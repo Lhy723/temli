@@ -39,6 +39,7 @@ import {
   cancelTask,
   compactJson,
   createTask,
+  createTaskFromIssue,
   decisionKindLabel,
   errorText,
   formatDate,
@@ -109,6 +110,15 @@ const BOARD_COLUMNS: BoardColumn[] = [
   { key: "review", title: "待合并", statuses: ["needs_human"] },
   { key: "done", title: "已完成", statuses: ["merged"] },
 ];
+
+// 已同步但还没转成任务的 open issue；ghost（远端已删除）和已关闭的不再提供“创建任务”。
+function issueNeedsTask(issue: ProjectIssue): boolean {
+  return (
+    issue.task_id === null &&
+    !issue.ghost &&
+    issue.github_state !== "closed"
+  );
+}
 
 const ADAPTER_DEFAULT_KEY = "__default__";
 const ADAPTER_FOLLOW_KEY = "__follow__";
@@ -182,6 +192,11 @@ export function TasksPanel({ projectId }: { projectId: string }) {
   const [issues, setIssues] = useState<ProjectIssue[]>([]);
   const [issuesLoading, setIssuesLoading] = useState(true);
   const [issuesError, setIssuesError] = useState<string | null>(null);
+  const [creatingIssueId, setCreatingIssueId] = useState<string | null>(null);
+  const [createIssueError, setCreateIssueError] = useState<{
+    issueId: string;
+    message: string;
+  } | null>(null);
   const [githubError, setGithubError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [publishing, setPublishing] = useState(false);
@@ -226,6 +241,8 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setIssues([]);
     setIssuesLoading(true);
     setIssuesError(null);
+    setCreatingIssueId(null);
+    setCreateIssueError(null);
     setGithubError(null);
     setSyncing(false);
     setPublishing(false);
@@ -559,6 +576,31 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     }
   }
 
+  async function createTaskFromIssueItem(issue: ProjectIssue) {
+    if (creatingIssueId) return;
+    const requestedFor = projectId;
+    setCreatingIssueId(issue.id);
+    setCreateIssueError(null);
+    try {
+      const created = await createTaskFromIssue({ item_id: issue.id });
+      if (projectRef.current !== requestedFor) return;
+      // 先本地建立关联，刷新返回前看板不会同时出现任务卡与 issue 卡。
+      setIssues((prev) =>
+        prev.map((item) =>
+          item.id === issue.id ? { ...item, task_id: created.task.id } : item,
+        ),
+      );
+      await handleCreated(created);
+    } catch (e) {
+      if (projectRef.current !== requestedFor) return;
+      setCreateIssueError({ issueId: issue.id, message: errorText(e) });
+      // 命令可能已在后端成功但响应丢失；刷新一次以免残留重复卡片。
+      void Promise.all([refreshTasks(), refreshIssues()]).catch(() => {});
+    } finally {
+      if (projectRef.current === requestedFor) setCreatingIssueId(null);
+    }
+  }
+
   async function startSelected() {
     const taskId = selectedRef.current;
     if (!taskId) return;
@@ -835,6 +877,7 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     selectedTaskId === null
       ? null
       : (issues.find((item) => item.task_id === selectedTaskId) ?? null);
+  const pendingIssues = issues.filter(issueNeedsTask);
 
   return (
     <div className="relative flex h-full min-h-0 gap-3">
@@ -845,6 +888,15 @@ export function TasksPanel({ projectId }: { projectId: string }) {
               <CircleDot size={14} />
               {tasks.length} 个任务
             </span>
+            {pendingIssues.length > 0 && (
+              <span
+                className="flex items-center gap-1.5 text-ui-sm text-[var(--muted)]"
+                title="还没有关联任务的 open issue"
+              >
+                <Inbox size={14} />
+                {pendingIssues.length} 个 issue 待创建
+              </span>
+            )}
             <div className="flex items-center rounded-md border border-[var(--border)] p-0.5">
               <Button
                 variant={view === "board" ? "secondary" : "ghost"}
@@ -964,6 +1016,12 @@ export function TasksPanel({ projectId }: { projectId: string }) {
           </p>
         )}
 
+        {issuesError && (
+          <p role="alert" className="mb-2 text-ui-sm text-[var(--danger)]">
+            issue 加载失败：{issuesError}
+          </p>
+        )}
+
         {showCreate && (
           <CreateTaskForm
             projectId={projectId}
@@ -977,32 +1035,62 @@ export function TasksPanel({ projectId }: { projectId: string }) {
             <p className="text-ui-sm text-[var(--muted)]">加载中…</p>
           )}
 
-          {!loading && !error && tasks.length === 0 && (
-            <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
-              <ListChecks size={20} className="text-[var(--muted)] opacity-70" />
-              <p className="text-ui text-[var(--muted)]">
-                还没有任务。新建一个任务开始执行。
-              </p>
-              {!showCreate && (
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className="h-7 px-3 text-ui"
-                  onPress={() => setShowCreate(true)}
-                >
-                  新建任务
-                </Button>
-              )}
-            </div>
-          )}
+          {!loading &&
+            !error &&
+            tasks.length === 0 &&
+            pendingIssues.length === 0 && (
+              <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
+                <ListChecks
+                  size={20}
+                  className="text-[var(--muted)] opacity-70"
+                />
+                <p className="text-ui text-[var(--muted)]">
+                  还没有任务。新建一个任务开始执行。
+                </p>
+                {!showCreate && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    className="h-7 px-3 text-ui"
+                    onPress={() => setShowCreate(true)}
+                  >
+                    新建任务
+                  </Button>
+                )}
+              </div>
+            )}
 
-          {!loading && tasks.length > 0 && view === "board" && (
-            <TaskBoard
-              tasks={tasks}
-              issues={issues}
-              selectedId={selectedId}
-              onSelect={selectTask}
-            />
+          {!loading &&
+            (tasks.length > 0 || pendingIssues.length > 0) &&
+            view === "board" && (
+              <TaskBoard
+                tasks={tasks}
+                issues={issues}
+                pendingIssues={pendingIssues}
+                selectedId={selectedId}
+                onSelect={selectTask}
+                issuesLoading={issuesLoading}
+                creatingIssueId={creatingIssueId}
+                createIssueError={createIssueError}
+                onCreateFromIssue={createTaskFromIssueItem}
+              />
+            )}
+
+          {!loading && view === "table" && pendingIssues.length > 0 && (
+            <div className="mb-2 flex items-center justify-between gap-2 rounded-md border border-dashed border-[var(--border)] px-2 py-1.5">
+              <p className="text-ui-sm text-[var(--muted)]">
+                另有 {pendingIssues.length} 个 issue 尚未创建任务。
+              </p>
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-6 gap-1 px-2 text-ui-sm"
+                onPress={() => setView("board")}
+              >
+                <LayoutGrid size={13} />
+                去创建
+              </Button>
+            </div>
           )}
 
           {!loading && tasks.length > 0 && view === "table" && (
@@ -1077,13 +1165,23 @@ export function TasksPanel({ projectId }: { projectId: string }) {
 function TaskBoard({
   tasks,
   issues,
+  pendingIssues,
   selectedId,
   onSelect,
+  issuesLoading,
+  creatingIssueId,
+  createIssueError,
+  onCreateFromIssue,
 }: {
   tasks: TaskSummary[];
   issues: ProjectIssue[];
+  pendingIssues: ProjectIssue[];
   selectedId: string | null;
   onSelect: (taskId: string) => void;
+  issuesLoading: boolean;
+  creatingIssueId: string | null;
+  createIssueError: { issueId: string; message: string } | null;
+  onCreateFromIssue: (issue: ProjectIssue) => void;
 }) {
   const issueByTask = new Map<string, ProjectIssue>();
   for (const issue of issues) {
@@ -1095,6 +1193,7 @@ function TaskBoard({
   const columns = BOARD_COLUMNS.map((column) => ({
     ...column,
     tasks: tasks.filter((task) => column.statuses.includes(task.status)),
+    issues: column.key === "backlog" ? pendingIssues : [],
   }));
   const otherTasks = tasks.filter((task) => !knownStatuses.has(task.status));
   if (otherTasks.length > 0) {
@@ -1103,42 +1202,66 @@ function TaskBoard({
       title: "异常/中断",
       statuses: [],
       tasks: otherTasks,
+      issues: [],
     });
   }
 
   return (
-    <div className="flex min-h-full items-start gap-2 overflow-x-auto pb-2">
-      {columns.map((column) => (
-        <section
-          key={column.key}
-          aria-label={column.title}
-          className="flex w-[224px] min-w-[200px] shrink-0 flex-col gap-1.5"
-        >
-          <div className="flex items-center justify-between px-0.5">
-            <span className="text-ui-sm font-medium">{column.title}</span>
-            <span className="text-label text-[var(--muted)]">
-              {column.tasks.length}
-            </span>
-          </div>
-          {column.tasks.length === 0 ? (
-            <p className="rounded-md border border-dashed border-[var(--border)] px-2 py-3 text-center text-ui-sm text-[var(--muted)]">
-              暂无任务
-            </p>
-          ) : (
-            <div className="grid gap-1.5">
-              {column.tasks.map((task) => (
-                <TaskCard
-                  key={task.id}
-                  task={task}
-                  issue={issueByTask.get(task.id) ?? null}
-                  selected={selectedId === task.id}
-                  onSelect={onSelect}
-                />
-              ))}
+    <div className="flex flex-col gap-1.5 pb-2">
+      {issuesLoading && (
+        <div className="rounded-md border border-dashed border-[var(--border)] px-2 py-1.5">
+          <p className="text-ui-sm text-[var(--muted)]">issue 加载中…</p>
+        </div>
+      )}
+      <div className="flex min-h-full items-start gap-2 overflow-x-auto">
+        {columns.map((column) => (
+          <section
+            key={column.key}
+            aria-label={column.title}
+            className="flex w-[224px] min-w-[200px] shrink-0 flex-col gap-1.5"
+          >
+            <div className="flex items-center justify-between px-0.5">
+              <span className="text-ui-sm font-medium">{column.title}</span>
+              <span className="text-label text-[var(--muted)]">
+                {column.tasks.length + column.issues.length}
+              </span>
             </div>
-          )}
-        </section>
-      ))}
+            {column.tasks.length === 0 && column.issues.length === 0 ? (
+              <p className="rounded-md border border-dashed border-[var(--border)] px-2 py-3 text-center text-ui-sm text-[var(--muted)]">
+                暂无任务
+              </p>
+            ) : (
+              <div className="grid gap-1.5">
+                {column.issues.map((issue) => (
+                  <IssueCard
+                    key={`issue-${issue.id}`}
+                    issue={issue}
+                    creating={creatingIssueId === issue.id}
+                    disabled={
+                      creatingIssueId !== null && creatingIssueId !== issue.id
+                    }
+                    error={
+                      createIssueError?.issueId === issue.id
+                        ? createIssueError.message
+                        : null
+                    }
+                    onCreate={() => onCreateFromIssue(issue)}
+                  />
+                ))}
+                {column.tasks.map((task) => (
+                  <TaskCard
+                    key={task.id}
+                    task={task}
+                    issue={issueByTask.get(task.id) ?? null}
+                    selected={selectedId === task.id}
+                    onSelect={onSelect}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+        ))}
+      </div>
     </div>
   );
 }
@@ -1229,6 +1352,62 @@ function TaskCard({
           审查 {reviewer ?? "默认"}
         </span>
       </div>
+    </div>
+  );
+}
+
+function IssueCard({
+  issue,
+  creating,
+  disabled,
+  error,
+  onCreate,
+}: {
+  issue: ProjectIssue;
+  creating: boolean;
+  disabled: boolean;
+  error: string | null;
+  onCreate: () => void;
+}) {
+  return (
+    <div className="rounded-md border border-dashed border-[var(--border)] bg-[var(--background)] px-2 py-1.5">
+      <p className="line-clamp-2 text-ui-sm font-medium" title={issue.title}>
+        {issue.title}
+      </p>
+      <div className="mt-1 flex flex-wrap items-center gap-1">
+        {issue.github_number != null && (
+          <span className="rounded border border-[var(--border)] px-1 font-mono text-label text-[var(--muted)]">
+            GitHub #{issue.github_number}
+          </span>
+        )}
+        {issue.github_state ? (
+          <Chip
+            size="sm"
+            variant="soft"
+            color={statusTone(issue.github_state)}
+          >
+            {statusLabel(issue.github_state)}
+          </Chip>
+        ) : (
+          <Chip size="sm" variant="tertiary" color="default">
+            未发布
+          </Chip>
+        )}
+      </div>
+      <Button
+        variant="secondary"
+        size="sm"
+        className="mt-1.5 h-6 w-full px-2 text-ui-sm"
+        isDisabled={creating || disabled}
+        onPress={onCreate}
+      >
+        {creating ? "创建中…" : "创建任务"}
+      </Button>
+      {error && (
+        <p role="alert" className="mt-1 text-label text-[var(--danger)]">
+          {error}
+        </p>
+      )}
     </div>
   );
 }

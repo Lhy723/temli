@@ -358,6 +358,75 @@ pub fn create_task(conn: &Connection, input: NewTask) -> Result<TaskRow, String>
     .map_err(db_err)
 }
 
+/// 把已有的 issue item 转换为任务：item 行保持原样，只把 `status` 置为
+/// `draft`，并在同一事务内写入 `tasks` 行。
+///
+/// 与 [`create_task`] 不同，这里复用同步进来的 item（`github_number` / `body`
+/// 等字段不受影响），因此要求 item 存在、`kind='issue'` 且尚未关联任务。
+pub fn create_task_for_item(
+    conn: &Connection,
+    item_id: &str,
+    prompt: &str,
+    criteria: Vec<Criterion>,
+) -> Result<TaskRow, String> {
+    validate_criteria(&criteria)?;
+
+    let (project_id, kind) = conn
+        .query_row(
+            "SELECT project_id, kind FROM items WHERE id = ?1",
+            params![item_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(db_err)?
+        .ok_or_else(|| format!("条目不存在：{item_id}"))?;
+    if kind != "issue" {
+        return Err(format!("只能将 issue 条目转换为任务：{item_id}"));
+    }
+    ensure_project(conn, &project_id)?;
+
+    let existing: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE item_id = ?1)",
+            params![item_id],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if existing {
+        return Err(format!("条目已有任务：{item_id}"));
+    }
+
+    let task_id = Uuid::new_v4().to_string();
+    let acceptance_json =
+        serde_json::to_string(&criteria).map_err(|e| format!("验收标准序列化失败：{e}"))?;
+
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    tx.execute(
+        "INSERT INTO tasks (id, item_id, acceptance_json, prompt)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![task_id, item_id, acceptance_json, prompt],
+    )
+    .map_err(db_err)?;
+    tx.execute(
+        "UPDATE items
+         SET status = 'draft', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ?1",
+        params![item_id],
+    )
+    .map_err(db_err)?;
+    tx.commit().map_err(db_err)?;
+
+    conn.query_row(
+        "SELECT t.id, i.project_id, i.title, i.status, t.prompt, t.attempts, t.max_minutes,
+                t.created_at, t.developer_adapter, t.reviewer_adapter
+         FROM tasks t JOIN items i ON i.id = t.item_id
+         WHERE t.id = ?1",
+        params![task_id],
+        read_task_row,
+    )
+    .map_err(db_err)
+}
+
 pub fn list_tasks(conn: &Connection) -> Result<Vec<TaskSummary>, String> {
     query_task_summaries(conn, None)
 }
@@ -1983,6 +2052,76 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
             .unwrap();
         assert_eq!((items, tasks), (0, 0));
+    }
+
+    #[test]
+    fn create_task_for_item_reuses_issue_row() {
+        let db = open_db();
+        let project_id = project(&db);
+        let conn = db.conn();
+        let item_id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO items (id, project_id, kind, title, body, status, github_number)
+             VALUES (?1, ?2, 'issue', '同步问题', '复现步骤', 'open', 42)",
+            params![item_id, project_id],
+        )
+        .unwrap();
+
+        let task = create_task_for_item(conn, &item_id, "处理同步问题", criteria()).unwrap();
+        assert_eq!(task.status, TaskStatus::Draft);
+        assert_eq!(task.title, "同步问题");
+        assert_eq!(task.project_id, project_id);
+        assert_eq!(task.prompt, "处理同步问题");
+        assert_eq!(get_task(conn, &task.id).unwrap().criteria.len(), 2);
+
+        let (status, body, github_number): (String, String, i64) = conn
+            .query_row(
+                "SELECT status, body, github_number FROM items WHERE id = ?1",
+                params![item_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "draft");
+        assert_eq!(body, "复现步骤");
+        assert_eq!(github_number, 42);
+
+        // 条目已有关联任务时必须报错，而不是再插入一条 tasks 行。
+        let err = create_task_for_item(conn, &item_id, "再次转换", criteria()).unwrap_err();
+        assert!(err.contains("已有任务"), "{err}");
+        let tasks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tasks, 1);
+    }
+
+    #[test]
+    fn create_task_for_item_rejects_non_issue_and_invalid_criteria() {
+        let db = open_db();
+        let project_id = project(&db);
+        let conn = db.conn();
+
+        let note = insert_item(conn, &project_id, "note", "笔记", "正文");
+        let err = create_task_for_item(conn, &note, "p", criteria()).unwrap_err();
+        assert!(err.contains("issue"), "{err}");
+
+        let issue = insert_item(conn, &project_id, "issue", "问题", "正文");
+        let mut invalid = criteria();
+        invalid[0].id = "bad id".into();
+        let err = create_task_for_item(conn, &issue, "p", invalid).unwrap_err();
+        assert!(err.contains("id 非法"), "{err}");
+
+        let missing = create_task_for_item(conn, "missing-item", "p", criteria()).unwrap_err();
+        assert!(missing.contains("条目不存在"), "{missing}");
+
+        let (tasks, status): (i64, String) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM tasks), status FROM items WHERE id = ?1",
+                params![issue],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tasks, 0);
+        assert_eq!(status, "open", "校验失败时不应改写 item 状态");
     }
 
     #[test]
