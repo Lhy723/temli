@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn run(repo: &Path, args: &[&str]) -> Result<String, String> {
@@ -77,6 +77,51 @@ pub fn remove_worktree(repo: &Path, worktree: &Path) -> Result<(), String> {
             worktree.to_string_lossy().as_ref(),
         ],
     )?;
+    Ok(())
+}
+
+/// Registered worktrees of `repo`, the main worktree included.
+pub fn list_worktrees(repo: &Path) -> Result<Vec<PathBuf>, String> {
+    let out = run(repo, &["worktree", "list", "--porcelain"])?;
+    Ok(out
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect())
+}
+
+/// Drop bookkeeping for worktrees whose directories no longer exist.
+pub fn prune_worktrees(repo: &Path) -> Result<(), String> {
+    run(repo, &["worktree", "prune"])?;
+    Ok(())
+}
+
+/// Whether a rebase is mid-flight in `repo` (or in the worktree at `repo`).
+pub fn rebase_in_progress(repo: &Path) -> bool {
+    ["rebase-merge", "rebase-apply"].into_iter().any(|name| {
+        run(repo, &["rev-parse", "--git-path", name])
+            .ok()
+            .map(PathBuf::from)
+            .map(|p| if p.is_absolute() { p } else { repo.join(p) })
+            .is_some_and(|p| p.exists())
+    })
+}
+
+/// Rebase the worktree's current branch onto `target_ref`. A failed rebase is aborted so the
+/// worktree is left conflict-free; the git error including stderr is returned.
+pub fn rebase_onto(worktree: &Path, target_ref: &str) -> Result<(), String> {
+    match run(worktree, &["rebase", target_ref]) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let _ = run(worktree, &["rebase", "--abort"]);
+            Err(err)
+        }
+    }
+}
+
+/// Hard-reset `repo` to `sha`, discarding tracked changes.
+pub fn reset_hard(repo: &Path, sha: &str) -> Result<(), String> {
+    run(repo, &["reset", "--hard", sha])?;
     Ok(())
 }
 
@@ -194,6 +239,99 @@ mod tests {
             create_worktree(&repo, &repo.with_extension("wt3"), "temli/2-run", "HEAD").is_err()
         );
         remove_worktree(&repo, &wt).unwrap();
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rebases_diverged_worktree_onto_moved_main() {
+        let repo = temp_repo();
+        let wt = repo.with_extension("wt-rebase");
+        let base = head_sha(&repo).unwrap();
+
+        create_worktree(&repo, &wt, "temli/1-run", &base).unwrap();
+        fs::write(wt.join("feat.txt"), "feat\n").unwrap();
+        let feat = commit_all(&wt, "feat").unwrap().unwrap();
+
+        fs::write(repo.join("main.txt"), "main\n").unwrap();
+        let main = commit_all(&repo, "main").unwrap().unwrap();
+        assert_ne!(main, feat);
+
+        rebase_onto(&wt, "main").unwrap();
+        assert!(!rebase_in_progress(&wt));
+        assert_ne!(head_sha(&wt).unwrap(), feat);
+        assert_eq!(rev_parse(&wt, "HEAD~1").unwrap(), main);
+        assert_eq!(fs::read_to_string(wt.join("feat.txt")).unwrap(), "feat\n");
+        assert_eq!(fs::read_to_string(wt.join("main.txt")).unwrap(), "main\n");
+
+        remove_worktree(&repo, &wt).unwrap();
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn conflicting_rebase_returns_err_and_aborts() {
+        let repo = temp_repo();
+        let wt = repo.with_extension("wt-conflict");
+        create_worktree(&repo, &wt, "temli/2-run", "HEAD").unwrap();
+
+        fs::write(wt.join("a.txt"), "feature\n").unwrap();
+        commit_all(&wt, "feature").unwrap();
+        fs::write(repo.join("a.txt"), "main\n").unwrap();
+        commit_all(&repo, "main").unwrap();
+
+        let err = rebase_onto(&wt, "main").unwrap_err();
+        assert!(err.contains("git rebase main 失败"), "{err}");
+        assert!(!rebase_in_progress(&wt));
+        assert_eq!(current_branch(&wt).unwrap(), "temli/2-run");
+        assert!(is_clean(&wt).unwrap());
+        assert_eq!(fs::read_to_string(wt.join("a.txt")).unwrap(), "feature\n");
+
+        remove_worktree(&repo, &wt).unwrap();
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn reset_hard_restores_file_and_moves_head() {
+        let repo = temp_repo();
+        let base = head_sha(&repo).unwrap();
+
+        fs::write(repo.join("a.txt"), "changed\n").unwrap();
+        fs::write(repo.join("extra.txt"), "extra\n").unwrap();
+        commit_all(&repo, "second").unwrap();
+        fs::write(repo.join("a.txt"), "again\n").unwrap();
+
+        reset_hard(&repo, &base).unwrap();
+        assert_eq!(head_sha(&repo).unwrap(), base);
+        assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "one\n");
+        assert!(!repo.join("extra.txt").exists());
+        assert!(is_clean(&repo).unwrap());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn lists_main_and_added_worktrees() {
+        let repo = temp_repo();
+        let wt = repo.with_extension("wt-list");
+        create_worktree(&repo, &wt, "temli/3-run", "HEAD").unwrap();
+
+        let listed = list_worktrees(&repo).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&fs::canonicalize(&repo).unwrap()));
+        assert!(listed.contains(&fs::canonicalize(&wt).unwrap()));
+
+        remove_worktree(&repo, &wt).unwrap();
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn prune_forgets_deleted_worktree() {
+        let repo = temp_repo();
+        let wt = repo.with_extension("wt-prune");
+        create_worktree(&repo, &wt, "temli/4-run", "HEAD").unwrap();
+        fs::remove_dir_all(&wt).unwrap();
+
+        prune_worktrees(&repo).unwrap();
+        let listed = list_worktrees(&repo).unwrap();
+        assert_eq!(listed, vec![fs::canonicalize(&repo).unwrap()]);
         let _ = fs::remove_dir_all(&repo);
     }
 }
