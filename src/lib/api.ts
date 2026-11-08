@@ -127,6 +127,12 @@ export type UpdateIssueInput = {
   body?: string;
 };
 
+export type CreateTaskFromIssueInput = {
+  item_id: string;
+  title?: string;
+  prompt?: string;
+};
+
 export type SetAutoMergeInput = {
   project_id: string;
   enabled: boolean;
@@ -433,6 +439,12 @@ export function createTaskFromNote(
   input: CreateTaskFromNoteInput,
 ): Promise<TaskDetail> {
   return invoke<TaskDetail>("create_task_from_note", { input });
+}
+
+export function createTaskFromIssue(
+  input: CreateTaskFromIssueInput,
+): Promise<TaskDetail> {
+  return invoke<TaskDetail>("create_task_from_issue", { input });
 }
 
 export function linkContext(input: LinkContextInput): Promise<void> {

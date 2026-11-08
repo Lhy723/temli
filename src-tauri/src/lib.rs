@@ -16,7 +16,7 @@ use agent::{
 };
 use db::{Db, Project, RegisterProjectInput, canonical_repo};
 use evidence::DiscoveredCommand;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use scheduler::Scheduler;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -46,6 +46,15 @@ struct CreateTaskInput {
     prompt: String,
     #[serde(default)]
     acceptance: Vec<store::Criterion>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTaskFromIssueInput {
+    item_id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -383,6 +392,108 @@ fn create_task(state: State<AppState>, input: CreateTaskInput) -> Result<TaskDet
         },
     )?;
     store::get_task(db.conn(), &task.id)
+}
+
+/// `create_task_from_issue` 的数据库逻辑；拆出来以便直接对 `Connection` 做单测。
+fn convert_issue_to_task(
+    conn: &rusqlite::Connection,
+    input: CreateTaskFromIssueInput,
+) -> Result<TaskDetail, String> {
+    let CreateTaskFromIssueInput {
+        item_id,
+        title,
+        prompt,
+    } = input;
+
+    let (project_id, kind, item_title, item_body) = conn
+        .query_row(
+            "SELECT project_id, kind, title, body FROM items WHERE id = ?1",
+            params![item_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_err)?
+        .ok_or_else(|| format!("条目不存在：{item_id}"))?;
+    if kind != "issue" {
+        return Err(format!("只能将 issue 条目转换为任务：{item_id}"));
+    }
+
+    let repo_path: String = conn
+        .query_row(
+            "SELECT repo_path FROM projects WHERE id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?
+        .ok_or_else(|| format!("项目不存在：{project_id}"))?;
+
+    // 已转换过：直接返回已有任务，保证重复调用幂等。
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM tasks WHERE item_id = ?1",
+            params![item_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    if let Some(task_id) = existing {
+        return store::get_task(conn, &task_id);
+    }
+
+    let criteria =
+        evidence::default_acceptance(&evidence::discover_commands(Path::new(&repo_path)));
+    if criteria.is_empty() {
+        return Err("未发现可执行的测试/构建命令，请手动提供验收标准".to_string());
+    }
+
+    let title = title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(title) = title.as_deref() {
+        conn.execute(
+            "UPDATE items
+             SET title = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id = ?1",
+            params![item_id, title],
+        )
+        .map_err(db_err)?;
+    }
+
+    let prompt = prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let fallback = title.as_deref().unwrap_or(&item_title);
+            if item_body.trim().is_empty() {
+                fallback.to_string()
+            } else {
+                item_body
+            }
+        });
+
+    let task = store::create_task_for_item(conn, &item_id, &prompt, criteria)?;
+    store::get_task(conn, &task.id)
+}
+
+#[tauri::command]
+fn create_task_from_issue(
+    state: State<AppState>,
+    input: CreateTaskFromIssueInput,
+) -> Result<TaskDetail, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    convert_issue_to_task(db.conn(), input)
 }
 
 #[tauri::command]
@@ -795,6 +906,7 @@ pub fn run() {
             get_project_concurrency,
             set_project_concurrency,
             create_task,
+            create_task_from_issue,
             get_task,
             start_task,
             cancel_task,
@@ -839,8 +951,10 @@ pub fn run() {
 mod tests {
     use super::*;
     use crate::agent::{AuthState, Capabilities, DetectResult, RunStatus, SessionHandle};
+    use rusqlite::params;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use uuid::Uuid;
 
     /// 脚本化适配器：`start` 同步发出一条 `TextDelta` 与 `Ended(Completed)`，
     /// 不启动子进程、不调用模型；`starts` 记录被启动的次数。
@@ -1121,6 +1235,187 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// 在夹具仓库登记项目；`with_commands` 时写入 `package.json` 供命令发现。
+    fn repo_project(fixture: &WorktreeFixture, with_commands: bool) -> Project {
+        if with_commands {
+            fs::write(
+                fixture.repo.join("package.json"),
+                r#"{"scripts":{"test":"node --test","build":"tsc"}}"#,
+            )
+            .expect("写入 package.json");
+        }
+        let repo = fixture.repo.canonicalize().expect("规范化仓库路径");
+        fixture
+            .db
+            .insert_project(
+                RegisterProjectInput {
+                    repo_path: repo.to_string_lossy().into_owned(),
+                    name: Some("demo".to_string()),
+                    github_owner: None,
+                    github_repo: None,
+                    default_branch: Some("main".to_string()),
+                },
+                repo,
+            )
+            .expect("登记项目")
+    }
+
+    fn insert_issue_item(
+        conn: &rusqlite::Connection,
+        project_id: &str,
+        kind: &str,
+        title: &str,
+        body: &str,
+        github_number: Option<i64>,
+    ) -> String {
+        let id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO items (id, project_id, kind, title, body, status, github_number)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6)",
+            params![id, project_id, kind, title, body, github_number],
+        )
+        .expect("写入条目");
+        id
+    }
+
+    fn item_row(
+        conn: &rusqlite::Connection,
+        item_id: &str,
+    ) -> (String, String, Option<i64>, String) {
+        conn.query_row(
+            "SELECT status, title, github_number, body FROM items WHERE id = ?1",
+            params![item_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("读取条目")
+    }
+
+    #[test]
+    fn convert_issue_creates_draft_task_and_is_idempotent() {
+        let fixture = WorktreeFixture::new("issue-task");
+        let project = repo_project(&fixture, true);
+        let conn = fixture.db.conn();
+        let item_id =
+            insert_issue_item(conn, &project.id, "issue", "远端问题", "复现步骤", Some(42));
+
+        let detail = convert_issue_to_task(
+            conn,
+            CreateTaskFromIssueInput {
+                item_id: item_id.clone(),
+                title: None,
+                prompt: None,
+            },
+        )
+        .expect("同步 issue 应能转换为任务");
+
+        assert_eq!(detail.task.status, store::TaskStatus::Draft);
+        assert_eq!(detail.task.title, "远端问题");
+        assert_eq!(detail.task.prompt, "复现步骤");
+        assert_eq!(detail.task.project_id, project.id);
+        assert_eq!(detail.criteria.len(), 2);
+        assert_eq!(detail.criteria[0].cmd, "npm run test");
+
+        let (status, title, github_number, body) = item_row(conn, &item_id);
+        assert_eq!(status, "draft");
+        assert_eq!(title, "远端问题");
+        assert_eq!(github_number, Some(42));
+        assert_eq!(body, "复现步骤");
+
+        // 幂等：第二次调用返回同一任务，不再插入 tasks 行，也不应用标题覆盖。
+        let again = convert_issue_to_task(
+            conn,
+            CreateTaskFromIssueInput {
+                item_id: item_id.clone(),
+                title: Some("另一个标题".to_string()),
+                prompt: Some("另一段提示".to_string()),
+            },
+        )
+        .expect("重复转换应返回已有任务");
+        assert_eq!(again.task.id, detail.task.id);
+        let tasks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tasks, 1);
+        assert_eq!(item_row(conn, &item_id).1, "远端问题");
+    }
+
+    #[test]
+    fn convert_issue_applies_title_override_and_default_prompt() {
+        let fixture = WorktreeFixture::new("issue-override");
+        let project = repo_project(&fixture, true);
+        let conn = fixture.db.conn();
+
+        let no_body = insert_issue_item(conn, &project.id, "issue", "旧标题", "", Some(7));
+        let detail = convert_issue_to_task(
+            conn,
+            CreateTaskFromIssueInput {
+                item_id: no_body.clone(),
+                title: Some("  新标题  ".to_string()),
+                prompt: None,
+            },
+        )
+        .expect("标题覆盖应成功");
+        assert_eq!(detail.task.title, "新标题");
+        assert_eq!(detail.task.prompt, "新标题", "无正文时提示回退到标题");
+        assert_eq!(item_row(conn, &no_body).1, "新标题");
+
+        let with_body = insert_issue_item(
+            conn,
+            &project.id,
+            "issue",
+            "另一个问题",
+            "正文内容",
+            Some(8),
+        );
+        let detail = convert_issue_to_task(
+            conn,
+            CreateTaskFromIssueInput {
+                item_id: with_body,
+                title: None,
+                prompt: Some("  自定义提示  ".to_string()),
+            },
+        )
+        .expect("显式提示应成功");
+        assert_eq!(detail.task.prompt, "自定义提示");
+    }
+
+    #[test]
+    fn convert_issue_rejects_non_issue_and_repos_without_commands() {
+        let fixture = WorktreeFixture::new("issue-reject");
+        let project = repo_project(&fixture, false);
+        let conn = fixture.db.conn();
+
+        let note = insert_issue_item(conn, &project.id, "note", "笔记", "正文", None);
+        let err = convert_issue_to_task(
+            conn,
+            CreateTaskFromIssueInput {
+                item_id: note,
+                title: None,
+                prompt: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("issue"), "{err}");
+
+        let issue = insert_issue_item(conn, &project.id, "issue", "没有命令", "正文", None);
+        let err = convert_issue_to_task(
+            conn,
+            CreateTaskFromIssueInput {
+                item_id: issue.clone(),
+                title: None,
+                prompt: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("未发现可执行的测试/构建命令"), "{err}");
+
+        let tasks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tasks, 0);
+        assert_eq!(item_row(conn, &issue).0, "open");
     }
 
     #[test]
