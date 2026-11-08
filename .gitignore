@@ -11,5 +11,8 @@
 .env.*
 !.env.example
 
+# temli private notes
+.temli/
+
 # Logs
 *.log
