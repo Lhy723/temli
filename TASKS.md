@@ -125,3 +125,4 @@
 - [x] 独立审查（1 blocker / 1 major / 3 minor）
 - [x] 修复：上下文仍调用已删除的 list_notes、vault 符号链接逃逸、非原子写入、大小写重命名、混合短词搜索
 - [x] 合入 develop（PR #26，Issue #25）
+- [x] 看板展示同步 Issue 并支持一键转任务（PR #28，Issue #27）
