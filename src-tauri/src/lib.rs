@@ -4,6 +4,7 @@ mod evidence;
 mod github;
 mod gitops;
 mod orchestrator;
+mod planner;
 mod prompts;
 mod scheduler;
 mod search;
@@ -14,6 +15,7 @@ mod workspace;
 
 use agent::{
     AdapterRegistry, AgentAdapter, AgentEvent, AgentManifest, Decision, EventSink, RunSpec,
+    RunStatus,
 };
 use db::{Db, Project, RegisterProjectInput, canonical_repo};
 use evidence::DiscoveredCommand;
@@ -56,6 +58,21 @@ struct CreateTaskFromIssueInput {
     title: Option<String>,
     #[serde(default)]
     prompt: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanProjectInput {
+    project_id: String,
+    idea: String,
+    /// 缺省时使用全局默认适配器。
+    #[serde(default)]
+    agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTasksFromPlanInput {
+    project_id: String,
+    draft: planner::PlanDraft,
 }
 
 #[derive(Debug, Deserialize)]
@@ -374,6 +391,127 @@ fn generate_acceptance(
         .unwrap_or_else(|| evidence::default_acceptance(commands))
 }
 
+/// 多任务规划的单次硬超时（秒）。
+const PLAN_TIMEOUT_SECS: u64 = 180;
+
+/// 通过适配器生成任务草案。
+///
+/// 收集全部 `TextDelta` 作为输出；审批请求一律拒绝；无论成功、失败、超时还是
+/// 连接断开，都会关闭会话，未正常结束时额外取消。输出交给
+/// [`planner::parse_plan`] 严格校验后才返回。
+fn run_plan(
+    adapter: &dyn AgentAdapter,
+    project: &Project,
+    idea: &str,
+    commands: &[DiscoveredCommand],
+) -> Result<planner::PlanDraft, String> {
+    let prompt = planner::plan_prompt(idea, project, commands);
+    let (tx, rx) = mpsc::channel::<AgentEvent>();
+    let sink: EventSink = Arc::new(move |event| {
+        let _ = tx.send(event);
+    });
+    let spec = RunSpec {
+        run_id: uuid::Uuid::new_v4().to_string(),
+        cwd: PathBuf::from(&project.repo_path),
+        prompt,
+        model: None,
+        max_minutes: 3,
+        max_cost_usd: None,
+        env_allowlist: Vec::new(),
+    };
+    let handle = adapter
+        .start(spec, sink)
+        .map_err(|error| format!("无法启动规划器：{error}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(PLAN_TIMEOUT_SECS);
+    let mut output = String::new();
+    let mut ended: Option<RunStatus> = None;
+    let mut last_error: Option<String> = None;
+    let mut timed_out = false;
+    let mut disconnected = false;
+
+    while ended.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
+        match rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
+            Ok(AgentEvent::TextDelta { text }) => output.push_str(&text),
+            Ok(AgentEvent::ApprovalRequest { request_id, .. }) => {
+                let _ = adapter.respond(&handle, &request_id, Decision::Deny);
+            }
+            Ok(AgentEvent::Error { message, .. }) => last_error = Some(message),
+            Ok(AgentEvent::Ended { status }) => ended = Some(status),
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+
+    if !matches!(ended, Some(RunStatus::Completed)) {
+        let _ = adapter.cancel(&handle);
+    }
+    let _ = adapter.close(&handle);
+
+    if timed_out {
+        return Err(format!("规划器在 {PLAN_TIMEOUT_SECS} 秒内未完成"));
+    }
+    if disconnected {
+        return Err("规划器连接中断".to_string());
+    }
+    match ended {
+        Some(RunStatus::Completed) => {}
+        Some(RunStatus::Failed) => {
+            return Err(last_error.unwrap_or_else(|| "规划器运行失败".to_string()));
+        }
+        Some(RunStatus::Cancelled) => return Err("规划器运行被取消".to_string()),
+        None => return Err("规划器未正常结束".to_string()),
+    }
+
+    planner::parse_plan(&output, commands)
+        .map_err(|error| format!("规划器输出无法通过校验：{error}"))
+}
+
+#[tauri::command(async)]
+fn plan_project(
+    state: State<AppState>,
+    input: PlanProjectInput,
+) -> Result<planner::PlanDraft, String> {
+    let idea = input.idea.trim();
+    if idea.is_empty() {
+        return Err("请提供要规划的想法".to_string());
+    }
+
+    let project = {
+        let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+        db.get_project(&input.project_id)?
+            .ok_or_else(|| "项目不存在".to_string())?
+    };
+
+    let requested = input
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|agent| !agent.is_empty())
+        .unwrap_or(&state.default_agent);
+    let adapter = state
+        .adapters
+        .get(requested)
+        .ok_or_else(|| format!("适配器未注册：{requested}"))?;
+
+    let repo = Path::new(&project.repo_path);
+    let commands = evidence::discover_commands(repo);
+    if commands.is_empty() {
+        return Err("未发现可执行的测试/构建命令，请先配置测试或构建脚本".to_string());
+    }
+
+    run_plan(adapter.as_ref(), &project, idea, &commands)
+}
+
 #[tauri::command]
 fn create_task(state: State<AppState>, input: CreateTaskInput) -> Result<TaskDetail, String> {
     let project = {
@@ -514,6 +652,118 @@ fn create_task_from_issue(
 ) -> Result<TaskDetail, String> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     convert_issue_to_task(db.conn(), input)
+}
+
+/// 校验草案并把每个任务写入数据库。
+///
+/// 与 [`plan_project`] 使用同一套 [`planner::validate_plan`] 规则，因此前端回传的
+/// 草案在落库前会再次被严格校验（包括命令必须仍存在于发现列表）。
+fn create_plan_tasks(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    repo: &Path,
+    draft: planner::PlanDraft,
+) -> Result<Vec<TaskDetail>, String> {
+    let commands = evidence::discover_commands(repo);
+    if commands.is_empty() {
+        return Err("未发现可执行的测试/构建命令，请先配置测试或构建脚本".to_string());
+    }
+    let draft = planner::validate_plan(draft, &commands)?;
+    create_tasks_from_draft(conn, project_id, draft)
+}
+
+/// 在单个项目内把草案落成 draft 任务及其依赖边。
+///
+/// 调用方应先用 [`planner::validate_plan`] 校验；本函数仍负责任何中途失败后的
+/// 回滚：删除已创建的 issue item，级联清除任务、验收数据与依赖边。
+fn create_tasks_from_draft(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    draft: planner::PlanDraft,
+) -> Result<Vec<TaskDetail>, String> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if !exists {
+        return Err(format!("项目不存在：{project_id}"));
+    }
+
+    let mut created: Vec<store::TaskRow> = Vec::with_capacity(draft.issues.len());
+    let result = (|| -> Result<Vec<TaskDetail>, String> {
+        for issue in &draft.issues {
+            let task = store::create_task(
+                conn,
+                store::NewTask {
+                    project_id: project_id.to_string(),
+                    title: issue.title.clone(),
+                    prompt: issue.prompt.clone(),
+                    criteria: issue.acceptance.clone(),
+                },
+            )?;
+            created.push(task);
+        }
+
+        for (index, issue) in draft.issues.iter().enumerate() {
+            for &blocker_index in &issue.depends_on {
+                let blocker = created.get(blocker_index).ok_or_else(|| {
+                    format!("任务「{}」依赖不存在的索引：{blocker_index}", issue.title)
+                })?;
+                store::add_dependency(conn, &created[index].id, &blocker.id)?;
+            }
+        }
+
+        let mut details = Vec::with_capacity(created.len());
+        for task in &created {
+            details.push(store::get_task(conn, &task.id)?);
+        }
+        Ok(details)
+    })();
+
+    if result.is_err() {
+        rollback_plan_tasks(conn, &created);
+    }
+    result
+}
+
+/// 删除已创建任务的 issue item；外键级联清理 tasks / links。
+fn rollback_plan_tasks(conn: &rusqlite::Connection, tasks: &[store::TaskRow]) {
+    for task in tasks {
+        let item_id: Option<String> = conn
+            .query_row(
+                "SELECT item_id FROM tasks WHERE id = ?1",
+                params![task.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(item_id) = item_id {
+            let _ = conn.execute("DELETE FROM items WHERE id = ?1", params![item_id]);
+        }
+    }
+}
+
+#[tauri::command]
+fn create_tasks_from_plan(
+    state: State<AppState>,
+    input: CreateTasksFromPlanInput,
+) -> Result<Vec<TaskDetail>, String> {
+    let project = {
+        let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+        db.get_project(&input.project_id)?
+            .ok_or_else(|| "项目不存在".to_string())?
+    };
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    create_plan_tasks(
+        db.conn(),
+        &project.id,
+        Path::new(&project.repo_path),
+        input.draft,
+    )
 }
 
 #[tauri::command]
@@ -949,6 +1199,8 @@ pub fn run() {
             set_project_concurrency,
             create_task,
             create_task_from_issue,
+            plan_project,
+            create_tasks_from_plan,
             get_task,
             start_task,
             cancel_task,
@@ -1512,5 +1764,251 @@ mod tests {
             "清理后只应保留主 worktree：{registered:?}"
         );
         assert!(registered.iter().all(|path| path != &worktree));
+    }
+
+    fn planned_issue(title: &str, cmd: &str, depends_on: Vec<usize>) -> planner::PlanIssue {
+        planner::PlanIssue {
+            title: title.to_string(),
+            prompt: format!("实现{title}并补充测试"),
+            acceptance: vec![store::Criterion {
+                id: "c-1".to_string(),
+                cmd: cmd.to_string(),
+                expect_exit: 0,
+                expect_match: None,
+            }],
+            depends_on,
+        }
+    }
+
+    fn plan_issue_json(title: &str, cmd: &str, depends_on: Vec<usize>) -> serde_json::Value {
+        serde_json::json!({
+            "title": title,
+            "prompt": format!("实现{title}并补充测试"),
+            "acceptance": [{
+                "id": "c-1",
+                "cmd": cmd,
+                "expect_exit": 0,
+                "expect_match": null
+            }],
+            "depends_on": depends_on
+        })
+    }
+
+    #[test]
+    fn plan_pipeline_returns_strictly_validated_draft() {
+        let fixture = WorktreeFixture::new("plan-run");
+        let project = repo_project(&fixture, true);
+        let commands = evidence::discover_commands(&fixture.repo);
+        let test_cmd = commands
+            .iter()
+            .find(|command| command.kind == evidence::CmdKind::Test)
+            .expect("夹具应发现 test 命令")
+            .cmd
+            .clone();
+        let build_cmd = commands
+            .iter()
+            .find(|command| command.kind == evidence::CmdKind::Build)
+            .expect("夹具应发现 build 命令")
+            .cmd
+            .clone();
+        let output = serde_json::json!({
+            "issues": [
+                plan_issue_json("解析输入", &test_cmd, vec![]),
+                plan_issue_json("接入界面", &build_cmd, vec![0])
+            ]
+        })
+        .to_string();
+        let adapter = ScriptedAdapter::new(output);
+
+        let draft =
+            run_plan(&adapter, &project, "实现搜索面板", &commands).expect("合法输出应生成草案");
+
+        assert_eq!(adapter.starts(), 1);
+        assert_eq!(draft.issues.len(), 2);
+        assert_eq!(draft.issues[0].title, "解析输入");
+        assert_eq!(draft.issues[1].depends_on, vec![0]);
+    }
+
+    #[test]
+    fn plan_pipeline_rejects_invalid_agent_output() {
+        let fixture = WorktreeFixture::new("plan-invalid");
+        let project = repo_project(&fixture, true);
+        let commands = evidence::discover_commands(&fixture.repo);
+        let adapter = ScriptedAdapter::new("这不是 JSON");
+
+        let err = run_plan(&adapter, &project, "想法", &commands).unwrap_err();
+
+        assert!(err.contains("无法通过校验"), "{err}");
+        assert_eq!(adapter.starts(), 1);
+    }
+
+    #[test]
+    fn create_tasks_from_plan_creates_draft_tasks_with_blocks_edges() {
+        let fixture = WorktreeFixture::new("plan-batch");
+        let project = repo_project(&fixture, true);
+        let commands = evidence::discover_commands(&fixture.repo);
+        let test_cmd = commands
+            .iter()
+            .find(|command| command.kind == evidence::CmdKind::Test)
+            .expect("夹具应发现 test 命令")
+            .cmd
+            .clone();
+        let build_cmd = commands
+            .iter()
+            .find(|command| command.kind == evidence::CmdKind::Build)
+            .expect("夹具应发现 build 命令")
+            .cmd
+            .clone();
+        let raw = serde_json::json!({
+            "issues": [
+                plan_issue_json("解析输入", &test_cmd, vec![]),
+                plan_issue_json("接入界面", &build_cmd, vec![0]),
+                plan_issue_json("发布", &test_cmd, vec![0, 1])
+            ]
+        })
+        .to_string();
+        let draft = planner::parse_plan(&raw, &commands).expect("草案应通过校验");
+        let conn = fixture.db.conn();
+
+        let details =
+            create_plan_tasks(conn, &project.id, &fixture.repo, draft).expect("确认计划应创建任务");
+
+        assert_eq!(details.len(), 3);
+        for detail in &details {
+            assert_eq!(detail.task.status, store::TaskStatus::Draft);
+            assert_eq!(detail.task.project_id, project.id);
+            assert_eq!(detail.criteria.len(), 1);
+        }
+        assert_eq!(details[0].criteria[0].cmd, test_cmd);
+        assert_eq!(details[1].criteria[0].cmd, build_cmd);
+
+        let (blockers, blocks) =
+            store::task_dependencies(conn, &details[1].task.id).expect("读取依赖");
+        assert_eq!(
+            blockers
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![details[0].task.id.as_str()]
+        );
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![details[2].task.id.as_str()],
+            "第二个任务应阻塞第三个任务"
+        );
+
+        let (blockers, blocks) =
+            store::task_dependencies(conn, &details[2].task.id).expect("读取依赖");
+        let mut blocker_ids = blockers
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>();
+        blocker_ids.sort_unstable();
+        let mut expected = vec![details[0].task.id.as_str(), details[1].task.id.as_str()];
+        expected.sort_unstable();
+        assert_eq!(blocker_ids, expected);
+        assert!(blocks.is_empty());
+
+        let (blockers, blocks) =
+            store::task_dependencies(conn, &details[0].task.id).expect("读取依赖");
+        assert!(blockers.is_empty());
+        assert_eq!(blocks.len(), 2, "首个任务应阻塞后两个任务");
+
+        let task_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let link_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE rel = 'blocks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_count, 3);
+        assert_eq!(link_count, 3);
+    }
+
+    #[test]
+    fn create_tasks_from_plan_rejects_invalid_plan_before_writing() {
+        let fixture = WorktreeFixture::new("plan-reject");
+        let project = repo_project(&fixture, true);
+        let conn = fixture.db.conn();
+
+        let unknown_command = planner::PlanDraft {
+            issues: vec![planned_issue("危险任务", "rm -rf /", vec![])],
+        };
+        let err = create_plan_tasks(conn, &project.id, &fixture.repo, unknown_command).unwrap_err();
+        assert!(err.contains("rm -rf /"), "{err}");
+
+        let forward_reference = planner::PlanDraft {
+            issues: vec![
+                planned_issue("第一个", "npm run test", vec![]),
+                planned_issue("第二个", "npm run build", vec![1]),
+            ],
+        };
+        let err =
+            create_plan_tasks(conn, &project.id, &fixture.repo, forward_reference).unwrap_err();
+        assert!(err.contains("depends_on"), "{err}");
+
+        let task_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let item_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(task_count, 0, "校验失败不得写入任务");
+        assert_eq!(item_count, 0, "校验失败不得写入条目");
+    }
+
+    #[test]
+    fn create_tasks_from_draft_rolls_back_on_failure() {
+        let fixture = WorktreeFixture::new("plan-rollback");
+        let project = repo_project(&fixture, true);
+        let conn = fixture.db.conn();
+
+        // 绕过 planner 校验注入一个 store 会拒绝的验收 id：第二个任务失败时，
+        // 第一个任务必须被回滚删除。
+        let mut broken = planned_issue("第二个", "npm run build", vec![]);
+        broken.acceptance[0].id = "bad id".to_string();
+        let draft = planner::PlanDraft {
+            issues: vec![planned_issue("第一个", "npm run test", vec![]), broken],
+        };
+        let err = create_tasks_from_draft(conn, &project.id, draft).unwrap_err();
+        assert!(err.contains("id 非法"), "{err}");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        // 依赖写入阶段失败（自依赖）时，已写入的任务与 blocks 边同样要回滚。
+        let self_dependency = planner::PlanDraft {
+            issues: vec![
+                planned_issue("第一个", "npm run test", vec![]),
+                planned_issue("第二个", "npm run build", vec![0, 1]),
+            ],
+        };
+        let err = create_tasks_from_draft(conn, &project.id, self_dependency).unwrap_err();
+        assert!(err.contains("依赖自身"), "{err}");
+        let task_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let item_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        let link_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM links", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(task_count, 0);
+        assert_eq!(item_count, 0);
+        assert_eq!(link_count, 0);
     }
 }

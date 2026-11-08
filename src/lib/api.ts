@@ -135,6 +135,27 @@ export type CreateTaskFromIssueInput = {
   prompt?: string;
 };
 
+export type PlanIssue = {
+  title: string;
+  prompt: string;
+  acceptance: Criterion[];
+  depends_on: number[];
+};
+
+export type PlanDraft = {
+  issues: PlanIssue[];
+};
+
+export type PlanProjectInput = {
+  project_id: string;
+  idea: string;
+};
+
+export type CreateTasksFromPlanInput = {
+  project_id: string;
+  draft: PlanDraft;
+};
+
 export type SetAutoMergeInput = {
   project_id: string;
   enabled: boolean;
@@ -474,6 +495,16 @@ export function createTaskFromIssue(
   input: CreateTaskFromIssueInput,
 ): Promise<TaskDetail> {
   return invoke<TaskDetail>("create_task_from_issue", { input });
+}
+
+export function planProject(input: PlanProjectInput): Promise<PlanDraft> {
+  return invoke<PlanDraft>("plan_project", { input });
+}
+
+export function createTasksFromPlan(
+  input: CreateTasksFromPlanInput,
+): Promise<TaskDetail[]> {
+  return invoke<TaskDetail[]>("create_tasks_from_plan", { input });
 }
 
 export function linkContext(input: LinkContextInput): Promise<void> {

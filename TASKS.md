@@ -146,3 +146,10 @@
 - [x] 任务级 model 字段、RunSpec 传递与 UI
 - [x] 审查修复：Claude 权限提示挂起、prompt 截断、取消竞态、进程组、env allowlist、run.model 落库
 - [x] 合入 develop（PR #35，Issue #34）
+
+## 进行中：M9 想法 → 多 Issue 计划
+
+- [x] Planner prompt / JSON 校验 / 批量建任务与依赖
+- [x] 前端规划面板（想法 → 预览 → 创建）
+- [x] 审查修复：规划命令改为 async，避免阻塞 Tauri 主线程
+- [x] 合入 develop（PR #38，Issue #37）
