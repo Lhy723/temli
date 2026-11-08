@@ -1,0 +1,14 @@
+@import "tailwindcss";
+@import "@heroui/styles";
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans, system-ui, -apple-system, sans-serif);
+  -webkit-font-smoothing: antialiased;
+}

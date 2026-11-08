@@ -16,3 +16,7 @@
 
 # Logs
 *.log
+
+# JS
+node_modules/
+dist/
