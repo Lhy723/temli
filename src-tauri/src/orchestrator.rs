@@ -192,9 +192,13 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
 
     {
         let guard = lock_db(&ctx.db)?;
-        // 出队与真正开始之间可能已被取消（queued → draft）：以库内状态为准，
-        // 不能凭函数入口的快照给已取消的任务插入运行记录。
-        if store::task_status(guard.conn(), task_id)? != TaskStatus::Queued {
+        // 出队与真正开始之间可能已被取消（queued → draft），也可能在 worktree
+        // 创建之后才被写入新的依赖边：两种情况都以库内状态为准，不能凭函数入口
+        // 的快照给不满足条件的任务插入运行记录。依赖未就绪时任务保持 queued，
+        // 由调度器在依赖完成后重新派发。
+        let queued = store::task_status(guard.conn(), task_id)? == TaskStatus::Queued;
+        let dependencies_ready = store::task_ready(guard.conn(), task_id)?;
+        if !queued || !dependencies_ready {
             drop(guard);
             let _ = gitops::remove_worktree(&repo, &worktree);
             clear_cancel_intent(ctx, task_id);
@@ -338,34 +342,29 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
     transition(&ctx.db, task_id, TaskStatus::Verifying)?;
 
     // 目标分支可能在 agent 执行期间前移：必须在收集证据前把 worktree rebase 到最新
-    // 目标 tip，否则证据与最终合并内容不一致。冲突直接转人工，不自动合并。
+    // 目标 tip，否则证据与最终合并内容不一致。有冲突文件且 ≤ 3、无高风险路径时
+    // 换到新基线自动重排；其余情况（高风险、冲突过大、重试次数用尽）以及没有
+    // 冲突文件的非冲突失败都转人工。
     let target_tip = gitops::rev_parse(&repo, &project.default_branch)?;
     let diff_base = if target_tip != base_sha {
-        match gitops::rebase_onto(&worktree, &target_tip) {
+        match gitops::rebase_onto_with_conflicts(&worktree, &target_tip) {
             Ok(()) => {
                 head = gitops::head_sha(&worktree)?;
                 target_tip
             }
-            Err(err) => {
-                {
-                    let guard = lock_db(&ctx.db)?;
-                    store::open_decision(
-                        guard.conn(),
-                        NewDecision {
-                            project_id: project.id.clone(),
-                            task_id: Some(task_id.to_string()),
-                            run_id: Some(run_id.clone()),
-                            kind: "rebase_failed".into(),
-                            prompt: format!(
-                                "目标分支 {} 已前移到 {target_tip}，rebase 失败：{err}",
-                                project.default_branch
-                            ),
-                            options: vec!["retry".into(), "abort".into()],
-                        },
-                    )?;
-                }
-                transition(&ctx.db, task_id, TaskStatus::NeedsHuman)?;
-                close_run(ctx, &run_id, "failed", Some("rebase failed"));
+            Err(conflict) => {
+                // 两条路径都写入事件与决策，冲突文件清单不能只留在 git 输出里。
+                handle_rebase_conflict(
+                    ctx,
+                    &project.id,
+                    task_id,
+                    &run_id,
+                    &project.default_branch,
+                    &target_tip,
+                    task.attempts,
+                    &conflict,
+                )?;
+                close_run(ctx, &run_id, "failed", Some("rebase conflict"));
                 return Ok(());
             }
         }
@@ -527,6 +526,7 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
         match merge_and_verify(
             ctx,
             &repo,
+            &worktree,
             &branch,
             &head,
             &project.default_branch,
@@ -601,6 +601,34 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
                 );
                 return Ok(());
             }
+            // 冲突处理与运行关闭都已在 `merge_and_verify` 内完成：任务要么已回到
+            // `queued` 等待自动重排，要么已随 `rebase_failed` 决策转入 `needs_human`。
+            Err(MergeFailure::Requeued) | Err(MergeFailure::RebaseFailed) => return Ok(()),
+            Err(MergeFailure::PostRebaseEvidence(message)) => {
+                let guard = lock_db(&ctx.db)?;
+                store::open_decision(
+                    guard.conn(),
+                    NewDecision {
+                        project_id: project.id.clone(),
+                        task_id: Some(task_id.to_string()),
+                        run_id: Some(run_id.clone()),
+                        kind: "post_merge_failed".into(),
+                        prompt: format!(
+                            "目标分支前移后，rebase 到最新 tip 并在合并前重跑验收失败，未执行合并：{message}"
+                        ),
+                        options: vec!["retry".into(), "abort".into()],
+                    },
+                )?;
+                drop(guard);
+                transition(&ctx.db, task_id, TaskStatus::NeedsHuman)?;
+                close_run(
+                    ctx,
+                    &run_id,
+                    "failed",
+                    Some("post-rebase verification failed"),
+                );
+                return Ok(());
+            }
         }
     }
 
@@ -641,6 +669,122 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// rebase 冲突自动重排的文件数上限（`docs/data-model.md` §5）。
+const MAX_REBASE_CONFLICT_FILES: usize = 3;
+
+/// 冲突路径是否命中高风险类别。复用审查阶段的 [`evidence::classify_risk`]，保证
+/// rebase 重排与证据门使用同一套路径规则；冲突文件没有删除语义，因此只关心
+/// 依赖清单、数据库迁移、CI 配置与密钥四类。
+fn rebase_conflict_high_risk(files: &[String]) -> bool {
+    let changes = files
+        .iter()
+        .map(|path| evidence::FileChange {
+            path: path.clone(),
+            status: 'M',
+        })
+        .collect::<Vec<_>>();
+    evidence::classify_risk(&changes).iter().any(|flag| {
+        matches!(
+            flag.kind,
+            RiskKind::Dependency | RiskKind::Migration | RiskKind::Ci | RiskKind::Secret
+        )
+    })
+}
+
+/// 冲突处理结果：状态迁移与事件/决策都已写入，调用方只需关闭当前运行并按结果
+/// 决定是否继续。
+enum RebaseDisposition {
+    /// 冲突在阈值内且仍有重试次数：任务已 `verifying -> failed -> queued`。
+    Retried,
+    /// 冲突过大、命中高风险路径、重试次数用尽，或 rebase 因非冲突原因失败
+    /// （冲突文件为空）：决策已打开并转入 `needs_human`。
+    NeedsHuman,
+}
+
+/// 统一的 rebase 冲突策略：先在任务事件里记录目标 tip、冲突文件与尝试次数，
+/// 再按 `docs/data-model.md` §5 的阈值决定自动重排还是转人工。只有存在冲突文件
+/// 且文件数在阈值内、无高风险路径、仍有重试次数时才自动重排；冲突文件为空
+/// （rebase 因非冲突原因失败）一律转人工，不消耗自动重试次数。证据收集前的
+/// rebase 与合并前的 rebase 共用本函数，保证两条路径的策略完全一致。
+fn handle_rebase_conflict(
+    ctx: &RunContext,
+    project_id: &str,
+    task_id: &str,
+    run_id: &str,
+    default_branch: &str,
+    target_tip: &str,
+    entry_attempts: u32,
+    conflict: &gitops::RebaseConflict,
+) -> Result<RebaseDisposition, String> {
+    let guard = lock_db(&ctx.db)?;
+    let current: u32 = guard
+        .conn()
+        .query_row(
+            "SELECT attempts FROM tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("读取尝试次数失败：{e}"))?;
+    // 正常流程中 `start_run` 已把 `tasks.attempts` 同步为本次 attempt；
+    // 同时参考入口快照，兼容调度器/人工直接把 attempts 调到上限的收紧操作。
+    let attempts = current.max(entry_attempts);
+    // 冲突文件为空说明 rebase 是被非冲突原因（hook、损坏的基线、非法目标 ref 等）
+    // 拒绝的：换基线重试没有意义，直接转人工，不能消耗任何自动重试次数。
+    let retry = !conflict.files.is_empty()
+        && conflict.files.len() <= MAX_REBASE_CONFLICT_FILES
+        && !rebase_conflict_high_risk(&conflict.files)
+        && attempts < store::MAX_ATTEMPTS;
+    let kind = if retry {
+        "rebase_retry"
+    } else {
+        "rebase_failed"
+    };
+    store::append_event(
+        guard.conn(),
+        NewEvent {
+            project_id: project_id.to_string(),
+            entity: "task".into(),
+            entity_id: task_id.to_string(),
+            kind: kind.into(),
+            payload: serde_json::json!({
+                "run_id": run_id,
+                "target_tip": target_tip,
+                "files": &conflict.files,
+                "attempts": attempts,
+                "message": &conflict.message,
+                "auto_retry": retry,
+            }),
+        },
+    )?;
+    if retry {
+        store::transition(guard.conn(), task_id, TaskStatus::Failed)?;
+        store::transition(guard.conn(), task_id, TaskStatus::Queued)?;
+        return Ok(RebaseDisposition::Retried);
+    }
+    let files = if conflict.files.is_empty() {
+        "（无）".to_string()
+    } else {
+        conflict.files.join("\n")
+    };
+    store::open_decision(
+        guard.conn(),
+        NewDecision {
+            project_id: project_id.to_string(),
+            task_id: Some(task_id.to_string()),
+            run_id: Some(run_id.to_string()),
+            kind: "rebase_failed".into(),
+            prompt: format!(
+                "目标分支 {default_branch} 已前移到 {target_tip}，rebase 冲突：{}\n冲突文件（{}）：\n{files}",
+                conflict.message,
+                conflict.files.len(),
+            ),
+            options: vec!["retry".into(), "abort".into()],
+        },
+    )?;
+    store::transition(guard.conn(), task_id, TaskStatus::NeedsHuman)?;
+    Ok(RebaseDisposition::NeedsHuman)
+}
+
 /// 把默认分支快进到**被审查的那个提交**：分支必须先仍指向 `head`，合并后 HEAD 必须
 /// 恰好等于 `head`。任何偏移都说明审查对象与实际合并对象不一致，调用方转人工处理。
 fn merge_reviewed_head(repo: &Path, branch: &str, head: &str) -> Result<String, String> {
@@ -668,6 +812,12 @@ enum MergeFailure {
         message: String,
         rollback_error: Option<String>,
     },
+    /// 目标 tip 在证据收集后前移且 rebase 冲突，已按阈值自动重排；运行已关闭。
+    Requeued,
+    /// 目标 tip 在证据收集后前移且 rebase 冲突，已打开 `rebase_failed` 决策；运行已关闭。
+    RebaseFailed,
+    /// rebase 到新 tip 后重跑验收失败，尚未合并；调用方需打开决策并转人工。
+    PostRebaseEvidence(String),
 }
 
 /// 仅在目标分支仍停在本次合并产生的提交时才回滚；返回值作为 `rollback_error`
@@ -685,12 +835,18 @@ fn rollback_to_pre_merge(repo: &Path, merged: &str, pre_merge_sha: &str) -> Opti
     }
 }
 
-/// 在合并锁内完成：记录合并前提交、校验分支仍指向被审查的 head、快进合并、
-/// 再在目标仓库重跑全部验收标准。任何验收不满足都尝试回滚到合并前提交；
-/// 若目标 tip 已被外部提交前移则跳过回滚，交由人工处理。
+/// 在合并锁内完成：校验分支仍指向被审查的 head；若目标 tip 在证据收集后前移，
+/// 先把 worktree rebase 到新 tip 并在 worktree 内重跑全部验收标准（新证据写入本次
+/// run），再用新 head 快进合并；合并后仍在目标仓库重跑验收，失败则尝试回滚。
+///
+/// 合并锁必须覆盖 rebase、重跑验收与合并本身：并发任务的合并因此串行，后到者
+/// 一定会看到前一个任务推进后的 tip，从而在锁内换基线而不是快进失败。验收命令
+/// 在锁内执行（每条最多 600s）是刻意取舍：宁可合并排队，也不能让“验证过的提交”
+/// 与“最终合并的提交”之间的基线再次移动。
 fn merge_and_verify(
     ctx: &RunContext,
     repo: &Path,
+    worktree: &Path,
     branch: &str,
     head: &str,
     default_branch: &str,
@@ -708,8 +864,65 @@ fn merge_and_verify(
             "目标仓库当前不在默认分支 {default_branch}（实际 {current_branch}），拒绝合并"
         )));
     }
+    let mut head = head.to_string();
+
+    // 分支必须先仍指向被审查的提交；否则 rebase 会把别人的提交也带进来。
+    let branch_sha = gitops::rev_parse(repo, branch).map_err(MergeFailure::Merge)?;
+    if branch_sha != head {
+        return Err(MergeFailure::Merge(format!(
+            "分支 {branch} 已移动到 {branch_sha}，不再是被审查的 {head}"
+        )));
+    }
     let pre_merge_sha = gitops::rev_parse(repo, default_branch).map_err(MergeFailure::Merge)?;
-    let merged = match merge_reviewed_head(repo, branch, head) {
+
+    if !gitops::is_ancestor(repo, &pre_merge_sha, &head).map_err(MergeFailure::Merge)? {
+        // 证据收集完成到合并之间目标分支又前移了（并发任务先完成合并）：旧 head
+        // 无法快进。先在 worktree 内换基线，成功后基于新 head 重新验证并合并。
+        match gitops::rebase_onto_with_conflicts(worktree, &pre_merge_sha) {
+            Ok(()) => {
+                head = gitops::head_sha(worktree).map_err(MergeFailure::Merge)?;
+                // 新基线可能改变验收结果（例如目标分支新增了依赖或配置），
+                // 必须重跑；新证据仍挂在同一个 run 上，证据门以最新行为准。
+                let outcomes =
+                    run_acceptance(ctx, detail, worktree, output_dir, run_id, "merge-rebase-")
+                        .map_err(MergeFailure::PostRebaseEvidence)?;
+                let failures = outcomes
+                    .iter()
+                    .filter(|outcome| !outcome.satisfied)
+                    .map(|outcome| outcome.note.clone())
+                    .collect::<Vec<_>>();
+                if !failures.is_empty() {
+                    return Err(MergeFailure::PostRebaseEvidence(format!(
+                        "rebase 到 {pre_merge_sha} 后重跑验收失败：{}",
+                        failures.join("；")
+                    )));
+                }
+            }
+            Err(conflict) => {
+                // 与证据收集前的 rebase 共用同一套阈值策略（含无冲突文件的非冲突
+                // 失败）；状态迁移与决策已由 `handle_rebase_conflict` 写入，这里
+                // 只需关闭本次运行。
+                let disposition = handle_rebase_conflict(
+                    ctx,
+                    &detail.task.project_id,
+                    &detail.task.id,
+                    run_id,
+                    default_branch,
+                    &pre_merge_sha,
+                    detail.task.attempts,
+                    &conflict,
+                )
+                .map_err(MergeFailure::Merge)?;
+                close_run(ctx, run_id, "failed", Some("rebase conflict before merge"));
+                return Err(match disposition {
+                    RebaseDisposition::Retried => MergeFailure::Requeued,
+                    RebaseDisposition::NeedsHuman => MergeFailure::RebaseFailed,
+                });
+            }
+        }
+    }
+
+    let merged = match merge_reviewed_head(repo, branch, &head) {
         Ok(sha) => sha,
         Err(err) => {
             // 合并过程中的失败若已把目标分支快进到被审查的 head，才回滚；
@@ -1087,7 +1300,7 @@ fn close_run(ctx: &RunContext, run_id: &str, status: &str, error: Option<&str>) 
 mod tests {
     use super::*;
     use crate::agent::{AgentManifest, AuthState, Capabilities, DetectResult, EventSink};
-    use crate::store::{Criterion, NewTask};
+    use crate::store::{Criterion, NewRun, NewTask};
     use std::fs;
 
     fn test_manifest(id: &str) -> AgentManifest {
@@ -1206,10 +1419,11 @@ mod tests {
         }
     }
 
-    /// 在 `start` 中让默认分支与 worktree 改动同一行：worktree 基于旧提交，
+    /// 在 `start` 中让默认分支与 worktree 改动同一批文件：worktree 基于旧提交，
     /// 默认分支已前移，orchestrator 的 rebase 必然冲突。
     struct ConflictingAdapter {
         repo: PathBuf,
+        files: Vec<&'static str>,
     }
 
     impl AgentAdapter for ConflictingAdapter {
@@ -1222,8 +1436,16 @@ mod tests {
         }
 
         fn start(&self, spec: RunSpec, sink: EventSink) -> Result<SessionHandle, String> {
-            fs::write(spec.cwd.join("README.md"), "agent change\n").map_err(|e| e.to_string())?;
-            fs::write(self.repo.join("README.md"), "main change\n").map_err(|e| e.to_string())?;
+            for path in &self.files {
+                for (root, side) in [(&spec.cwd, "agent"), (&self.repo, "main")] {
+                    let dest = root.join(path);
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    fs::write(&dest, format!("{side} {path}\n")).map_err(|e| e.to_string())?;
+                }
+            }
+            run_git(&self.repo, &["add", "-A"]);
             run_git(
                 &self.repo,
                 &[
@@ -1233,7 +1455,7 @@ mod tests {
                     "user.email=t@t",
                     "commit",
                     "-q",
-                    "-am",
+                    "-m",
                     "advance main",
                 ],
             );
@@ -1242,6 +1464,139 @@ mod tests {
             });
             Ok(SessionHandle {
                 id: "conflicting-1".into(),
+            })
+        }
+
+        fn respond(
+            &self,
+            _handle: &SessionHandle,
+            _request_id: &str,
+            _decision: Decision,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn cancel(&self, _handle: &SessionHandle) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Worker 正常写 `done.txt`；reviewer 启动时（证据已收集、审查尚未落库）在默认
+    /// 分支提交一个独立文件，模拟并发任务在证据收集后完成合并。合并前必须 rebase
+    /// 到新 tip 才能快进，且该 rebase 无冲突。
+    struct MainAdvancingAdapter {
+        repo: PathBuf,
+    }
+
+    impl AgentAdapter for MainAdvancingAdapter {
+        fn manifest(&self) -> AgentManifest {
+            test_manifest("advancing")
+        }
+
+        fn detect(&self) -> DetectResult {
+            ok_detect()
+        }
+
+        fn start(&self, spec: RunSpec, sink: EventSink) -> Result<SessionHandle, String> {
+            if spec.prompt.contains("independent reviewer") {
+                fs::write(self.repo.join("main.txt"), "main\n").map_err(|e| e.to_string())?;
+                run_git(&self.repo, &["add", "-A"]);
+                run_git(
+                    &self.repo,
+                    &[
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@t",
+                        "commit",
+                        "-q",
+                        "-m",
+                        "advance main after evidence",
+                    ],
+                );
+            } else {
+                fs::write(spec.cwd.join("done.txt"), "ok\n").map_err(|e| e.to_string())?;
+            }
+            sink(AgentEvent::TextDelta {
+                text: r#"{"verdict":"pass","summary":"looks good","risk_flags":[],"test_diff":[]}"#
+                    .into(),
+            });
+            sink(AgentEvent::Ended {
+                status: RunStatus::Completed,
+            });
+            Ok(SessionHandle {
+                id: "advancing-1".into(),
+            })
+        }
+
+        fn respond(
+            &self,
+            _handle: &SessionHandle,
+            _request_id: &str,
+            _decision: Decision,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn cancel(&self, _handle: &SessionHandle) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Worker 修改 `files`；reviewer 启动时（证据已收集）在默认分支提交同样的文件，
+    /// 制造只会在合并前 rebase 阶段暴露的冲突。
+    struct MergeTimeConflictAdapter {
+        repo: PathBuf,
+        files: Vec<&'static str>,
+    }
+
+    impl AgentAdapter for MergeTimeConflictAdapter {
+        fn manifest(&self) -> AgentManifest {
+            test_manifest("merge-time-conflict")
+        }
+
+        fn detect(&self) -> DetectResult {
+            ok_detect()
+        }
+
+        fn start(&self, spec: RunSpec, sink: EventSink) -> Result<SessionHandle, String> {
+            if spec.prompt.contains("independent reviewer") {
+                for path in &self.files {
+                    fs::write(self.repo.join(path), format!("main {path}\n"))
+                        .map_err(|e| e.to_string())?;
+                }
+                run_git(&self.repo, &["add", "-A"]);
+                run_git(
+                    &self.repo,
+                    &[
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@t",
+                        "commit",
+                        "-q",
+                        "-m",
+                        "advance main after evidence",
+                    ],
+                );
+            } else {
+                for path in &self.files {
+                    let dest = spec.cwd.join(path);
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    fs::write(&dest, format!("agent {path}\n")).map_err(|e| e.to_string())?;
+                }
+            }
+            sink(AgentEvent::TextDelta {
+                text: r#"{"verdict":"pass","summary":"looks good","risk_flags":[],"test_diff":[]}"#
+                    .into(),
+            });
+            sink(AgentEvent::Ended {
+                status: RunStatus::Completed,
+            });
+            Ok(SessionHandle {
+                id: "merge-time-conflict-1".into(),
             })
         }
 
@@ -1393,6 +1748,141 @@ mod tests {
         assert!(detail.decisions.is_empty());
     }
 
+    /// 依赖边在 worktree 创建之后才落库（这里用已存在的未合并前置任务验证同一个
+    /// 检查点）：不得插入运行，任务保持 queued，worktree 被清理且 attempts 不变。
+    #[test]
+    fn queued_task_with_unmerged_dependency_does_not_start() {
+        let (ctx, task_id) = setup("true");
+        let guard = ctx.db.lock().unwrap();
+        let project_id = store::get_task(guard.conn(), &task_id)
+            .unwrap()
+            .task
+            .project_id;
+        let blocker = store::create_task(
+            guard.conn(),
+            NewTask {
+                project_id,
+                title: "blocker".into(),
+                prompt: String::new(),
+                criteria: Vec::new(),
+            },
+        )
+        .unwrap();
+        store::add_dependency(guard.conn(), &task_id, &blocker.id).unwrap();
+        drop(guard);
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Queued);
+        let repo = repo_of(&ctx, &task_id);
+        assert_eq!(
+            gitops::list_worktrees(&repo).unwrap().len(),
+            1,
+            "未就绪任务不得留下 worktree"
+        );
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        assert_eq!(detail.task.attempts, 0);
+        assert!(detail.runs.is_empty(), "未就绪任务不得插入运行");
+        assert!(
+            !detail.events.iter().any(|row| row.kind == "run_started"),
+            "未就绪任务不得记录 run_started"
+        );
+    }
+
+    /// 证据收集完成后目标分支才被并发任务推进：合并前必须在锁内 rebase 到新 tip、
+    /// 在 worktree 重跑验收，再用新 head 快进，而不是落到 `merge_failed`。
+    #[test]
+    fn rebases_before_merge_when_target_tip_moved_after_evidence() {
+        let (ctx, task_id) = setup_with("test -f done.txt", |repo| {
+            Arc::new(MainAdvancingAdapter {
+                repo: repo.to_path_buf(),
+            })
+        });
+        let repo = repo_of(&ctx, &task_id);
+        let base = gitops::rev_parse(&repo, "main").unwrap();
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Merged);
+        // 并发任务提交的 main.txt 与本任务的 done.txt 必须同时出现在 main 上。
+        assert_eq!(fs::read_to_string(repo.join("main.txt")).unwrap(), "main\n");
+        assert_eq!(fs::read_to_string(repo.join("done.txt")).unwrap(), "ok\n");
+        let head = gitops::head_sha(&repo).unwrap();
+        assert_ne!(head, base);
+        assert!(gitops::is_ancestor(&repo, &base, &head).unwrap());
+
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        assert!(
+            !detail
+                .decisions
+                .iter()
+                .any(|row| row.kind == "merge_failed"),
+            "decisions: {:?}",
+            detail
+                .decisions
+                .iter()
+                .map(|row| row.kind.as_str())
+                .collect::<Vec<_>>()
+        );
+        let rebased = detail
+            .evidence
+            .iter()
+            .find(|row| {
+                row.criterion_id.as_deref() == Some("c-1")
+                    && row
+                        .output_path
+                        .as_deref()
+                        .is_some_and(|path| path.ends_with("merge-rebase-c-1.log"))
+            })
+            .expect("rebase 后重跑的验收证据");
+        assert_eq!(rebased.exit_code, Some(0));
+    }
+
+    /// 证据与审查都通过后目标分支才前移，且改动与任务冲突：合并前的 rebase 冲突
+    /// 必须走与证据收集前相同的阈值策略——单文件低风险自动重排，不产生决策。
+    #[test]
+    fn requeues_merge_time_rebase_conflict() {
+        let (ctx, task_id) = setup_with("true", |repo| {
+            Arc::new(MergeTimeConflictAdapter {
+                repo: repo.to_path_buf(),
+                files: vec!["README.md"],
+            })
+        });
+        let repo = repo_of(&ctx, &task_id);
+        let before = gitops::rev_parse(&repo, "main").unwrap();
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Queued);
+        assert_ne!(
+            gitops::rev_parse(&repo, "main").unwrap(),
+            before,
+            "并发任务的提交必须保留在默认分支上"
+        );
+
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        assert!(
+            detail.decisions.is_empty(),
+            "decisions: {:?}",
+            detail
+                .decisions
+                .iter()
+                .map(|row| row.kind.as_str())
+                .collect::<Vec<_>>()
+        );
+        let event = detail
+            .events
+            .iter()
+            .find(|row| row.kind == "rebase_retry")
+            .expect("rebase_retry event");
+        let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+        assert_eq!(payload["files"], serde_json::json!(["README.md"]));
+        assert_eq!(payload["auto_retry"], serde_json::json!(true));
+    }
+
     #[test]
     fn blocks_on_failed_evidence_and_opens_decision() {
         let (ctx, task_id) = setup("false");
@@ -1436,10 +1926,201 @@ mod tests {
         assert_eq!(decision.status, "open");
     }
 
+    /// 冲突文件 ≤ 3 且无高风险路径：换到新基线自动重排，不产生决策。
     #[test]
-    fn opens_rebase_failed_decision_when_default_branch_moved_conflictingly() {
+    fn requeues_small_rebase_conflict_without_decision() {
         let (ctx, task_id) = setup_with("true", |repo| {
             Arc::new(ConflictingAdapter {
+                repo: repo.to_path_buf(),
+                files: vec!["README.md"],
+            })
+        });
+        let repo = repo_of(&ctx, &task_id);
+        let before = gitops::rev_parse(&repo, "main").unwrap();
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        // 适配器在 worktree 创建之后前移了默认分支：单文件低风险冲突应直接重排。
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Queued);
+        assert_ne!(gitops::rev_parse(&repo, "main").unwrap(), before);
+
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        assert!(detail.review.is_none());
+        assert!(
+            detail.decisions.is_empty(),
+            "decisions: {:?}",
+            detail
+                .decisions
+                .iter()
+                .map(|row| row.kind.as_str())
+                .collect::<Vec<_>>()
+        );
+        let event = detail
+            .events
+            .iter()
+            .find(|row| row.kind == "rebase_retry")
+            .expect("rebase_retry event");
+        let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+        assert_eq!(payload["files"], serde_json::json!(["README.md"]));
+        assert_eq!(payload["auto_retry"], serde_json::json!(true));
+    }
+
+    /// 3 个冲突文件仍在上界之内（阈值为 `<= 3`），照常自动重排。
+    #[test]
+    fn requeues_rebase_conflict_at_three_files() {
+        let (ctx, task_id) = setup_with("true", |repo| {
+            Arc::new(ConflictingAdapter {
+                repo: repo.to_path_buf(),
+                files: vec!["a.txt", "b.txt", "c.txt"],
+            })
+        });
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Queued);
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        assert!(detail.decisions.is_empty());
+        let event = detail
+            .events
+            .iter()
+            .find(|row| row.kind == "rebase_retry")
+            .expect("rebase_retry event");
+        let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+        assert_eq!(
+            payload["files"].as_array().map(|files| files.len()),
+            Some(3)
+        );
+    }
+
+    /// 冲突文件超过 3 个：转人工，决策里保留完整文件清单。
+    #[test]
+    fn blocks_rebase_conflict_with_four_files() {
+        let files = ["a.txt", "b.txt", "c.txt", "d.txt"];
+        let (ctx, task_id) = setup_with("true", |repo| {
+            Arc::new(ConflictingAdapter {
+                repo: repo.to_path_buf(),
+                files: files.to_vec(),
+            })
+        });
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::NeedsHuman);
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        let decision = detail
+            .decisions
+            .iter()
+            .find(|row| row.kind == "rebase_failed" && row.status == "open")
+            .expect("rebase_failed decision");
+        for path in files {
+            assert!(
+                decision.prompt.contains(path),
+                "决策缺少冲突文件 {path}：{}",
+                decision.prompt
+            );
+        }
+    }
+
+    /// 依赖清单属于高风险路径：即使只有 1 个冲突文件也必须转人工。
+    #[test]
+    fn blocks_high_risk_rebase_conflict() {
+        let (ctx, task_id) = setup_with("true", |repo| {
+            Arc::new(ConflictingAdapter {
+                repo: repo.to_path_buf(),
+                files: vec!["Cargo.toml"],
+            })
+        });
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::NeedsHuman);
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        let decision = detail
+            .decisions
+            .iter()
+            .find(|row| row.kind == "rebase_failed" && row.status == "open")
+            .expect("rebase_failed decision");
+        assert!(
+            decision.prompt.contains("Cargo.toml"),
+            "prompt: {}",
+            decision.prompt
+        );
+    }
+
+    /// 重试次数已用尽：即使冲突很小也转人工并保留文件清单。
+    #[test]
+    fn blocks_rebase_conflict_when_attempts_exhausted() {
+        let (ctx, task_id) = setup_with("true", |repo| {
+            Arc::new(ConflictingAdapter {
+                repo: repo.to_path_buf(),
+                files: vec!["README.md"],
+            })
+        });
+        {
+            let guard = ctx.db.lock().unwrap();
+            for _ in 0..(store::MAX_ATTEMPTS - 1) {
+                store::start_run(
+                    guard.conn(),
+                    NewRun {
+                        id: None,
+                        task_id: task_id.clone(),
+                        adapter_id: "seed".into(),
+                        adapter_version: None,
+                        model: None,
+                        branch: None,
+                        worktree_path: None,
+                        base_sha: None,
+                    },
+                )
+                .unwrap();
+            }
+        }
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::NeedsHuman);
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        assert_eq!(detail.task.attempts, store::MAX_ATTEMPTS);
+        let decision = detail
+            .decisions
+            .iter()
+            .find(|row| row.kind == "rebase_failed" && row.status == "open")
+            .expect("rebase_failed decision");
+        assert!(
+            decision.prompt.contains("README.md"),
+            "prompt: {}",
+            decision.prompt
+        );
+        let event = detail
+            .events
+            .iter()
+            .find(|row| row.kind == "rebase_failed")
+            .expect("rebase_failed event");
+        let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+        assert_eq!(payload["attempts"], serde_json::json!(store::MAX_ATTEMPTS));
+        assert_eq!(payload["auto_retry"], serde_json::json!(false));
+    }
+
+    /// rebase 因非冲突原因失败（pre-rebase hook 拒绝）时没有任何冲突文件：不能
+    /// 换基线自动重排，必须立即打开 `rebase_failed` 决策转人工且不消耗重试。
+    #[test]
+    fn blocks_rebase_failure_without_conflict_files() {
+        let (ctx, task_id) = setup_with("test -f done.txt", |repo| {
+            let hook = repo.join(".git/hooks/pre-rebase");
+            fs::create_dir_all(hook.parent().unwrap()).unwrap();
+            fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&hook).unwrap().permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&hook, perms).unwrap();
+            }
+            Arc::new(MainAdvancingAdapter {
                 repo: repo.to_path_buf(),
             })
         });
@@ -1448,25 +2129,37 @@ mod tests {
 
         run_task_blocking(&ctx, &task_id).unwrap();
 
-        // 适配器在 worktree 创建之后前移了默认分支，rebase 冲突应直接转人工，
-        // 不产生审查、不合并。
         assert_eq!(status(&ctx, &task_id), TaskStatus::NeedsHuman);
-        assert_ne!(gitops::rev_parse(&repo, "main").unwrap(), before);
+        assert_ne!(
+            gitops::rev_parse(&repo, "main").unwrap(),
+            before,
+            "并发任务的提交必须保留在默认分支上"
+        );
 
         let guard = ctx.db.lock().unwrap();
         let detail = store::get_task(guard.conn(), &task_id).unwrap();
-        assert!(detail.review.is_none());
+        assert_eq!(detail.task.attempts, 1, "非冲突失败不能消耗自动重试");
         assert!(
-            detail
-                .decisions
-                .iter()
-                .any(|row| row.kind == "rebase_failed" && row.status == "open"),
-            "decisions: {:?}",
-            detail
-                .decisions
-                .iter()
-                .map(|row| row.kind.as_str())
-                .collect::<Vec<_>>()
+            !detail.events.iter().any(|row| row.kind == "rebase_retry"),
+            "非冲突失败不得自动重排"
+        );
+        let event = detail
+            .events
+            .iter()
+            .find(|row| row.kind == "rebase_failed")
+            .expect("rebase_failed event");
+        let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+        assert_eq!(payload["files"], serde_json::json!([]));
+        assert_eq!(payload["auto_retry"], serde_json::json!(false));
+        let decision = detail
+            .decisions
+            .iter()
+            .find(|row| row.kind == "rebase_failed" && row.status == "open")
+            .expect("rebase_failed decision");
+        assert!(
+            decision.prompt.contains("（无）"),
+            "prompt: {}",
+            decision.prompt
         );
     }
 

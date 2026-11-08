@@ -81,7 +81,9 @@ WHERE l.rel = 'blocks';
 ```
 
 - 传递闭包（A→B→C，A 间接阻塞 C）用递归 CTE 计算，不物化
+- 调度就绪判定：任务队列中最老的一条，且其传递闭包内所有依赖任务均为 `merged`
 - 边只允许指向同项目的 issue；写入时做同项目校验与环检测，失败直接拒绝
+- 并发上限来自 `projects.concurrency_limit`（1–16，默认 1）；调度器按项目统计运行中任务数，达到上限即不再认领
 
 ## 3. 任务状态机
 
@@ -126,7 +128,7 @@ stateDiagram-v2
 
 - 每个 run：`git worktree add <worktree> -b <branch> <base_sha>`
 - Agent 的 cwd 为 worktree；OMP 会话结束后收集：退出码、stdout/stderr、diff（`git diff base..head`）、未提交改动
-- 合并前若目标分支已前移，先在 worktree 内 rebase 到目标 tip；冲突立即 `rebase --abort` 并转人工
+- 合并前若目标分支已前移，先在 worktree 内 rebase 到目标 tip；冲突时 `rebase --abort`，冲突文件 ≤ 3 且无高风险路径则自动重排重试，否则转人工
 - 合并队列持有目标分支写锁（进程内单一 worker + 合并锁）；合并后立即在目标仓库重跑全部验收命令，失败则 `reset --hard` 回滚并转 `needs_human`
 - 任务取消：`queued → draft`；运行中取消通过适配器 `cancel`，随后按失败路径处理
 - worktree 生命周期：合并成功后删除；失败保留待调试；启动时 `git worktree prune` 并清理未在 `worktree list` 中的孤儿目录
