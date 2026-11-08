@@ -176,6 +176,21 @@ export type SearchHit = {
   snippet: string;
 };
 
+export type GlobalHit = {
+  kind: "task" | "doc" | "note";
+  id: string;
+  title: string;
+  snippet: string;
+  project_id: string | null;
+  vault_id: string | null;
+};
+
+export type GlobalSearchInput = {
+  query: string;
+  project_id?: string;
+  limit?: number;
+};
+
 export type AgentCapabilities = {
   streaming: boolean;
   approvals: boolean;
@@ -433,6 +448,10 @@ export function searchWorkspace(
   query: string,
 ): Promise<SearchHit[]> {
   return invoke<SearchHit[]>("search_workspace", { projectId, query });
+}
+
+export function globalSearch(input: GlobalSearchInput): Promise<GlobalHit[]> {
+  return invoke<GlobalHit[]>("global_search", { input });
 }
 
 export function createTaskFromNote(

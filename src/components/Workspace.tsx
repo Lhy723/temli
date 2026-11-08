@@ -64,9 +64,13 @@ const MARKDOWN_CLASS = [
 export function Workspace({
   projectId,
   mode,
+  focusDocId,
+  onFocusConsumed,
 }: {
   projectId: string;
   mode: WorkspaceMode;
+  focusDocId?: string;
+  onFocusConsumed?: () => void;
 }) {
   const [notes, setNotes] = useState<NoteMeta[]>([]);
   const [docs, setDocs] = useState<DocMeta[]>([]);
@@ -100,6 +104,7 @@ export function Workspace({
   const [taskError, setTaskError] = useState<string | null>(null);
 
   const loadRequest = useRef(0);
+  const focusConsumedRef = useRef<string | null>(null);
   const projectRef = useRef(projectId);
   projectRef.current = projectId;
 
@@ -162,6 +167,19 @@ export function Workspace({
       cancelled = true;
     };
   }, [projectId, mode]);
+
+  // 搜索面板深链：文档模式下直接打开目标文档并消费一次。
+  useEffect(() => {
+    if (!focusDocId) {
+      focusConsumedRef.current = null;
+      return;
+    }
+    if (mode !== "docs") return;
+    if (focusConsumedRef.current === focusDocId) return;
+    focusConsumedRef.current = focusDocId;
+    void openEntry("doc", focusDocId);
+    onFocusConsumed?.();
+  }, [focusDocId, mode, projectId, onFocusConsumed]);
 
   useEffect(() => {
     const query = searchQuery.trim();

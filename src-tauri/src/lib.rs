@@ -6,6 +6,7 @@ mod gitops;
 mod orchestrator;
 mod prompts;
 mod scheduler;
+mod search;
 mod store;
 mod sync;
 mod vaults;
@@ -124,6 +125,17 @@ struct SaveVaultNoteInput {
     body: Option<String>,
     #[serde(default)]
     path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GlobalSearchInput {
+    query: String,
+    /// 缺省 = 跨所有项目检索。
+    #[serde(default)]
+    project_id: Option<String>,
+    /// 缺省 = 20，服务端再夹到 1..=50。
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -777,6 +789,20 @@ fn search_workspace(
 }
 
 #[tauri::command]
+fn global_search(
+    state: State<AppState>,
+    input: GlobalSearchInput,
+) -> Result<Vec<search::GlobalHit>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    search::global_search(
+        db.conn(),
+        &input.query,
+        input.project_id.as_deref(),
+        input.limit.unwrap_or(search::DEFAULT_LIMIT),
+    )
+}
+
+#[tauri::command]
 fn link_context(state: State<AppState>, input: ContextLinkInput) -> Result<(), String> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     let task_item = store::task_item_id(db.conn(), &input.task_id)?;
@@ -939,6 +965,7 @@ pub fn run() {
             get_doc,
             reindex_workspace,
             search_workspace,
+            global_search,
             link_context,
             unlink_context,
             list_context

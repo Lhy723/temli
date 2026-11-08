@@ -1,10 +1,22 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Button, Card, Chip, Input } from "@heroui/react";
+import {
+  Button,
+  Card,
+  Chip,
+  Description,
+  Dropdown,
+  Header,
+  Input,
+  Label,
+  Separator,
+} from "@heroui/react";
+import { CommandPalette } from "./components/CommandPalette";
 import { DecisionInbox } from "./components/DecisionInbox";
 import { TasksPanel } from "./components/TasksPanel";
 import { Vaults } from "./components/Vaults";
 import { Workspace } from "./components/Workspace";
+import type { GlobalHit } from "./lib/api";
 import {
   Bot,
   ChevronDown,
@@ -81,22 +93,122 @@ function emptyCopy(view: ViewId) {
   }
 }
 
+const SELECTED_PROJECT_KEY = "temli.selectedProjectId";
+
+function readStoredProjectId(): string | null {
+  try {
+    return localStorage.getItem(SELECTED_PROJECT_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
+function storeProjectId(projectId: string | null) {
+  try {
+    if (projectId) localStorage.setItem(SELECTED_PROJECT_KEY, projectId);
+    else localStorage.removeItem(SELECTED_PROJECT_KEY);
+  } catch {
+    // localStorage may be unavailable; selection still works in memory.
+  }
+}
+
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(
+    readStoredProjectId,
+  );
   const [tabs, setTabs] = useState<{ id: ViewId; label: string }[]>([
     { id: "overview", label: "概览" },
   ]);
   const [active, setActive] = useState<ViewId>("overview");
   const [showRegister, setShowRegister] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [focusTaskId, setFocusTaskId] = useState<string | null>(null);
+  const [focusDocId, setFocusDocId] = useState<string | null>(null);
+  const [focusNoteId, setFocusNoteId] = useState<string | null>(null);
+  const [focusVaultId, setFocusVaultId] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<Project[]>("list_projects")
-      .then(setProjects)
-      .catch((e) => setError(String(e)));
+      .then((list) => {
+        setProjects(list);
+        setProjectsLoaded(true);
+      })
+      .catch((e) => {
+        setProjectsLoaded(true);
+        setError(String(e));
+      });
   }, []);
 
-  const current = projects[0] ?? null;
+  useEffect(() => {
+    if (!projectsLoaded) return;
+    if (selectedProjectId && projects.some((p) => p.id === selectedProjectId)) {
+      return;
+    }
+    const fallback = projects[0]?.id ?? null;
+    if (fallback !== selectedProjectId) setSelectedProjectId(fallback);
+  }, [projects, projectsLoaded, selectedProjectId]);
+
+  useEffect(() => {
+    storeProjectId(selectedProjectId);
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    function handleShortcut(event: KeyboardEvent) {
+      if (event.repeat) return;
+      if (!(event.metaKey || event.ctrlKey)) return;
+      if (event.altKey || event.key.toLowerCase() !== "k") return;
+      event.preventDefault();
+      setPaletteOpen((open) => !open);
+    }
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, []);
+
+  const current =
+    projects.find((project) => project.id === selectedProjectId) ??
+    projects[0] ??
+    null;
+
+  function clearFocus() {
+    setFocusTaskId(null);
+    setFocusDocId(null);
+    setFocusNoteId(null);
+    setFocusVaultId(null);
+  }
+
+  function switchProject(projectId: string | null) {
+    setSelectedProjectId(projectId);
+    clearFocus();
+  }
+
+  function openGlobalHit(hit: GlobalHit) {
+    if (
+      hit.kind !== "note" &&
+      hit.project_id &&
+      hit.project_id !== current?.id
+    ) {
+      switchProject(hit.project_id);
+    }
+    if (hit.kind === "task") {
+      setFocusTaskId(hit.id);
+      open("my");
+    } else if (hit.kind === "doc") {
+      setFocusDocId(hit.id);
+      open("docs");
+    } else {
+      setFocusNoteId(hit.id);
+      setFocusVaultId(hit.vault_id ?? null);
+      open("notes");
+    }
+  }
+
+  function consumeNoteFocus() {
+    setFocusNoteId(null);
+    setFocusVaultId(null);
+  }
 
   function open(id: ViewId) {
     setTabs((prev) =>
@@ -126,22 +238,71 @@ export default function App() {
     <div className="text-ui flex h-full overflow-hidden bg-[var(--background-secondary)] text-[var(--foreground)]">
       <aside className="flex w-[232px] shrink-0 flex-col px-2 pb-2 pt-9">
         <div className="flex items-center gap-0.5">
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-8 min-w-0 flex-1 justify-start gap-1.5 px-1.5 text-ui font-medium"
-            onPress={() => open("projects")}
-          >
-            <FolderKanban size={15} className="shrink-0 opacity-70" />
-            <span className="truncate">{current?.name ?? "temli"}</span>
-            <ChevronDown size={13} className="shrink-0 opacity-50" />
-          </Button>
+          <Dropdown>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-8 min-w-0 flex-1 justify-start gap-1.5 px-1.5 text-ui font-medium"
+              aria-label={`切换项目：${current?.name ?? "temli"}`}
+            >
+              <FolderKanban size={15} className="shrink-0 opacity-70" />
+              <span className="truncate">{current?.name ?? "temli"}</span>
+              <ChevronDown size={13} className="shrink-0 opacity-50" />
+            </Button>
+            <Dropdown.Popover className="min-w-[260px]">
+              <Dropdown.Menu
+                selectionMode="single"
+                selectedKeys={current ? [current.id] : []}
+                onAction={(key) => {
+                  const value = String(key);
+                  if (value === "register-project") {
+                    startRegister();
+                    return;
+                  }
+                  switchProject(value);
+                }}
+              >
+                {projects.length > 0 && (
+                  <Dropdown.Section>
+                    <Header>切换项目</Header>
+                    {projects.map((project) => (
+                      <Dropdown.Item
+                        key={project.id}
+                        id={project.id}
+                        textValue={`${project.name} ${project.repo_path}`}
+                      >
+                        <FolderKanban
+                          size={15}
+                          className="shrink-0 text-[var(--muted)]"
+                        />
+                        <div className="flex min-w-0 flex-1 flex-col">
+                          <Label>{project.name}</Label>
+                          <Description className="truncate">
+                            {project.repo_path}
+                          </Description>
+                        </div>
+                        {project.id === current?.id && (
+                          <Dropdown.ItemIndicator className="ms-auto" />
+                        )}
+                      </Dropdown.Item>
+                    ))}
+                  </Dropdown.Section>
+                )}
+                {projects.length > 0 && <Separator />}
+                <Dropdown.Item id="register-project" textValue="注册项目">
+                  <Plus size={15} className="shrink-0 text-[var(--muted)]" />
+                  <Label>注册项目</Label>
+                </Dropdown.Item>
+              </Dropdown.Menu>
+            </Dropdown.Popover>
+          </Dropdown>
           <Button
             isIconOnly
             variant="ghost"
             size="sm"
             className="h-8 w-8"
-            aria-label="搜索"
+            aria-label="全局搜索（⌘K）"
+            onPress={() => setPaletteOpen(true)}
           >
             <Search size={15} />
           </Button>
@@ -243,15 +404,27 @@ export default function App() {
           <section className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--background)] shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
             <header className="flex h-12 shrink-0 items-center justify-between border-b border-[var(--border)] px-4">
               <h1 className="text-ui font-medium">{TITLES[active]}</h1>
-              <Button
-                variant="primary"
-                size="sm"
-                className="h-7 gap-1 px-2.5 text-ui"
-                onPress={startRegister}
-              >
-                <Plus size={14} />
-                注册项目
-              </Button>
+              <div className="flex items-center gap-1">
+                <Button
+                  isIconOnly
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 w-7"
+                  aria-label="全局搜索（⌘K）"
+                  onPress={() => setPaletteOpen(true)}
+                >
+                  <Search size={14} />
+                </Button>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  className="h-7 gap-1 px-2.5 text-ui"
+                  onPress={startRegister}
+                >
+                  <Plus size={14} />
+                  注册项目
+                </Button>
+              </div>
             </header>
 
             <div className="flex h-9 shrink-0 items-center justify-between px-4">
@@ -292,7 +465,10 @@ export default function App() {
                   {!current && <EmptyProject onRegister={startRegister} />}
                   {current && (
                     <div className="flex flex-col gap-3">
-                      <ProjectList projects={projects} />
+                      <ProjectList
+                        projects={projects}
+                        selectedId={current.id}
+                      />
                       <DecisionInbox projectId={current.id} />
                     </div>
                   )}
@@ -303,7 +479,12 @@ export default function App() {
                 <>
                   {!current && <EmptyProject onRegister={startRegister} />}
                   {current && (
-                    <TasksPanel key={current.id} projectId={current.id} />
+                    <TasksPanel
+                      key={current.id}
+                      projectId={current.id}
+                      focusTaskId={focusTaskId ?? undefined}
+                      onFocusConsumed={() => setFocusTaskId(null)}
+                    />
                   )}
                 </>
               )}
@@ -315,13 +496,16 @@ export default function App() {
                       onCancel={() => setShowRegister(false)}
                       onRegistered={(project) => {
                         setProjects((prev) => [...prev, project]);
+                        switchProject(project.id);
                         setShowRegister(false);
                         setError(null);
                       }}
                       onError={setError}
                     />
                   )}
-                  {projects.length > 0 && <ProjectList projects={projects} />}
+                  {projects.length > 0 && (
+                    <ProjectList projects={projects} selectedId={current?.id} />
+                  )}
                   {projects.length === 0 && !showRegister && (
                     <EmptyProject onRegister={startRegister} />
                   )}
@@ -332,12 +516,23 @@ export default function App() {
                 <>
                   {!current && <EmptyProject onRegister={startRegister} />}
                   {current && (
-                    <Workspace projectId={current.id} mode="docs" />
+                    <Workspace
+                      projectId={current.id}
+                      mode="docs"
+                      focusDocId={focusDocId ?? undefined}
+                      onFocusConsumed={() => setFocusDocId(null)}
+                    />
                   )}
                 </>
               )}
 
-              {active === "notes" && <Vaults />}
+              {active === "notes" && (
+                <Vaults
+                  focusNoteId={focusNoteId ?? undefined}
+                  focusVaultId={focusVaultId ?? undefined}
+                  onFocusConsumed={consumeNoteFocus}
+                />
+              )}
 
               {active !== "overview" &&
                 active !== "my" &&
@@ -357,6 +552,14 @@ export default function App() {
           </section>
         </main>
       </div>
+
+      <CommandPalette
+        isOpen={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        projectId={current?.id ?? null}
+        projectName={current?.name ?? null}
+        onSelect={openGlobalHit}
+      />
     </div>
   );
 }
@@ -373,7 +576,13 @@ function EmptyProject({ onRegister }: { onRegister: () => void }) {
   );
 }
 
-function ProjectList({ projects }: { projects: Project[] }) {
+function ProjectList({
+  projects,
+  selectedId,
+}: {
+  projects: Project[];
+  selectedId?: string | null;
+}) {
   return (
     <div className="overflow-hidden rounded-md border border-[var(--border)]">
       <div className="text-ui-sm grid grid-cols-[1.2fr_1.8fr_100px_88px] gap-3 border-b border-[var(--border)] bg-[var(--background-secondary)] px-3 py-1.5 text-[var(--muted)]">
@@ -382,22 +591,42 @@ function ProjectList({ projects }: { projects: Project[] }) {
         <span>分支</span>
         <span>状态</span>
       </div>
-      {projects.map((project) => (
-        <div
-          key={project.id}
-          className="anim-fast text-ui grid h-9 grid-cols-[1.2fr_1.8fr_100px_88px] items-center gap-3 border-b border-[var(--border)] px-3 last:border-b-0 hover:bg-[var(--background-secondary)]"
-        >
-          <span className="flex items-center gap-2">
-            <FolderKanban size={15} className="text-[var(--muted)]" />
-            {project.name}
-          </span>
-          <span className="truncate text-[var(--muted)]">{project.repo_path}</span>
-          <span className="text-[var(--muted)]">{project.default_branch}</span>
-          <Chip size="sm" variant="soft" color="success">
-            已注册
-          </Chip>
-        </div>
-      ))}
+      {projects.map((project) => {
+        const isSelected = project.id === selectedId;
+        return (
+          <div
+            key={project.id}
+            className={`anim-fast text-ui grid h-9 grid-cols-[1.2fr_1.8fr_100px_88px] items-center gap-3 border-b border-[var(--border)] px-3 last:border-b-0 hover:bg-[var(--background-secondary)] ${
+              isSelected ? "bg-[var(--background-secondary)]" : ""
+            }`}
+          >
+            <span className="flex items-center gap-2">
+              <FolderKanban
+                size={15}
+                className={
+                  isSelected
+                    ? "text-[var(--accent)]"
+                    : "text-[var(--muted)]"
+                }
+              />
+              {project.name}
+            </span>
+            <span className="truncate text-[var(--muted)]">
+              {project.repo_path}
+            </span>
+            <span className="text-[var(--muted)]">
+              {project.default_branch}
+            </span>
+            <Chip
+              size="sm"
+              variant="soft"
+              color={isSelected ? "accent" : "success"}
+            >
+              {isSelected ? "当前" : "已注册"}
+            </Chip>
+          </div>
+        );
+      })}
     </div>
   );
 }
