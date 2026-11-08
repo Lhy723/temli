@@ -35,6 +35,9 @@ export type RunRow = {
   started_at: string | null;
   ended_at: string | null;
   error: string | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  pr_state: string | null;
 };
 
 export type EvidenceRow = {
@@ -104,6 +107,27 @@ export type SetProjectConcurrencyInput = {
   limit: number;
 };
 
+export type ProjectIssue = {
+  id: string;
+  title: string;
+  status: string;
+  github_state: string | null;
+  github_number: number | null;
+  ghost: boolean;
+  task_id: string | null;
+};
+
+export type UpdateIssueInput = {
+  item_id: string;
+  title?: string;
+  body?: string;
+};
+
+export type SetAutoMergeInput = {
+  project_id: string;
+  enabled: boolean;
+};
+
 export function listTasks(projectId: string): Promise<TaskSummary[]> {
   return invoke<TaskSummary[]>("list_tasks", { projectId });
 }
@@ -161,6 +185,30 @@ export function setProjectConcurrency(
   return invoke<void>("set_project_concurrency", { input });
 }
 
+export function syncNow(projectId: string): Promise<void> {
+  return invoke<void>("sync_now", { projectId });
+}
+
+export function updateIssue(input: UpdateIssueInput): Promise<void> {
+  return invoke<void>("update_issue", { input });
+}
+
+export function publishTask(taskId: string): Promise<number> {
+  return invoke<number>("publish_task", { taskId });
+}
+
+export function getProjectIssues(projectId: string): Promise<ProjectIssue[]> {
+  return invoke<ProjectIssue[]>("get_project_issues", { projectId });
+}
+
+export function getAutoMerge(projectId: string): Promise<boolean> {
+  return invoke<boolean>("get_auto_merge", { projectId });
+}
+
+export function setAutoMerge(input: SetAutoMergeInput): Promise<void> {
+  return invoke<void>("set_auto_merge", { input });
+}
+
 const STATUS_LABELS: Record<string, string> = {
   draft: "草稿",
   ready: "就绪",
@@ -176,6 +224,8 @@ const STATUS_LABELS: Record<string, string> = {
   cancelled: "已取消",
   canceled: "已取消",
   waiting_approval: "待审批",
+  open: "打开",
+  closed: "已关闭",
 };
 
 export function statusLabel(status: string): string {

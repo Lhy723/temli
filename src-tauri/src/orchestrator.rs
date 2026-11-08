@@ -30,6 +30,8 @@ pub struct RunContext {
     pub merge_lock: Arc<Mutex<()>>,
     /// 已请求取消但尚未拿到会话的任务（取消意图）。
     pub cancelled: Arc<Mutex<HashSet<String>>>,
+    /// GitHub 操作面；未配置远端时为 None。
+    pub github: Option<Arc<dyn crate::github::GitHubOps>>,
 }
 
 /// 任务 id -> (适配器, 会话句柄)，用于取消正在运行的任务。
@@ -135,6 +137,88 @@ fn task_max_minutes(ctx: &RunContext, task_id: &str) -> u32 {
         )
         .unwrap_or(30);
     minutes.clamp(0, 1440) as u32
+}
+
+/// 项目的自动合并开关；缺失、读取失败或旧库默认值都视为关闭。读取失败时绝不能
+/// 回退到“开启”，否则一次数据库抖动就可能把未经人工确认的改动推到默认分支。
+fn project_auto_merge(ctx: &RunContext, project_id: &str) -> bool {
+    let Ok(guard) = ctx.db.lock() else {
+        return false;
+    };
+    guard
+        .conn()
+        .query_row(
+            "SELECT auto_merge FROM projects WHERE id = ?1",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .unwrap_or(false)
+}
+
+/// 自动合并所需的 GitHub 上下文：开关为真、项目配置了 `owner/repo`、且本次运行
+/// 注入了 `GitHubOps`。任一条件不满足都回退到本地快进合并路径。
+#[derive(Clone)]
+struct AutoMergeConfig {
+    ops: Arc<dyn crate::github::GitHubOps>,
+    /// GitHub API 的 `owner/repo` 形式。
+    repo: String,
+}
+
+fn auto_merge_config(ctx: &RunContext, project: &crate::db::Project) -> Option<AutoMergeConfig> {
+    if !project_auto_merge(ctx, &project.id) {
+        return None;
+    }
+    let ops = ctx.github.clone()?;
+    let owner = project.github_owner.as_deref()?.trim();
+    let repo = project.github_repo.as_deref()?.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(AutoMergeConfig {
+        ops,
+        repo: format!("{owner}/{repo}"),
+    })
+}
+
+/// PR 检查轮询间隔与总超时。
+const AUTO_MERGE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+const AUTO_MERGE_CHECK_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 永远不会再变绿的检查结论；出现任意一条就没必要继续轮询到超时。
+const FAILED_CHECK_BUCKETS: &[&str] = &[
+    "failure",
+    "cancelled",
+    "timed_out",
+    "action_required",
+    "startup_failure",
+    "stale",
+];
+
+/// 空检查列表不算通过：没有任何检查信息的 PR 不能自动合并。
+fn checks_passed(checks: &[crate::github::CheckRun]) -> bool {
+    !checks.is_empty()
+        && checks
+            .iter()
+            .all(|check| matches!(check.bucket.as_str(), "success" | "skipped" | "neutral"))
+}
+
+fn checks_failed_terminally(checks: &[crate::github::CheckRun]) -> bool {
+    checks
+        .iter()
+        .any(|check| FAILED_CHECK_BUCKETS.contains(&check.bucket.as_str()))
+}
+
+/// 把检查状态整理成决策正文里的可读清单。
+fn describe_checks(checks: &[crate::github::CheckRun]) -> String {
+    if checks.is_empty() {
+        return "（没有检查结果）".to_string();
+    }
+    checks
+        .iter()
+        .map(|check| format!("- {}: {} ({})", check.name, check.bucket, check.state))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> {
@@ -521,8 +605,119 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
         .map(|name| name == project.default_branch)
         .unwrap_or(false);
     let approvals_supported = ctx.adapter.manifest().capabilities.approvals;
+    let auto_merge = auto_merge_config(ctx, &project);
 
     if verdict == "pass" && ready && !has_high_risk && on_default_branch && approvals_supported {
+        if let Some(auto_merge) = auto_merge {
+            match auto_merge_pull_request(
+                ctx,
+                &auto_merge,
+                &repo,
+                &branch,
+                &head,
+                &project.default_branch,
+                &task,
+                &run_id,
+                &review.summary,
+            ) {
+                Ok(pr) => {
+                    let guard = lock_db(&ctx.db)?;
+                    store::append_event(
+                        guard.conn(),
+                        NewEvent {
+                            project_id: project.id.clone(),
+                            entity: "task".into(),
+                            entity_id: task_id.to_string(),
+                            kind: "merged".into(),
+                            payload: serde_json::json!({
+                                "pr_number": pr.number,
+                                "pr_url": pr.url,
+                                "branch": branch,
+                            }),
+                        },
+                    )?;
+                    drop(guard);
+                    let _ = gitops::remove_worktree(&repo, &worktree);
+                    close_run(ctx, &run_id, "completed", None);
+                    transition(&ctx.db, task_id, TaskStatus::Merged)?;
+                    return Ok(());
+                }
+                Err(AutoMergeFailure::Setup(err)) => {
+                    let guard = lock_db(&ctx.db)?;
+                    store::open_decision(
+                        guard.conn(),
+                        NewDecision {
+                            project_id: project.id.clone(),
+                            task_id: Some(task_id.to_string()),
+                            run_id: Some(run_id.clone()),
+                            kind: "merge_failed".into(),
+                            prompt: format!("GitHub 自动合并准备失败：{err}"),
+                            options: vec!["retry".into(), "abort".into()],
+                        },
+                    )?;
+                    drop(guard);
+                    transition(&ctx.db, task_id, TaskStatus::NeedsHuman)?;
+                    close_run(ctx, &run_id, "failed", Some("auto-merge setup failed"));
+                    return Ok(());
+                }
+                Err(AutoMergeFailure::PullRequest { url, message }) => {
+                    let guard = lock_db(&ctx.db)?;
+                    store::open_decision(
+                        guard.conn(),
+                        NewDecision {
+                            project_id: project.id.clone(),
+                            task_id: Some(task_id.to_string()),
+                            run_id: Some(run_id.clone()),
+                            kind: "checks_failed".into(),
+                            prompt: format!("{message}\nPR：{url}"),
+                            options: vec!["retry".into(), "abort".into()],
+                        },
+                    )?;
+                    drop(guard);
+                    transition(&ctx.db, task_id, TaskStatus::NeedsHuman)?;
+                    close_run(ctx, &run_id, "failed", Some("PR merge failed"));
+                    return Ok(());
+                }
+                Err(AutoMergeFailure::Cancelled) => {
+                    // 取消优先于合并：PR 保持未合并，只结束本次运行。
+                    close_run(
+                        ctx,
+                        &run_id,
+                        "cancelled",
+                        Some("cancelled during PR checks"),
+                    );
+                    transition(&ctx.db, task_id, TaskStatus::Interrupted)?;
+                    return Ok(());
+                }
+                Err(AutoMergeFailure::MergedLocalSync { url, message }) => {
+                    // PR 已在远端合并：`pr_state` 保持 merged，本次失败只进入人工
+                    // 同步流程，不提供重试合并的选项。
+                    let guard = lock_db(&ctx.db)?;
+                    store::open_decision(
+                        guard.conn(),
+                        NewDecision {
+                            project_id: project.id.clone(),
+                            task_id: Some(task_id.to_string()),
+                            run_id: Some(run_id.clone()),
+                            kind: "local_sync_failed".into(),
+                            prompt: format!(
+                                "{message}\nPR：{url}\nPR 已在 GitHub 合并，请勿再次触发合并；请人工同步本地默认分支后处理该决策。"
+                            ),
+                            options: vec!["abort".into()],
+                        },
+                    )?;
+                    drop(guard);
+                    transition(&ctx.db, task_id, TaskStatus::NeedsHuman)?;
+                    close_run(
+                        ctx,
+                        &run_id,
+                        "failed",
+                        Some("PR merged but local sync failed"),
+                    );
+                    return Ok(());
+                }
+            }
+        }
         match merge_and_verify(
             ctx,
             &repo,
@@ -960,6 +1155,216 @@ fn merge_and_verify(
     Ok(merged)
 }
 
+/// 自动合并失败的时机：PR 尚未创建（无可展示链接）、PR 已存在但未合并、
+/// PR 已合并但本地同步失败（绝不能再重试合并），以及轮询期间被取消。
+enum AutoMergeFailure {
+    Setup(String),
+    PullRequest {
+        url: String,
+        message: String,
+    },
+    /// PR 已经在远端合并：本地默认分支未能同步时只能转人工，不能把这次失败
+    /// 当作可重试的合并失败（重试会把已合并的 PR 再提交一次）。
+    MergedLocalSync {
+        url: String,
+        message: String,
+    },
+    /// 轮询检查期间收到取消请求：PR 尚未合并，运行按取消收尾。
+    Cancelled,
+}
+
+/// 改写运行记录里的 PR 状态；调用方决定写入失败是否可重试。合并成功后的
+/// `merged` 状态必须最先落库，后续本地同步失败也不能回退它。
+fn mark_pr_state(
+    ctx: &RunContext,
+    run_id: &str,
+    pr: &crate::github::PullRequest,
+    state: &str,
+) -> Result<(), String> {
+    let guard = lock_db(&ctx.db)?;
+    store::set_run_pr(guard.conn(), run_id, pr.number, &pr.url, state)
+}
+
+/// 证据门与审查均已通过后的 GitHub 自动合并：
+/// 推送被审查分支 → 创建 PR → 轮询检查 → 合并 PR → 把本地默认分支快进到远端。
+///
+/// 推送后先确认 `origin/<branch>` 正是被审查的 `head`，确保 PR 的 head 没有被
+/// 移动过的分支顶替。轮询期间一并观察取消意图：一旦取消，PR 保持未合并并结束
+/// 本次运行。检查通过后的关键区（复核 head → 合并 → 写 merged → 本地快进）在
+/// `merge_lock` 内串行，且合并只钉在复核过的 `head` 上。合并走 squash，默认分支
+/// 上的提交是新提交，不能与 `head` 做严格 SHA 相等校验；这里改为要求拉取后默认
+/// 分支确实前进了。
+fn auto_merge_pull_request(
+    ctx: &RunContext,
+    cfg: &AutoMergeConfig,
+    repo: &Path,
+    branch: &str,
+    head: &str,
+    default_branch: &str,
+    task: &TaskRow,
+    run_id: &str,
+    review_summary: &str,
+) -> Result<crate::github::PullRequest, AutoMergeFailure> {
+    let current_branch = gitops::current_branch(repo).map_err(AutoMergeFailure::Setup)?;
+    if current_branch != default_branch {
+        return Err(AutoMergeFailure::Setup(format!(
+            "目标仓库当前不在默认分支 {default_branch}（实际 {current_branch}），拒绝自动合并"
+        )));
+    }
+    let branch_sha = gitops::rev_parse(repo, branch).map_err(AutoMergeFailure::Setup)?;
+    if branch_sha != head {
+        return Err(AutoMergeFailure::Setup(format!(
+            "分支 {branch} 已移动到 {branch_sha}，不再是被审查的 {head}"
+        )));
+    }
+    gitops::push_branch(repo, branch).map_err(AutoMergeFailure::Setup)?;
+    // push 会刷新 remote-tracking ref：PR 的 head 必须恰好是被审查的提交。
+    let pushed = format!("origin/{branch}");
+    let remote_sha = gitops::rev_parse(repo, &pushed).map_err(AutoMergeFailure::Setup)?;
+    if remote_sha != head {
+        return Err(AutoMergeFailure::Setup(format!(
+            "远端分支 {branch} 停在 {remote_sha}，与被审查的 {head} 不一致"
+        )));
+    }
+
+    let body = format!("由 temli 自动创建（run {run_id}）。\n\n审查结论：pass\n{review_summary}");
+    let pr = cfg
+        .ops
+        .create_pull_request(&cfg.repo, branch, default_branch, &task.title, &body)
+        .map_err(AutoMergeFailure::Setup)?;
+    {
+        let persisted = lock_db(&ctx.db).and_then(|guard| {
+            store::set_run_pr(guard.conn(), run_id, pr.number, &pr.url, &pr.state)
+        });
+        persisted.map_err(|err| AutoMergeFailure::PullRequest {
+            url: pr.url.clone(),
+            message: format!("记录 PR 信息失败：{err}"),
+        })?;
+    }
+
+    let deadline = Instant::now() + AUTO_MERGE_CHECK_TIMEOUT;
+    loop {
+        // 取消必须能在下一次轮询前生效：PR 尚未合并，直接停在当前状态。
+        if cancel_requested(ctx, &task.id) {
+            let _ = mark_pr_state(ctx, run_id, &pr, "cancelled");
+            return Err(AutoMergeFailure::Cancelled);
+        }
+        let checks_result = cfg.ops.pull_request_checks(&cfg.repo, pr.number);
+        // 拉取检查结果可能耗时：期间到达的取消同样要立即生效，否则会白等
+        // 一个轮询间隔后再合并。
+        if cancel_requested(ctx, &task.id) {
+            let _ = mark_pr_state(ctx, run_id, &pr, "cancelled");
+            return Err(AutoMergeFailure::Cancelled);
+        }
+        let checks = checks_result.map_err(|err| AutoMergeFailure::PullRequest {
+            url: pr.url.clone(),
+            message: format!("读取 PR 检查失败：{err}"),
+        })?;
+        if checks_passed(&checks) {
+            break;
+        }
+        if checks_failed_terminally(&checks) {
+            return Err(AutoMergeFailure::PullRequest {
+                url: pr.url.clone(),
+                message: format!("PR 检查未通过：\n{}", describe_checks(&checks)),
+            });
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(AutoMergeFailure::PullRequest {
+                url: pr.url.clone(),
+                message: format!(
+                    "等待 PR 检查超时（{} 分钟）：\n{}",
+                    AUTO_MERGE_CHECK_TIMEOUT.as_secs() / 60,
+                    describe_checks(&checks)
+                ),
+            });
+        }
+        std::thread::sleep((deadline - now).min(AUTO_MERGE_CHECK_INTERVAL));
+    }
+
+    // 检查通过后的关键区持合并锁执行：轮询本身不持锁，避免整个检查等待期把
+    // 并发任务串行化；但“复核 PR head → 合并 → 写 merged → 本地快进”必须原子，
+    // 否则并发任务可能在复核与合并之间推进目标分支。
+    let _lock = ctx
+        .merge_lock
+        .lock()
+        .map_err(|_| AutoMergeFailure::PullRequest {
+            url: pr.url.clone(),
+            message: "合并锁被占用".to_string(),
+        })?;
+
+    // 等待检查期间分支可能被改写：合并前刷新远端并再次确认 PR head 仍是被审查
+    // 的提交，避免把检查之后追加的提交一并合并。
+    let checked_head = gitops::fetch_origin(repo).and_then(|()| gitops::rev_parse(repo, &pushed));
+    let remote_head = checked_head.map_err(|err| AutoMergeFailure::PullRequest {
+        url: pr.url.clone(),
+        message: format!("合并前刷新远端分支失败：{err}"),
+    })?;
+    if remote_head != head {
+        return Err(AutoMergeFailure::PullRequest {
+            url: pr.url.clone(),
+            message: format!("等待检查期间分支 {branch} 被移动到 {remote_head}，拒绝合并"),
+        });
+    }
+
+    let pre_merge_sha = gitops::head_sha(repo).map_err(|err| AutoMergeFailure::PullRequest {
+        url: pr.url.clone(),
+        message: format!("读取本地 {default_branch} HEAD 失败：{err}"),
+    })?;
+
+    // 取消请求可能恰好落在检查通过之后、合并之前：拿到锁并复核 head 后再查一次。
+    if cancel_requested(ctx, &task.id) {
+        let _ = mark_pr_state(ctx, run_id, &pr, "cancelled");
+        return Err(AutoMergeFailure::Cancelled);
+    }
+
+    // 合并必须钉在刚复核过的被审查 head 上，避免 checks 之后新推的提交被一并合并。
+    cfg.ops
+        .merge_pull_request(&cfg.repo, pr.number, &head)
+        .map_err(|err| AutoMergeFailure::PullRequest {
+            url: pr.url.clone(),
+            message: format!("合并 PR 失败：{err}"),
+        })?;
+
+    // PR 已在远端合并：第一件事就是落 `merged` 状态。此后无论本地同步是否成功，
+    // 都不能再把它当作未合并的失败去重试合并。
+    if let Err(err) = mark_pr_state(ctx, run_id, &pr, "merged") {
+        return Err(AutoMergeFailure::MergedLocalSync {
+            url: pr.url.clone(),
+            message: format!("PR 已合并，但写入 merged 状态失败：{err}"),
+        });
+    }
+
+    // `git pull` 合并到当前分支：轮询期间用户若切走默认分支，绝不能把远端默认
+    // 分支快进到别的本地分支上。
+    let still_default = gitops::current_branch(repo)
+        .map(|name| name == default_branch)
+        .unwrap_or(false);
+    let pulled = if still_default {
+        gitops::fetch_origin(repo)
+            .and_then(|()| gitops::pull_ff(repo, default_branch))
+            .and_then(|()| gitops::head_sha(repo))
+    } else {
+        Err(format!(
+            "目标仓库已不在默认分支 {default_branch}，跳过本地更新"
+        ))
+    };
+    let after_sha = pulled.map_err(|err| AutoMergeFailure::MergedLocalSync {
+        url: pr.url.clone(),
+        message: format!("PR 已合并，但更新本地 {default_branch} 失败：{err}"),
+    })?;
+    // squash 合并会产生新的提交，无法与被审查的 head 比对；只要求目标分支前进，
+    // 说明本地确实拿到了 PR 的合并结果。
+    if after_sha == pre_merge_sha {
+        return Err(AutoMergeFailure::MergedLocalSync {
+            url: pr.url.clone(),
+            message: format!("PR 已合并，但本地 {default_branch} 未前进，请人工核对"),
+        });
+    }
+    Ok(pr)
+}
+
 fn worker_prompt(task: &TaskRow) -> String {
     format!(
         "你在隔离的 git worktree 中开发。\n\n任务：{}\n\n{}\n\n要求：\n- 只修改完成任务所需的文件，不要触碰 .temli/。\n- 完成后运行仓库既有测试。\n- 不要执行 force push、删除仓库或修改 CI 密钥等破坏性操作。\n- 保持改动可审查、可回滚。",
@@ -1300,6 +1705,7 @@ fn close_run(ctx: &RunContext, run_id: &str, status: &str, error: Option<&str>) 
 mod tests {
     use super::*;
     use crate::agent::{AgentManifest, AuthState, Capabilities, DetectResult, EventSink};
+    use crate::github::{CheckRun, PullRequest};
     use crate::store::{Criterion, NewRun, NewTask};
     use std::fs;
 
@@ -1614,13 +2020,179 @@ mod tests {
         }
     }
 
+    /// 只覆盖自动合并用到的 GitHub 操作；其余方法在测试里不会被调用。
+    struct FakeGitHubOps {
+        checks: Mutex<Vec<CheckRun>>,
+        created: Mutex<Vec<(String, String)>>,
+        /// 每次合并请求的 (PR 编号, 钉住的 head SHA)。
+        merged: Mutex<Vec<(u64, String)>>,
+        calls: Mutex<Vec<&'static str>>,
+        /// 模拟 squash 合并的仓库：把分支压到 main 并推回 origin，供本地
+        /// `fetch + pull --ff-only` 验证。
+        repo: Mutex<Option<PathBuf>>,
+        /// 首次读取检查时写入取消意图，模拟轮询期间的取消请求。
+        cancel_on_checks: Mutex<Option<(Arc<Mutex<HashSet<String>>>, String)>>,
+        /// 远端合并成功后把本地默认分支改成分叉提交，模拟本地同步失败。
+        diverge_local: Mutex<bool>,
+    }
+
+    impl FakeGitHubOps {
+        fn new(checks: Vec<CheckRun>) -> Self {
+            Self {
+                checks: Mutex::new(checks),
+                created: Mutex::new(Vec::new()),
+                merged: Mutex::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
+                repo: Mutex::new(None),
+                cancel_on_checks: Mutex::new(None),
+                diverge_local: Mutex::new(false),
+            }
+        }
+
+        fn simulate_merge_in(&self, repo: PathBuf) {
+            *self.repo.lock().unwrap() = Some(repo);
+        }
+
+        fn cancel_on_checks(&self, cancelled: Arc<Mutex<HashSet<String>>>, task_id: String) {
+            *self.cancel_on_checks.lock().unwrap() = Some((cancelled, task_id));
+        }
+
+        fn diverge_local_after_merge(&self) {
+            *self.diverge_local.lock().unwrap() = true;
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::github::GitHubOps for FakeGitHubOps {
+        fn list_issues(
+            &self,
+            _repo: &str,
+            _etag: Option<&str>,
+        ) -> Result<crate::github::IssuePage, String> {
+            Err("fixture 未实现 list_issues".into())
+        }
+
+        fn get_issue(
+            &self,
+            _repo: &str,
+            _number: u64,
+        ) -> Result<crate::github::RemoteIssue, String> {
+            Err("fixture 未实现 get_issue".into())
+        }
+
+        fn update_issue(
+            &self,
+            _repo: &str,
+            _number: u64,
+            _patch: &crate::github::IssuePatch,
+        ) -> Result<crate::github::RemoteIssue, String> {
+            Err("fixture 未实现 update_issue".into())
+        }
+
+        fn create_issue(
+            &self,
+            _repo: &str,
+            _title: &str,
+            _body: &str,
+        ) -> Result<crate::github::RemoteIssue, String> {
+            Err("fixture 未实现 create_issue".into())
+        }
+
+        fn create_pull_request(
+            &self,
+            repo: &str,
+            head: &str,
+            base: &str,
+            _title: &str,
+            _body: &str,
+        ) -> Result<PullRequest, String> {
+            assert_eq!(repo, "acme/demo");
+            self.calls.lock().unwrap().push("create_pull_request");
+            self.created
+                .lock()
+                .unwrap()
+                .push((head.to_string(), base.to_string()));
+            Ok(PullRequest {
+                number: 42,
+                url: "https://github.com/acme/demo/pull/42".into(),
+                state: "open".into(),
+            })
+        }
+
+        fn pull_request_checks(&self, _repo: &str, _number: u64) -> Result<Vec<CheckRun>, String> {
+            self.calls.lock().unwrap().push("pull_request_checks");
+            let cancel = self.cancel_on_checks.lock().unwrap().take();
+            if let Some((cancelled, task_id)) = cancel {
+                cancelled.lock().unwrap().insert(task_id);
+            }
+            Ok(self.checks.lock().unwrap().clone())
+        }
+
+        fn merge_pull_request(&self, _repo: &str, number: u64, sha: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push("merge_pull_request");
+            self.merged.lock().unwrap().push((number, sha.to_string()));
+            if let Some(repo) = self.repo.lock().unwrap().clone() {
+                let head = self
+                    .created
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .map(|(head, _)| head.clone())
+                    .ok_or_else(|| "没有待合并的 PR".to_string())?;
+                let pre_merge = gitops::rev_parse(&repo, "HEAD")?;
+                run_git(&repo, &["merge", "--squash", head.as_str()]);
+                run_git(
+                    &repo,
+                    &[
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@t",
+                        "commit",
+                        "-q",
+                        "-m",
+                        "squash merge",
+                    ],
+                );
+                run_git(&repo, &["push", "-q", "origin", "main"]);
+                if *self.diverge_local.lock().unwrap() {
+                    // 远端已前进，本地却回到合并前再提交一次：`pull --ff-only`
+                    // 必然失败，但 PR 确实已经合并。
+                    run_git(&repo, &["reset", "--hard", &pre_merge]);
+                    run_git(
+                        &repo,
+                        &[
+                            "-c",
+                            "user.name=t",
+                            "-c",
+                            "user.email=t@t",
+                            "commit",
+                            "--allow-empty",
+                            "-q",
+                            "-m",
+                            "local only",
+                        ],
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+
     fn temp_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "temli-orch-{}",
+            "temli-orch-{}-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -1657,7 +2229,25 @@ mod tests {
         cmd: &str,
         adapter: impl FnOnce(&Path) -> Arc<dyn AgentAdapter>,
     ) -> (RunContext, String) {
+        setup_full(cmd, adapter, None, false)
+    }
+
+    /// 自动合并夹具：`ops` 为 Some 时项目写入 `acme/demo`；`auto_merge` 为真时
+    /// 额外建立 bare origin，保证 push / fetch / pull 可执行。
+    fn setup_full(
+        cmd: &str,
+        adapter: impl FnOnce(&Path) -> Arc<dyn AgentAdapter>,
+        ops: Option<Arc<dyn crate::github::GitHubOps>>,
+        auto_merge: bool,
+    ) -> (RunContext, String) {
         let repo = init_repo();
+        if auto_merge {
+            let remote = repo.with_extension("remote.git");
+            let remote_path = remote.to_string_lossy().into_owned();
+            run_git(&repo, &["init", "-q", "--bare", &remote_path]);
+            run_git(&repo, &["remote", "add", "origin", &remote_path]);
+            run_git(&repo, &["push", "-q", "-u", "origin", "main"]);
+        }
         let db_dir = temp_dir();
         let db = Db::open(&db_dir.join("temli.db")).unwrap();
         let project = db
@@ -1665,13 +2255,21 @@ mod tests {
                 crate::db::RegisterProjectInput {
                     repo_path: repo.to_string_lossy().into_owned(),
                     name: Some("demo".into()),
-                    github_owner: None,
-                    github_repo: None,
+                    github_owner: ops.as_ref().map(|_| "acme".into()),
+                    github_repo: ops.as_ref().map(|_| "demo".into()),
                     default_branch: Some("main".into()),
                 },
                 repo.canonicalize().unwrap(),
             )
             .unwrap();
+        if auto_merge {
+            db.conn()
+                .execute(
+                    "UPDATE projects SET auto_merge = 1 WHERE id = ?1",
+                    rusqlite::params![project.id],
+                )
+                .unwrap();
+        }
         let task = store::create_task(
             db.conn(),
             NewTask {
@@ -1695,6 +2293,7 @@ mod tests {
             cancels: CancelRegistry::new(),
             merge_lock: Arc::new(Mutex::new(())),
             cancelled: Arc::new(Mutex::new(HashSet::new())),
+            github: ops,
         };
         (ctx, task.id)
     }
@@ -2263,5 +2862,297 @@ mod tests {
         assert!(detail.review.is_none(), "握手取消不应进入审查");
         assert_eq!(detail.runs.len(), 1);
         assert_eq!(detail.runs[0].status, "cancelled");
+    }
+
+    fn green_check(name: &str, bucket: &str) -> CheckRun {
+        CheckRun {
+            name: name.into(),
+            state: "completed".into(),
+            bucket: bucket.into(),
+        }
+    }
+
+    fn run_pr_fields(
+        ctx: &RunContext,
+        task_id: &str,
+    ) -> (Option<i64>, Option<String>, Option<String>) {
+        let guard = ctx.db.lock().unwrap();
+        guard
+            .conn()
+            .query_row(
+                "SELECT pr_number, pr_url, pr_state FROM runs
+                 WHERE task_id = ?1 ORDER BY attempt DESC LIMIT 1",
+                rusqlite::params![task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn checks_passed_requires_nonempty_green_list() {
+        assert!(!checks_passed(&[]), "空检查列表不能视为通过");
+        assert!(checks_passed(&[
+            green_check("ci", "success"),
+            green_check("lint", "skipped"),
+            green_check("optional", "neutral"),
+        ]));
+        assert!(!checks_passed(&[
+            green_check("ci", "success"),
+            green_check("deploy", "pending"),
+        ]));
+        assert!(!checks_passed(&[
+            green_check("ci", "success"),
+            green_check("test", "failure"),
+        ]));
+        assert!(checks_failed_terminally(&[green_check("test", "failure")]));
+        assert!(!checks_failed_terminally(&[green_check(
+            "deploy", "pending"
+        )]));
+    }
+
+    #[test]
+    fn auto_merge_pushes_pr_and_merges_when_checks_pass() {
+        let ops = Arc::new(FakeGitHubOps::new(vec![
+            green_check("ci", "success"),
+            green_check("lint", "success"),
+        ]));
+        let (ctx, task_id) = setup_full(
+            "test -f done.txt",
+            |_| Arc::new(ScriptedAdapter),
+            Some(ops.clone()),
+            true,
+        );
+        let repo = repo_of(&ctx, &task_id);
+        ops.simulate_merge_in(repo.clone());
+        let before = gitops::head_sha(&repo).unwrap();
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Merged);
+        let merged = ops.merged.lock().unwrap().clone();
+        assert_eq!(merged.len(), 1, "PR 必须且只能合并一次");
+        assert_eq!(merged[0].0, 42);
+        let branch = {
+            let guard = ctx.db.lock().unwrap();
+            let detail = store::get_task(guard.conn(), &task_id).unwrap();
+            detail.runs[0].branch.clone().expect("run branch")
+        };
+        assert_eq!(
+            merged[0].1,
+            gitops::rev_parse(&repo, &branch).unwrap(),
+            "合并 PR 必须钉在被检查的 head 上"
+        );
+        {
+            let created = ops.created.lock().unwrap();
+            assert_eq!(created.len(), 1);
+            assert_eq!(created[0].1, "main");
+            assert!(
+                created[0].0.starts_with("temli/"),
+                "PR head: {}",
+                created[0].0
+            );
+        }
+        let (number, url, state) = run_pr_fields(&ctx, &task_id);
+        assert_eq!(number, Some(42));
+        assert_eq!(url.as_deref(), Some("https://github.com/acme/demo/pull/42"));
+        assert_eq!(state.as_deref(), Some("merged"));
+        assert_ne!(
+            gitops::head_sha(&repo).unwrap(),
+            before,
+            "拉取后默认分支必须前进"
+        );
+
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        assert!(detail.decisions.is_empty());
+        assert_eq!(detail.runs[0].status, "completed");
+    }
+
+    /// 取消发生在检查轮询期间：PR 已创建但绝不能合并，运行按取消收尾。
+    #[test]
+    fn auto_merge_cancel_during_checks_never_merges() {
+        let ops = Arc::new(FakeGitHubOps::new(vec![green_check("ci", "pending")]));
+        let (ctx, task_id) = setup_full(
+            "test -f done.txt",
+            |_| Arc::new(ScriptedAdapter),
+            Some(ops.clone()),
+            true,
+        );
+        let repo = repo_of(&ctx, &task_id);
+        ops.simulate_merge_in(repo.clone());
+        ops.cancel_on_checks(ctx.cancelled.clone(), task_id.clone());
+        let before = gitops::head_sha(&repo).unwrap();
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Interrupted);
+        assert!(ops.merged.lock().unwrap().is_empty(), "取消后绝不能合并 PR");
+        assert!(
+            !ops.calls().contains(&"merge_pull_request"),
+            "取消后不得调用合并接口: {:?}",
+            ops.calls()
+        );
+        assert_eq!(
+            gitops::head_sha(&repo).unwrap(),
+            before,
+            "取消后本地默认分支不得变化"
+        );
+        let (number, url, state) = run_pr_fields(&ctx, &task_id);
+        assert_eq!(number, Some(42));
+        assert_eq!(url.as_deref(), Some("https://github.com/acme/demo/pull/42"));
+        assert_eq!(state.as_deref(), Some("cancelled"));
+
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        assert_eq!(detail.runs[0].status, "cancelled");
+        assert!(
+            detail.decisions.is_empty(),
+            "取消不应打开合并失败决策: {:?}",
+            detail
+                .decisions
+                .iter()
+                .map(|row| row.kind.as_str())
+                .collect::<Vec<_>>()
+        );
+        drop(guard);
+        assert!(
+            !ctx.cancelled.lock().unwrap().contains(&task_id),
+            "退出路径必须清除取消意图"
+        );
+    }
+
+    /// 远端已合并但本地 `pull --ff-only` 失败：`pr_state` 必须保持 merged，
+    /// 只记录 `local_sync_failed` 决策，且绝不重试合并。
+    #[test]
+    fn auto_merge_keeps_merged_state_when_local_sync_fails() {
+        let ops = Arc::new(FakeGitHubOps::new(vec![green_check("ci", "success")]));
+        let (ctx, task_id) = setup_full(
+            "test -f done.txt",
+            |_| Arc::new(ScriptedAdapter),
+            Some(ops.clone()),
+            true,
+        );
+        let repo = repo_of(&ctx, &task_id);
+        ops.simulate_merge_in(repo.clone());
+        ops.diverge_local_after_merge();
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::NeedsHuman);
+        let merged = ops.merged.lock().unwrap().clone();
+        assert_eq!(merged.len(), 1, "本地同步失败不能重试 PR 合并");
+        assert_eq!(merged[0].0, 42);
+        let branch = {
+            let guard = ctx.db.lock().unwrap();
+            let detail = store::get_task(guard.conn(), &task_id).unwrap();
+            detail.runs[0].branch.clone().expect("run branch")
+        };
+        assert_eq!(
+            merged[0].1,
+            gitops::rev_parse(&repo, &branch).unwrap(),
+            "合并 PR 必须钉在被检查的 head 上"
+        );
+        assert_eq!(
+            ops.calls()
+                .iter()
+                .filter(|call| **call == "merge_pull_request")
+                .count(),
+            1,
+            "本地同步失败后不得再次合并 PR"
+        );
+
+        let (number, url, state) = run_pr_fields(&ctx, &task_id);
+        assert_eq!(number, Some(42));
+        assert_eq!(url.as_deref(), Some("https://github.com/acme/demo/pull/42"));
+        assert_eq!(
+            state.as_deref(),
+            Some("merged"),
+            "本地同步失败不能覆盖已合并状态"
+        );
+
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        let decision = detail
+            .decisions
+            .iter()
+            .find(|row| row.kind == "local_sync_failed")
+            .expect("local_sync_failed decision");
+        assert_eq!(decision.status, "open");
+        assert!(
+            decision
+                .prompt
+                .contains("https://github.com/acme/demo/pull/42"),
+            "prompt 必须带 PR 链接: {}",
+            decision.prompt
+        );
+        assert_eq!(detail.runs[0].status, "failed");
+    }
+
+    #[test]
+    fn auto_merge_blocks_on_failed_checks_without_merging() {
+        let ops = Arc::new(FakeGitHubOps::new(vec![green_check("ci", "failure")]));
+        let (ctx, task_id) = setup_full(
+            "test -f done.txt",
+            |_| Arc::new(ScriptedAdapter),
+            Some(ops.clone()),
+            true,
+        );
+        let repo = repo_of(&ctx, &task_id);
+        ops.simulate_merge_in(repo.clone());
+        let before = gitops::head_sha(&repo).unwrap();
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::NeedsHuman);
+        assert!(
+            ops.merged.lock().unwrap().is_empty(),
+            "检查失败时绝不能合并 PR"
+        );
+        assert_eq!(gitops::head_sha(&repo).unwrap(), before);
+        let (number, url, state) = run_pr_fields(&ctx, &task_id);
+        assert_eq!(number, Some(42));
+        assert_eq!(url.as_deref(), Some("https://github.com/acme/demo/pull/42"));
+        assert_eq!(state.as_deref(), Some("open"));
+
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        let decision = detail
+            .decisions
+            .iter()
+            .find(|row| row.kind == "checks_failed")
+            .expect("checks_failed decision");
+        assert!(
+            decision
+                .prompt
+                .contains("https://github.com/acme/demo/pull/42"),
+            "prompt 必须带 PR 链接: {}",
+            decision.prompt
+        );
+        assert_eq!(detail.runs[0].status, "failed");
+    }
+
+    #[test]
+    fn auto_merge_off_keeps_local_merge_and_skips_github() {
+        let ops = Arc::new(FakeGitHubOps::new(vec![green_check("ci", "success")]));
+        let (ctx, task_id) = setup_full(
+            "test -f done.txt",
+            |_| Arc::new(ScriptedAdapter),
+            Some(ops.clone()),
+            false,
+        );
+        let repo = repo_of(&ctx, &task_id);
+        let before = gitops::head_sha(&repo).unwrap();
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Merged);
+        assert!(
+            ops.calls().is_empty(),
+            "auto_merge 关闭时不得调用 GitHub: {:?}",
+            ops.calls()
+        );
+        assert!(ops.merged.lock().unwrap().is_empty());
+        assert_ne!(gitops::head_sha(&repo).unwrap(), before);
+        assert_eq!(run_pr_fields(&ctx, &task_id), (None, None, None));
     }
 }

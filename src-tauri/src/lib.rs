@@ -1,11 +1,13 @@
 mod agent;
 mod db;
 mod evidence;
+mod github;
 mod gitops;
 mod orchestrator;
 mod prompts;
 mod scheduler;
 mod store;
+mod sync;
 
 use agent::{
     AdapterRegistry, AgentAdapter, AgentEvent, AgentManifest, Decision, EventSink, RunSpec,
@@ -28,6 +30,8 @@ struct AppState {
     adapters: Arc<AdapterRegistry>,
     /// 任务队列的唯一入口；所有执行都在调度线程内串行进行。
     scheduler: Arc<Scheduler>,
+    /// GitHub issue 后台同步。
+    sync: Arc<sync::SyncEngine>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +60,21 @@ struct DependencyInput {
 struct ProjectConcurrencyInput {
     project_id: String,
     limit: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateIssueInput {
+    item_id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutoMergeInput {
+    project_id: String,
+    enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -360,6 +379,44 @@ fn list_adapters(state: State<AppState>) -> Vec<AgentManifest> {
     state.adapters.manifests()
 }
 
+#[tauri::command]
+fn sync_now(state: State<AppState>, project_id: String) -> Result<(), String> {
+    state.sync.sync_project(&project_id)
+}
+
+#[tauri::command]
+fn update_issue(state: State<AppState>, input: UpdateIssueInput) -> Result<(), String> {
+    state
+        .sync
+        .update_remote_issue(&input.item_id, input.title, input.body)
+}
+
+#[tauri::command]
+fn publish_task(state: State<AppState>, task_id: String) -> Result<u64, String> {
+    state.sync.publish_task(&task_id)
+}
+
+#[tauri::command]
+fn get_project_issues(
+    state: State<AppState>,
+    project_id: String,
+) -> Result<Vec<store::ProjectIssue>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::list_project_issues(db.conn(), &project_id)
+}
+
+#[tauri::command]
+fn get_auto_merge(state: State<AppState>, project_id: String) -> Result<bool, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::project_auto_merge(db.conn(), &project_id)
+}
+
+#[tauri::command]
+fn set_auto_merge(state: State<AppState>, input: AutoMergeInput) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::set_project_auto_merge(db.conn(), &input.project_id, input.enabled)
+}
+
 /// 启动时回收 worktree：先让 git 清掉失效登记，再删除项目目录下未被 git 登记的残留目录。
 fn cleanup_worktrees(db: &Db, data_dir: &Path) {
     let projects = match db.list_projects() {
@@ -431,6 +488,7 @@ pub fn run() {
                 .ok_or_else(|| std::io::Error::other(format!("适配器未注册：{adapter_id}")))?;
 
             let db = Arc::new(Mutex::new(db));
+            let github: Arc<dyn github::GitHubOps> = Arc::new(github::GhOps::new());
             let scheduler = Scheduler::new(orchestrator::RunContext {
                 db: Arc::clone(&db),
                 adapter,
@@ -439,13 +497,18 @@ pub fn run() {
                 cancels: orchestrator::CancelRegistry::new(),
                 merge_lock: Arc::new(Mutex::new(())),
                 cancelled: Arc::new(Mutex::new(HashSet::new())),
+                github: Some(Arc::clone(&github)),
             });
             scheduler.start().map_err(std::io::Error::other)?;
+
+            let sync = sync::SyncEngine::new(Arc::clone(&db), github);
+            sync.start().map_err(std::io::Error::other)?;
 
             app.manage(AppState {
                 db,
                 adapters,
                 scheduler,
+                sync,
             });
             Ok(())
         })
@@ -465,7 +528,13 @@ pub fn run() {
             list_decisions,
             resolve_decision,
             list_events,
-            list_adapters
+            list_adapters,
+            sync_now,
+            update_issue,
+            publish_task,
+            get_project_issues,
+            get_auto_merge,
+            set_auto_merge
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -210,6 +210,27 @@ pub fn merge_ff(repo: &Path, branch: &str) -> Result<String, String> {
     head_sha(repo)
 }
 
+/// Push `branch` to `origin` and set its upstream tracking.
+pub fn push_branch(repo: &Path, branch: &str) -> Result<(), String> {
+    run(repo, &["push", "-u", "origin", branch])?;
+    Ok(())
+}
+
+/// Refresh remote-tracking refs from `origin`.
+pub fn fetch_origin(repo: &Path) -> Result<(), String> {
+    run(repo, &["fetch", "origin"])?;
+    Ok(())
+}
+
+/// Fast-forward the current branch from `origin/<branch>`.
+///
+/// `git pull` also fetches, so callers that want an explicit `fetch_origin`
+/// first can do so without changing the outcome.
+pub fn pull_ff(repo: &Path, branch: &str) -> Result<(), String> {
+    run(repo, &["pull", "--ff-only", "origin", branch])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,12 +238,16 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_repo() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "temli-gitops-{}",
+            "temli-gitops-{}-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&dir).unwrap();
         run(&dir, &["init", "-q", "-b", "main"]).unwrap();
@@ -418,6 +443,45 @@ mod tests {
         prune_worktrees(&repo).unwrap();
         let listed = list_worktrees(&repo).unwrap();
         assert_eq!(listed, vec![fs::canonicalize(&repo).unwrap()]);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn pushes_fetches_and_pulls_from_origin() {
+        let repo = temp_repo();
+        let remote = repo.with_extension("remote.git");
+        let remote_path = remote.to_string_lossy().into_owned();
+        run(&repo, &["init", "-q", "--bare", &remote_path]).unwrap();
+        run(&repo, &["remote", "add", "origin", &remote_path]).unwrap();
+        push_branch(&repo, "main").unwrap();
+
+        let wt = repo.with_extension("wt-push");
+        create_worktree(&repo, &wt, "temli/feature", "HEAD").unwrap();
+        fs::write(wt.join("b.txt"), "b\n").unwrap();
+        commit_all(&wt, "feature").unwrap();
+        push_branch(&wt, "temli/feature").unwrap();
+
+        fetch_origin(&repo).unwrap();
+        pull_ff(&repo, "temli/feature").unwrap();
+        assert_eq!(fs::read_to_string(repo.join("b.txt")).unwrap(), "b\n");
+
+        remove_worktree(&repo, &wt).unwrap();
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&remote);
+    }
+
+    #[test]
+    fn fetch_pull_and_push_fail_without_origin() {
+        let repo = temp_repo();
+        let fetch = fetch_origin(&repo).unwrap_err();
+        assert!(fetch.contains("git fetch origin 失败"), "{fetch}");
+        let pull = pull_ff(&repo, "main").unwrap_err();
+        assert!(
+            pull.contains("git pull --ff-only origin main 失败"),
+            "{pull}"
+        );
+        let push = push_branch(&repo, "main").unwrap_err();
+        assert!(push.contains("git push -u origin main 失败"), "{push}");
         let _ = fs::remove_dir_all(&repo);
     }
 }
