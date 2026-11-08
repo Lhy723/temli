@@ -77,3 +77,14 @@
 | 状态 | Badge、Spinner、Skeleton、ProgressBar/ProgressCircle |
 | 反馈 | Toast、Alert、Tooltip、Modal |
 | 头像 / 用户 | Avatar、AvatarGroup |
+
+## 7. 密度、字号与动效
+
+- 基准字号 **13px**（正文与控件），次级 12px，分组标签 11px；行高 1.45
+- 间距走 4px 栅格；侧栏 232px；导航行高 32px；标签页 28px；表头 30px；数据行 36px
+- 主卡片圆角 8px + 1px 边框 + 极轻阴影；窗口底色比卡片低一级
+- 选中态使用中性灰（HeroUI `tertiary`），强调色只用于主操作按钮与状态
+- 过渡统一 120ms、`cubic-bezier(0.2, 0, 0, 1)`，只作用于颜色、背景、边框、阴影、透明度；`prefers-reduced-motion` 下关闭
+- 表头 12px 次级色；行 hover 使用窗口底色；标签页关闭按钮仅在 hover 时出现
+- 图标统一 16px（内联控件 14px），不混用 15/16
+- 不新增对 HeroUI 组件内部样式的覆盖；选中/悬停优先用组件自带 variant
