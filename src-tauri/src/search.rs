@@ -64,6 +64,8 @@ pub fn global_search(
              LEFT JOIN tasks t ON t.item_id = i.id
              WHERE i.kind = 'issue'
                AND (?1 IS NULL OR i.project_id = ?1)
+               AND (t.id IS NOT NULL
+                    OR (i.ghost = 0 AND COALESCE(i.github_state, 'open') <> 'closed'))
                AND (i.title LIKE ?2 ESCAPE '\\' OR i.body LIKE ?2 ESCAPE '\\')
              UNION ALL
              SELECT i.id, 'doc', i.title, i.body, i.project_id, NULL, i.updated_at, 1
@@ -169,7 +171,7 @@ fn db_err(err: rusqlite::Error) -> String {
 mod tests {
     use super::*;
     use crate::db::{Db, Project, RegisterProjectInput};
-    use crate::store::{NewTask, create_task, task_item_id};
+    use crate::store::{Criterion, NewTask, create_task, create_task_for_item, task_item_id};
     use crate::vaults::{Vault, add_vault, create_vault_note};
     use crate::workspace::{list_docs, scan_docs};
     use std::fs;
@@ -512,5 +514,54 @@ mod tests {
         // limit=0 使用默认 20；超过 50 时封顶 50。
         assert_eq!(global_search(conn, "Limit", None, 0).unwrap().len(), 20);
         assert_eq!(global_search(conn, "Limit", None, 100).unwrap().len(), 50);
+    }
+    #[test]
+    fn hides_unconverted_closed_and_ghost_issues() {
+        let fixture = Fixture::new("closed");
+        let conn = fixture.db.conn();
+        let project = fixture.project("visible-repo");
+        for (id, state, ghost) in [
+            ("vis-open", "open", 0),
+            ("vis-closed", "closed", 0),
+            ("vis-ghost", "open", 1),
+        ] {
+            conn.execute(
+                "INSERT INTO items (id, project_id, kind, title, status, body,
+                                    github_number, github_state, ghost)
+                 VALUES (?1, ?2, 'issue', 'Visible issue', 'open', 'visible body',
+                         1, ?3, ?4)",
+                params![id, project.id, state, ghost],
+            )
+            .expect("插入同步 issue");
+        }
+
+        let hits = global_search(conn, "Visible", Some(&project.id), 20).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|hit| hit.id.as_str()).collect();
+        assert_eq!(ids, vec!["vis-open"], "closed/ghost 未转任务不应命中");
+
+        // 已转任务的 closed issue 仍然可搜索（任务本身可见）。
+        conn.execute(
+            "INSERT INTO items (id, project_id, kind, title, status, body,
+                                github_number, github_state, ghost)
+             VALUES ('vis-converted', ?1, 'issue', 'Converted visible', 'open',
+                     'visible body', 2, 'closed', 0)",
+            params![project.id],
+        )
+        .expect("插入已转换 issue");
+        let task = create_task_for_item(
+            conn,
+            "vis-converted",
+            "",
+            vec![Criterion {
+                id: "c-1".into(),
+                cmd: "true".into(),
+                expect_exit: 0,
+                expect_match: None,
+            }],
+        )
+        .expect("转任务");
+        let hits = global_search(conn, "Converted", Some(&project.id), 20).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].id, task.id, "已转换 issue 命中返回任务 id");
     }
 }
