@@ -52,3 +52,7 @@ npm run tauri build
 - [UI 规范](docs/ui.md)
 - [Agent 适配器契约](docs/agent-plugins.md)
 - [变更记录](CHANGELOG.md)
+
+## 许可证
+
+[MIT](LICENSE)

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "AI-native project workspace"
 authors = ["Lhy723"]
 edition = "2024"
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
