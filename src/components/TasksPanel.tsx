@@ -142,7 +142,15 @@ function adapterLabel(adapters: AgentManifest[], id: string | null): string {
   return name && name.trim() ? name : id;
 }
 
-export function TasksPanel({ projectId }: { projectId: string }) {
+export function TasksPanel({
+  projectId,
+  focusTaskId,
+  onFocusConsumed,
+}: {
+  projectId: string;
+  focusTaskId?: string;
+  onFocusConsumed?: () => void;
+}) {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -213,11 +221,15 @@ export function TasksPanel({ projectId }: { projectId: string }) {
   const selectedRef = useRef<string | null>(null);
   const detailRequestRef = useRef(0);
   const projectRef = useRef(projectId);
+  const tasksSettledRef = useRef<string | null>(null);
+  const focusConsumedRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     projectRef.current = projectId;
     selectedRef.current = null;
+    tasksSettledRef.current = null;
+    focusConsumedRef.current = null;
     setLoading(true);
     setError(null);
     setTasks([]);
@@ -254,7 +266,10 @@ export function TasksPanel({ projectId }: { projectId: string }) {
         if (!cancelled) setError(errorText(e));
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          tasksSettledRef.current = projectId;
+          setLoading(false);
+        }
       });
     return () => {
       cancelled = true;
@@ -864,6 +879,21 @@ export function TasksPanel({ projectId }: { projectId: string }) {
       window.clearInterval(timer);
     };
   }, [polling, projectId]);
+
+  // 搜索面板深链：任务列表就绪后选中目标任务并消费一次，避免重复触发。
+  useEffect(() => {
+    if (!focusTaskId) {
+      focusConsumedRef.current = null;
+      return;
+    }
+    if (focusConsumedRef.current === focusTaskId) return;
+    if (loading || tasksSettledRef.current !== projectId) return;
+    focusConsumedRef.current = focusTaskId;
+    if (tasks.some((task) => task.id === focusTaskId)) {
+      selectTask(focusTaskId);
+    }
+    onFocusConsumed?.();
+  }, [focusTaskId, projectId, loading, tasks, onFocusConsumed]);
 
   const parsedConcurrency = Number(concurrencyInput);
   const concurrencyValid =

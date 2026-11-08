@@ -354,7 +354,15 @@ function VaultGraphView({
   );
 }
 
-export function Vaults() {
+export function Vaults({
+  focusNoteId,
+  focusVaultId,
+  onFocusConsumed,
+}: {
+  focusNoteId?: string;
+  focusVaultId?: string;
+  onFocusConsumed?: () => void;
+}) {
   const [vaults, setVaults] = useState<Vault[]>([]);
   const [vaultsLoading, setVaultsLoading] = useState(true);
   const [vaultError, setVaultError] = useState<string | null>(null);
@@ -403,6 +411,9 @@ export function Vaults() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const openRequest = useRef(0);
+  const focusConsumedRef = useRef<string | null>(null);
+  const treeLoadedVaultRef = useRef<string | null>(null);
+  const treeErrorVaultRef = useRef<string | null>(null);
 
   const [backlinks, setBacklinks] = useState<Backlink[]>([]);
   const [backlinksLoading, setBacklinksLoading] = useState(false);
@@ -436,6 +447,7 @@ export function Vaults() {
 
   async function refreshTree(vaultId: string, reindex: boolean) {
     const request = ++treeRequest.current;
+    if (vaultId === vaultRef.current) treeErrorVaultRef.current = null;
     setTreeLoading(true);
     setTreeError(null);
     try {
@@ -446,13 +458,17 @@ export function Vaults() {
       const loaded = await vaultTree(vaultId);
       if (request !== treeRequest.current || vaultId !== vaultRef.current) return;
       setEntries(loaded);
+      treeLoadedVaultRef.current = vaultId;
       if (reindex) {
         setNotice(
           `已索引 ${loaded.filter((entry) => !entry.is_dir).length} 条笔记`,
         );
       }
     } catch (error) {
-      if (request === treeRequest.current) setTreeError(errorText(error));
+      if (request === treeRequest.current) {
+        setTreeError(errorText(error));
+        treeErrorVaultRef.current = vaultId;
+      }
     } finally {
       if (request === treeRequest.current) setTreeLoading(false);
     }
@@ -462,6 +478,8 @@ export function Vaults() {
     if (!selectedVaultId) {
       treeRequest.current += 1;
       openRequest.current += 1;
+      treeLoadedVaultRef.current = null;
+      treeErrorVaultRef.current = null;
       setEntries([]);
       setTreeError(null);
       setTreeLoading(false);
@@ -477,6 +495,8 @@ export function Vaults() {
     }
 
     openRequest.current += 1;
+    treeLoadedVaultRef.current = null;
+    treeErrorVaultRef.current = null;
     setEntries([]);
     setCollapsed(new Set());
     setCreatingPath(null);
@@ -555,6 +575,83 @@ export function Vaults() {
       cancelled = true;
     };
   }, [mode, selectedVaultId, graphSeed]);
+
+  const focusKey =
+    focusNoteId || focusVaultId
+      ? `${focusVaultId ?? ""}\u0000${focusNoteId ?? ""}`
+      : null;
+
+  // 搜索面板深链：先切到目标笔记库，等树加载完成后再打开笔记并消费一次。
+  useEffect(() => {
+    if (!focusKey) {
+      focusConsumedRef.current = null;
+      return;
+    }
+    if (focusConsumedRef.current === focusKey) return;
+
+    if (focusVaultId) {
+      if (vaultsLoading) return;
+      if (!vaults.some((vault) => vault.id === focusVaultId)) {
+        focusConsumedRef.current = focusKey;
+        setNotice("未找到对应的笔记库，无法打开笔记。");
+        onFocusConsumed?.();
+        return;
+      }
+      if (selectedVaultId !== focusVaultId) {
+        setSelectedVaultId(focusVaultId);
+        return;
+      }
+    } else if (!selectedVaultId) {
+      if (vaultsLoading) return;
+      const fallbackVaultId = vaults[0]?.id;
+      if (fallbackVaultId) {
+        setSelectedVaultId(fallbackVaultId);
+        return;
+      }
+      focusConsumedRef.current = focusKey;
+      setNotice("还没有可用的笔记库。");
+      onFocusConsumed?.();
+      return;
+    }
+
+    if (!focusNoteId) {
+      focusConsumedRef.current = focusKey;
+      onFocusConsumed?.();
+      return;
+    }
+
+    if (treeLoadedVaultRef.current !== selectedVaultId) {
+      // 树加载失败时仍尝试直接打开，笔记可能只是没进索引。
+      if (treeErrorVaultRef.current === selectedVaultId && !treeLoading) {
+        focusConsumedRef.current = focusKey;
+        void openNote(focusNoteId);
+        onFocusConsumed?.();
+      }
+      return;
+    }
+
+    if (!entries.some((entry) => entry.id === focusNoteId)) {
+      focusConsumedRef.current = focusKey;
+      setNotice("未找到要打开的笔记，可能已被移动或删除。");
+      onFocusConsumed?.();
+      return;
+    }
+
+    focusConsumedRef.current = focusKey;
+    void openNote(focusNoteId);
+    onFocusConsumed?.();
+  }, [
+    focusKey,
+    focusNoteId,
+    focusVaultId,
+    vaults,
+    vaultsLoading,
+    selectedVaultId,
+    entries,
+    treeLoading,
+    treeError,
+    onFocusConsumed,
+  ]);
 
   async function loadBacklinks(noteId: string, request: number) {
     setBacklinksLoading(true);
