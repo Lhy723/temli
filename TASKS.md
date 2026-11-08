@@ -162,3 +162,15 @@
 - [x] 开启 auto_merge + require_checks，真实 OMP 任务新增 greet + 测试
 - [x] app 创建 PR #3，checks 全绿后自动合并，本地 main 快进
 - [x] 修复：checks 读取的 curl/TLS 抖动重试（GhOps GET 3 次 + 轮询持续到超时）
+
+## 进行中：M11 合并后自动维护文档
+
+- [x] 迁移 v9：projects.auto_docs / tasks.auto_docs
+- [x] 合并后生成受限文档任务（queued、derived_from、auto_docs=1 防递归）
+- [x] 文档任务走统一证据门；调度失败不影响 merged
+- [x] UI 开关与文档任务标记
+- [x] 补测：checks 读取瞬时失败（重试后合并）、持续失败（超时转人工）
+- [x] 真实闭环冒烟：父任务 PR #4 合并 → 自动生成 `文档：add farewell` → PR #5 checks 通过并合并 → `docs/guide.md` 更新；auto_docs 任务仅 1 条，无递归
+- [x] 审查修复：文档任务 prompt 固定使用本次合并的 SHA（不再事后 rev_parse）
+- [x] 合入 develop（PR #43，Issue #42）
+- 遗留 P3：文档 chip 仍按标题前缀判断；父任务 merged 瞬间的轮询关闭可能让新文档任务晚一个刷新出现

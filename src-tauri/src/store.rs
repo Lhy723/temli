@@ -433,6 +433,69 @@ pub fn create_task_for_item(
     .map_err(db_err)
 }
 
+/// 为已合并任务排队一个自动文档任务。
+///
+/// 与普通任务不同：新 item 直接以 `queued` 落库（无需经过 draft/ready），任务行
+/// 标记 `auto_docs=1`（合并后不再递归调度），并通过 `derived_from`
+/// （父任务 item → 新 item）记录来源。父任务、项目或非空验收标准任一缺失都拒绝。
+pub fn create_docs_task(
+    conn: &Connection,
+    project_id: &str,
+    parent_task_id: &str,
+    title: &str,
+    prompt: &str,
+    criteria: Vec<Criterion>,
+) -> Result<TaskDetail, String> {
+    if criteria.is_empty() {
+        return Err("自动文档任务必须包含验收标准".to_string());
+    }
+    validate_criteria(&criteria)?;
+    ensure_project(conn, project_id)?;
+
+    let (parent_item, parent_project) = conn
+        .query_row(
+            "SELECT t.item_id, i.project_id
+             FROM tasks t JOIN items i ON i.id = t.item_id
+             WHERE t.id = ?1",
+            params![parent_task_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(db_err)?
+        .ok_or_else(|| format!("任务不存在：{parent_task_id}"))?;
+    if parent_project != project_id {
+        return Err(format!("父任务不属于该项目：{parent_task_id}"));
+    }
+
+    let item_id = Uuid::new_v4().to_string();
+    let task_id = Uuid::new_v4().to_string();
+    let acceptance_json =
+        serde_json::to_string(&criteria).map_err(|e| format!("验收标准序列化失败：{e}"))?;
+
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    tx.execute(
+        "INSERT INTO items (id, project_id, kind, title, status)
+         VALUES (?1, ?2, 'issue', ?3, 'queued')",
+        params![item_id, project_id, title],
+    )
+    .map_err(db_err)?;
+    tx.execute(
+        "INSERT INTO tasks (id, item_id, acceptance_json, prompt, auto_docs)
+         VALUES (?1, ?2, ?3, ?4, 1)",
+        params![task_id, item_id, acceptance_json, prompt],
+    )
+    .map_err(db_err)?;
+    tx.execute(
+        "INSERT INTO links (id, from_item, to_item, rel)
+         VALUES (?1, ?2, ?3, 'derived_from')",
+        params![Uuid::new_v4().to_string(), parent_item, item_id],
+    )
+    .map_err(db_err)?;
+    tx.commit().map_err(db_err)?;
+
+    get_task(conn, &task_id)
+}
+
 pub fn list_tasks(conn: &Connection) -> Result<Vec<TaskSummary>, String> {
     query_task_summaries(conn, None)
 }
@@ -479,6 +542,20 @@ pub fn task_status(conn: &Connection, task_id: &str) -> Result<TaskStatus, Strin
 pub fn task_item_id(conn: &Connection, task_id: &str) -> Result<String, String> {
     conn.query_row(
         "SELECT item_id FROM tasks WHERE id = ?1",
+        params![task_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)?
+    .ok_or_else(|| format!("任务不存在：{task_id}"))
+}
+
+/// 任务是否为自动文档任务；默认 `false`。
+///
+/// 自动文档任务合并后绝不能再调度新的文档任务，否则会形成无限递归。
+pub fn task_auto_docs(conn: &Connection, task_id: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT COALESCE(auto_docs, 0) FROM tasks WHERE id = ?1",
         params![task_id],
         |row| row.get(0),
     )
@@ -932,6 +1009,35 @@ pub fn set_project_auto_merge(
     let changed = conn
         .execute(
             "UPDATE projects SET auto_merge = ?2 WHERE id = ?1",
+            params![project_id, enabled],
+        )
+        .map_err(db_err)?;
+    if changed == 0 {
+        return Err(format!("项目不存在：{project_id}"));
+    }
+    Ok(())
+}
+
+/// 项目是否在任务合并后自动排队文档更新任务；默认关闭。
+pub fn project_auto_docs(conn: &Connection, project_id: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT COALESCE(auto_docs, 0) FROM projects WHERE id = ?1",
+        params![project_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)?
+    .ok_or_else(|| format!("项目不存在：{project_id}"))
+}
+
+pub fn set_project_auto_docs(
+    conn: &Connection,
+    project_id: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE projects SET auto_docs = ?2 WHERE id = ?1",
             params![project_id, enabled],
         )
         .map_err(db_err)?;
@@ -2125,6 +2231,124 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
             .unwrap();
         assert_eq!(tasks, 1);
+    }
+
+    #[test]
+    fn auto_docs_settings_default_off_and_roundtrip() {
+        let db = open_db();
+        let project_id = project(&db);
+        let conn = db.conn();
+
+        assert!(!project_auto_docs(conn, &project_id).unwrap());
+        set_project_auto_docs(conn, &project_id, true).unwrap();
+        assert!(project_auto_docs(conn, &project_id).unwrap());
+        set_project_auto_docs(conn, &project_id, false).unwrap();
+        assert!(!project_auto_docs(conn, &project_id).unwrap());
+
+        assert!(project_auto_docs(conn, "missing-project").is_err());
+        assert!(set_project_auto_docs(conn, "missing-project", true).is_err());
+
+        let task = create_task(conn, new_task(&project_id, criteria())).unwrap();
+        assert!(!task_auto_docs(conn, &task.id).unwrap());
+        assert!(task_auto_docs(conn, "missing-task").is_err());
+    }
+
+    #[test]
+    fn create_docs_task_queues_linked_auto_docs_task() {
+        let db = open_db();
+        let project_id = project(&db);
+        let conn = db.conn();
+        let parent = create_task(conn, new_task(&project_id, criteria())).unwrap();
+
+        let docs = create_docs_task(
+            conn,
+            &project_id,
+            &parent.id,
+            "文档：实现证据门",
+            "更新文档",
+            criteria(),
+        )
+        .unwrap();
+
+        assert_eq!(docs.task.status, TaskStatus::Queued);
+        assert_eq!(docs.task.project_id, project_id);
+        assert_eq!(docs.task.title, "文档：实现证据门");
+        assert_eq!(docs.task.prompt, "更新文档");
+        assert_eq!(docs.criteria.len(), 2);
+        assert!(task_auto_docs(conn, &docs.task.id).unwrap());
+
+        let (kind, status): (String, String) = conn
+            .query_row(
+                "SELECT kind, status FROM items
+                 WHERE id = (SELECT item_id FROM tasks WHERE id = ?1)",
+                params![docs.task.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((kind.as_str(), status.as_str()), ("issue", "queued"));
+
+        let linked: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM links l
+                     JOIN tasks parent ON parent.item_id = l.from_item
+                     JOIN tasks docs ON docs.item_id = l.to_item
+                     WHERE parent.id = ?1 AND docs.id = ?2 AND l.rel = 'derived_from'
+                 )",
+                params![parent.id, docs.task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            linked,
+            "父任务 item 到文档任务 item 必须有 derived_from 链接"
+        );
+        assert!(docs.events.is_empty());
+    }
+
+    #[test]
+    fn create_docs_task_rejects_missing_inputs_and_empty_criteria() {
+        let db = open_db();
+        let project_id = project(&db);
+        let other_project = project(&db);
+        let conn = db.conn();
+        let parent = create_task(conn, new_task(&project_id, criteria())).unwrap();
+
+        let missing_project =
+            create_docs_task(conn, "missing-project", &parent.id, "文档", "p", criteria())
+                .unwrap_err();
+        assert!(missing_project.contains("项目不存在"), "{missing_project}");
+
+        let missing_parent =
+            create_docs_task(conn, &project_id, "missing-task", "文档", "p", criteria())
+                .unwrap_err();
+        assert!(missing_parent.contains("任务不存在"), "{missing_parent}");
+
+        let mismatched =
+            create_docs_task(conn, &other_project, &parent.id, "文档", "p", criteria())
+                .unwrap_err();
+        assert!(mismatched.contains("父任务不属于该项目"), "{mismatched}");
+
+        let empty =
+            create_docs_task(conn, &project_id, &parent.id, "文档", "p", Vec::new()).unwrap_err();
+        assert!(empty.contains("验收标准"), "{empty}");
+
+        let mut invalid = criteria();
+        invalid[0].id = "bad id".into();
+        let invalid =
+            create_docs_task(conn, &project_id, &parent.id, "文档", "p", invalid).unwrap_err();
+        assert!(invalid.contains("id 非法"), "{invalid}");
+
+        let (items, tasks, links): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM items),
+                        (SELECT COUNT(*) FROM tasks),
+                        (SELECT COUNT(*) FROM links)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((items, tasks, links), (1, 1, 0), "失败时不得写入任何行");
     }
 
     #[test]

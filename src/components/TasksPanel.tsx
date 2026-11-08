@@ -44,6 +44,7 @@ import {
   decisionKindLabel,
   errorText,
   formatDate,
+  getAutoDocs,
   getAutoMerge,
   getProjectConcurrency,
   getProjectIssues,
@@ -61,6 +62,7 @@ import {
   reindexWorkspace,
   removeDependency,
   resolveDecision,
+  setAutoDocs,
   setAutoMerge,
   setProjectConcurrency,
   setRequireChecks,
@@ -253,6 +255,9 @@ export function TasksPanel({
   const [requireChecksError, setRequireChecksError] = useState<string | null>(
     null,
   );
+  const [autoDocs, setAutoDocsEnabled] = useState<boolean | null>(null);
+  const [autoDocsSaving, setAutoDocsSaving] = useState(false);
+  const [autoDocsError, setAutoDocsError] = useState<string | null>(null);
   const selectedRef = useRef<string | null>(null);
   const detailRequestRef = useRef(0);
   const projectRef = useRef(projectId);
@@ -440,6 +445,26 @@ export function TasksPanel({
     };
   }, [projectId]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setAutoDocsEnabled(null);
+    setAutoDocsSaving(false);
+    setAutoDocsError(null);
+    getAutoDocs(projectId)
+      .then((enabled) => {
+        if (cancelled || projectRef.current !== projectId) return;
+        setAutoDocsEnabled(enabled);
+      })
+      .catch((e) => {
+        if (cancelled || projectRef.current !== projectId) return;
+        setAutoDocsEnabled(false);
+        setAutoDocsError(errorText(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
   async function refreshTasks() {
     const requestedFor = projectId;
     const next = await listTasks(requestedFor);
@@ -529,6 +554,23 @@ export function TasksPanel({
       setRequireChecksError(errorText(e));
     } finally {
       if (projectRef.current === requestedFor) setRequireChecksSaving(false);
+    }
+  }
+
+  async function saveAutoDocs(enabled: boolean) {
+    if (autoDocs === null || autoDocsSaving) return;
+    const requestedFor = projectId;
+    setAutoDocsSaving(true);
+    setAutoDocsError(null);
+    try {
+      await setAutoDocs({ project_id: requestedFor, enabled });
+      if (projectRef.current !== requestedFor) return;
+      setAutoDocsEnabled(enabled);
+    } catch (e) {
+      if (projectRef.current !== requestedFor) return;
+      setAutoDocsError(errorText(e));
+    } finally {
+      if (projectRef.current === requestedFor) setAutoDocsSaving(false);
     }
   }
 
@@ -1048,6 +1090,21 @@ export function TasksPanel({
               </Switch.Content>
               <Description>无 checks 时阻止自动合并</Description>
             </Switch>
+            <Switch
+              size="sm"
+              isSelected={autoDocs === true}
+              isDisabled={autoDocs === null || autoDocsSaving}
+              onChange={(enabled) => void saveAutoDocs(enabled)}
+              className="text-ui-sm text-[var(--muted)]"
+            >
+              <Switch.Content>
+                <Switch.Control>
+                  <Switch.Thumb />
+                </Switch.Control>
+                自动更新文档
+              </Switch.Content>
+              <Description>合并后创建文档任务</Description>
+            </Switch>
             <div className="flex items-center gap-1 text-ui-sm text-[var(--muted)]">
               <span className="shrink-0">并发</span>
               <Input
@@ -1123,6 +1180,12 @@ export function TasksPanel({
         {requireChecksError && (
           <p role="alert" className="mb-2 text-ui-sm text-[var(--danger)]">
             {requireChecksError}
+          </p>
+        )}
+
+        {autoDocsError && (
+          <p role="alert" className="mb-2 text-ui-sm text-[var(--danger)]">
+            {autoDocsError}
           </p>
         )}
 
@@ -1438,6 +1501,11 @@ function TaskCard({
         <Chip size="sm" variant="soft" color={statusTone(task.status)}>
           {statusLabel(task.status)}
         </Chip>
+        {task.title.startsWith("文档：") && (
+          <Chip size="sm" variant="soft" color="accent">
+            文档
+          </Chip>
+        )}
         <span className="text-label text-[var(--muted)]">
           尝试 {task.attempts}
         </span>

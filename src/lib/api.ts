@@ -166,6 +166,11 @@ export type SetRequireChecksInput = {
   enabled: boolean;
 };
 
+export type SetAutoDocsInput = {
+  project_id: string;
+  enabled: boolean;
+};
+
 export type NoteMeta = {
   id: string;
   title: string;
@@ -440,6 +445,14 @@ export function getRequireChecks(projectId: string): Promise<boolean> {
 
 export function setRequireChecks(input: SetRequireChecksInput): Promise<void> {
   return invoke<void>("set_require_checks", { input });
+}
+
+export function getAutoDocs(projectId: string): Promise<boolean> {
+  return invoke<boolean>("get_auto_docs", { projectId });
+}
+
+export function setAutoDocs(input: SetAutoDocsInput): Promise<void> {
+  return invoke<void>("set_auto_docs", { input });
 }
 
 export function listNotes(projectId: string): Promise<NoteMeta[]> {

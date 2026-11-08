@@ -115,6 +115,12 @@ struct RequireChecksInput {
 }
 
 #[derive(Debug, Deserialize)]
+struct AutoDocsInput {
+    project_id: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct AddVaultInput {
     name: String,
     root_path: String,
@@ -875,6 +881,18 @@ fn set_require_checks(state: State<AppState>, input: RequireChecksInput) -> Resu
 }
 
 #[tauri::command]
+fn get_auto_docs(state: State<AppState>, project_id: String) -> Result<bool, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::project_auto_docs(db.conn(), &project_id)
+}
+
+#[tauri::command]
+fn set_auto_docs(state: State<AppState>, input: AutoDocsInput) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::set_project_auto_docs(db.conn(), &input.project_id, input.enabled)
+}
+
+#[tauri::command]
 fn set_task_agents(state: State<AppState>, input: SetTaskAgentsInput) -> Result<(), String> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     let conn = db.conn();
@@ -1216,6 +1234,8 @@ pub fn run() {
             set_auto_merge,
             get_require_checks,
             set_require_checks,
+            get_auto_docs,
+            set_auto_docs,
             set_task_agents,
             set_task_model,
             add_vault,
