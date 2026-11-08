@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -199,7 +199,27 @@ impl Db {
             tx.commit().map_err(|e| e.to_string())?;
         }
 
+        if current < 2 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN prompt TEXT NOT NULL DEFAULT '';
+                 CREATE INDEX IF NOT EXISTS idx_items_project_status ON items(project_id, status);
+                 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id);
+                 CREATE INDEX IF NOT EXISTS idx_evidence_run ON evidence(run_id);
+                 CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status);
+                 CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity, entity_id);",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (2)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
         Ok(())
+    }
+
+    pub fn conn(&self) -> &Connection {
+        &self.conn
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>, String> {
@@ -224,7 +244,32 @@ impl Db {
             })
             .map_err(|e| e.to_string())?;
 
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn get_project(&self, id: &str) -> Result<Option<Project>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, repo_path, github_owner, github_repo, default_branch, created_at
+                 FROM projects WHERE id = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt
+            .query_map(params![id], |row| {
+                Ok(Project {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    repo_path: row.get(2)?,
+                    github_owner: row.get(3)?,
+                    github_repo: row.get(4)?,
+                    default_branch: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.next().transpose().map_err(|e| e.to_string())
     }
 
     pub fn insert_project(
@@ -307,9 +352,7 @@ pub fn canonical_repo(path: &str) -> Result<PathBuf, String> {
         .args(["-C", &canonical_str, "rev-parse", "--is-inside-work-tree"])
         .output()
         .map_err(|e| format!("无法执行 git：{e}"))?;
-    if !worktree.status.success()
-        || String::from_utf8_lossy(&worktree.stdout).trim() != "true"
-    {
+    if !worktree.status.success() || String::from_utf8_lossy(&worktree.stdout).trim() != "true" {
         return Err("路径不是 git 工作区".to_string());
     }
 

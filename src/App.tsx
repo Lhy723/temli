@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Button, Card, Chip, Input } from "@heroui/react";
+import { DecisionInbox } from "./components/DecisionInbox";
+import { TasksPanel } from "./components/TasksPanel";
 import {
   Bot,
   ChevronDown,
@@ -274,7 +276,11 @@ export default function App() {
               </Button>
             </div>
 
-            <div className="min-h-0 flex-1 overflow-auto px-4 pb-4">
+            <div
+              className={`min-h-0 flex-1 px-4 pb-4 ${
+                active === "my" ? "overflow-hidden" : "overflow-auto"
+              }`}
+            >
               {error && (
                 <p role="alert" className="mb-3 text-ui-sm text-[var(--danger)]">
                   {error}
@@ -283,10 +289,20 @@ export default function App() {
 
               {active === "overview" && (
                 <>
-                  {projects.length === 0 && (
-                    <EmptyProject onRegister={startRegister} />
+                  {!current && <EmptyProject onRegister={startRegister} />}
+                  {current && (
+                    <div className="flex flex-col gap-3">
+                      <ProjectList projects={projects} />
+                      <DecisionInbox projectId={current.id} />
+                    </div>
                   )}
-                  {projects.length > 0 && <ProjectList projects={projects} />}
+                </>
+              )}
+
+              {active === "my" && (
+                <>
+                  {!current && <EmptyProject onRegister={startRegister} />}
+                  {current && <TasksPanel projectId={current.id} />}
                 </>
               )}
 
@@ -310,16 +326,18 @@ export default function App() {
                 </>
               )}
 
-              {active !== "overview" && active !== "projects" && (
-                <div className="flex h-full flex-col items-center justify-center gap-1.5 text-center">
-                  <p className="text-ui text-[var(--muted)]">
-                    {emptyCopy(active)}
-                  </p>
-                  <p className="text-ui-sm text-[var(--muted)] opacity-70">
-                    M0 骨架，功能在后续里程碑实现。
-                  </p>
-                </div>
-              )}
+              {active !== "overview" &&
+                active !== "my" &&
+                active !== "projects" && (
+                  <div className="flex h-full flex-col items-center justify-center gap-1.5 text-center">
+                    <p className="text-ui text-[var(--muted)]">
+                      {emptyCopy(active)}
+                    </p>
+                    <p className="text-ui-sm text-[var(--muted)] opacity-70">
+                      M0 骨架，功能在后续里程碑实现。
+                    </p>
+                  </div>
+                )}
             </div>
           </section>
         </main>
