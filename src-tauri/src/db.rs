@@ -234,6 +234,17 @@ impl Db {
             tx.commit().map_err(|e| e.to_string())?;
         }
 
+        if current < 4 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "ALTER TABLE projects ADD COLUMN require_checks INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (4)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
         Ok(())
     }
 

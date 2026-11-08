@@ -77,6 +77,12 @@ struct AutoMergeInput {
     enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct RequireChecksInput {
+    project_id: String,
+    enabled: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct DependencyList {
     blockers: Vec<TaskSummary>,
@@ -417,6 +423,18 @@ fn set_auto_merge(state: State<AppState>, input: AutoMergeInput) -> Result<(), S
     store::set_project_auto_merge(db.conn(), &input.project_id, input.enabled)
 }
 
+#[tauri::command]
+fn get_require_checks(state: State<AppState>, project_id: String) -> Result<bool, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::project_require_checks(db.conn(), &project_id)
+}
+
+#[tauri::command]
+fn set_require_checks(state: State<AppState>, input: RequireChecksInput) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::set_project_require_checks(db.conn(), &input.project_id, input.enabled)
+}
+
 /// 启动时回收 worktree：先让 git 清掉失效登记，再删除项目目录下未被 git 登记的残留目录。
 fn cleanup_worktrees(db: &Db, data_dir: &Path) {
     let projects = match db.list_projects() {
@@ -534,7 +552,9 @@ pub fn run() {
             publish_task,
             get_project_issues,
             get_auto_merge,
-            set_auto_merge
+            set_auto_merge,
+            get_require_checks,
+            set_require_checks
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
