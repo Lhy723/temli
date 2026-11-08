@@ -2011,4 +2011,69 @@ mod tests {
         assert_eq!(item_count, 0);
         assert_eq!(link_count, 0);
     }
+    #[test]
+    #[ignore = "requires a live OMP model"]
+    fn live_plan_generation_with_omp() {
+        use crate::agent::{AgentAdapter, AgentEvent, Decision, EventSink, RunSpec, RunStatus};
+        use std::sync::Arc;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let fixture = WorktreeFixture::new("plan-live");
+        let project = repo_project(&fixture, true);
+        let commands = evidence::discover_commands(&fixture.repo);
+        assert!(!commands.is_empty(), "夹具应发现可执行命令");
+
+        let adapter = crate::agent::omp::OmpAdapter::new();
+        let prompt = planner::plan_prompt(
+            "增加两个小功能：为 slugify 补充空输入测试，并在 README 增加使用示例。",
+            &project,
+            &commands,
+        );
+        let (tx, rx) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |event| {
+            let _ = tx.send(event);
+        });
+        let spec = RunSpec {
+            run_id: "live-plan".into(),
+            cwd: fixture.repo.clone(),
+            prompt,
+            model: None,
+            max_minutes: 10,
+            max_cost_usd: None,
+            env_allowlist: Vec::new(),
+        };
+        let handle = adapter.start(spec, sink).expect("启动 OMP 会话");
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let mut text = String::new();
+        let status = loop {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(AgentEvent::TextDelta { text: delta }) => text.push_str(&delta),
+                Ok(AgentEvent::ApprovalRequest { request_id, .. }) => {
+                    let _ = adapter.respond(&handle, &request_id, Decision::Deny);
+                }
+                Ok(AgentEvent::Ended { status }) => break status,
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
+                    let _ = adapter.cancel(&handle);
+                    panic!("OMP 规划超时");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("事件流中断"),
+            }
+        };
+        let _ = adapter.close(&handle);
+        assert_eq!(status, RunStatus::Completed);
+        println!("LIVE PLAN OUTPUT:\n{text}");
+
+        let draft = planner::parse_plan(&text, &commands).expect("真实计划应通过校验");
+        assert!(draft.issues.len() >= 2, "应生成多个 Issue，实际: {draft:?}");
+        let details =
+            create_plan_tasks(fixture.db.conn(), &project.id, &fixture.repo, draft).expect("落库");
+        assert!(
+            details
+                .iter()
+                .all(|detail| detail.task.status == store::TaskStatus::Draft)
+        );
+    }
 }

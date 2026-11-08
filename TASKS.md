@@ -153,3 +153,5 @@
 - [x] 前端规划面板（想法 → 预览 → 创建）
 - [x] 审查修复：规划命令改为 async，避免阻塞 Tauri 主线程
 - [x] 合入 develop（PR #38，Issue #37）
+- [x] 真实 OMP 规划冒烟（ignored test，63s）：生成多 Issue 计划并通过校验、批量落库为 draft
+- [x] 规划 UI 闭环（mock IPC）：生成 → 预览（依赖/验收）→ 创建动作触发
