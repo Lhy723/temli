@@ -8,6 +8,7 @@ mod prompts;
 mod scheduler;
 mod store;
 mod sync;
+mod vaults;
 mod workspace;
 
 use agent::{
@@ -29,6 +30,8 @@ use tauri::{Manager, State};
 struct AppState {
     db: Arc<Mutex<Db>>,
     adapters: Arc<AdapterRegistry>,
+    /// 未在任务上单独指定适配器时使用的默认适配器 id。
+    default_agent: String,
     /// 任务队列的唯一入口；所有执行都在调度线程内串行进行。
     scheduler: Arc<Scheduler>,
     /// GitHub issue 后台同步。
@@ -85,29 +88,51 @@ struct RequireChecksInput {
 }
 
 #[derive(Debug, Deserialize)]
-struct CreateNoteInput {
-    project_id: String,
-    title: String,
+struct AddVaultInput {
+    name: String,
+    root_path: String,
     #[serde(default)]
-    body: String,
+    create: bool,
 }
 
 #[derive(Debug, Deserialize)]
-struct UpdateNoteInput {
-    #[serde(alias = "note_id")]
-    id: String,
-    title: String,
-    #[serde(default)]
-    body: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateTaskFromNoteInput {
-    note_id: String,
+struct CreateVaultNoteInput {
+    vault_id: String,
+    path: String,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
-    prompt: Option<String>,
+    body: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveVaultNoteInput {
+    #[serde(alias = "note_id")]
+    id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetTaskAgentsInput {
+    task_id: String,
+    /// 缺省 = 保持不变；null / 空串 = 清除覆盖；字符串 = 指定适配器。
+    #[serde(default, deserialize_with = "double_option")]
+    developer_adapter: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    reviewer_adapter: Option<Option<String>>,
+}
+
+/// 区分 JSON 字段缺省（外层 `None`）与显式 `null`（`Some(None)`）。
+fn double_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,19 +149,6 @@ struct DependencyList {
 
 fn db_err(e: rusqlite::Error) -> String {
     e.to_string()
-}
-
-/// 条目（笔记 / 文档 / issue）所属项目；链接与笔记转任务都要先解析项目。
-fn item_project_id(conn: &rusqlite::Connection, item_id: &str) -> Result<String, String> {
-    conn.query_row(
-        "SELECT project_id FROM items WHERE id = ?1",
-        params![item_id],
-        |row| row.get(0),
-    )
-    .map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => format!("条目不存在：{item_id}"),
-        other => db_err(other),
-    })
 }
 
 fn list_project_decisions(
@@ -344,7 +356,7 @@ fn create_task(state: State<AppState>, input: CreateTaskInput) -> Result<TaskDet
     let criteria = if input.acceptance.is_empty() {
         let repo = PathBuf::from(&project.repo_path);
         let commands = evidence::discover_commands(&repo);
-        let adapter = state.adapters.get("omp");
+        let adapter = state.adapters.get(&state.default_agent);
         let generated = generate_acceptance(
             adapter.as_deref(),
             &repo,
@@ -482,39 +494,141 @@ fn set_require_checks(state: State<AppState>, input: RequireChecksInput) -> Resu
 }
 
 #[tauri::command]
-fn list_notes(
+fn set_task_agents(state: State<AppState>, input: SetTaskAgentsInput) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    let conn = db.conn();
+    let (developer, reviewer) = store::task_agents(conn, &input.task_id)?;
+
+    let apply = |label: &str, incoming: Option<Option<String>>, current: Option<String>| {
+        match incoming {
+            // 字段缺省：保持当前值。
+            None => Ok(current),
+            // 显式 null / 空串：清除覆盖，回退到默认适配器。
+            Some(None) => Ok(None),
+            Some(Some(value)) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                if state.adapters.get(value).is_none() {
+                    return Err(format!("{label}适配器未注册：{value}"));
+                }
+                Ok(Some(value.to_string()))
+            }
+        }
+    };
+
+    let developer = apply("开发者", input.developer_adapter, developer)?;
+    let reviewer = apply("审查者", input.reviewer_adapter, reviewer)?;
+    store::set_task_agents(
+        conn,
+        &input.task_id,
+        developer.as_deref(),
+        reviewer.as_deref(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 笔记库（vault）
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn add_vault(state: State<AppState>, input: AddVaultInput) -> Result<vaults::Vault, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    vaults::add_vault(db.conn(), &input.name, &input.root_path, input.create)
+}
+
+#[tauri::command]
+fn list_vaults(state: State<AppState>) -> Result<Vec<vaults::Vault>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    vaults::list_vaults(db.conn())
+}
+
+#[tauri::command]
+fn remove_vault(state: State<AppState>, vault_id: String) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    vaults::remove_vault(db.conn(), &vault_id)
+}
+
+#[tauri::command]
+fn index_vault(state: State<AppState>, vault_id: String) -> Result<usize, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    let vault = vaults::get_vault(db.conn(), &vault_id)?;
+    vaults::index_vault(db.conn(), &vault)
+}
+
+#[tauri::command]
+fn vault_tree(state: State<AppState>, vault_id: String) -> Result<Vec<vaults::VaultEntry>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    vaults::vault_tree(db.conn(), &vault_id)
+}
+
+#[tauri::command]
+fn get_vault_note(state: State<AppState>, note_id: String) -> Result<vaults::VaultNote, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    vaults::get_vault_note(db.conn(), &note_id)
+}
+
+#[tauri::command]
+fn create_vault_note(
     state: State<AppState>,
-    project_id: String,
-) -> Result<Vec<workspace::NoteMeta>, String> {
+    input: CreateVaultNoteInput,
+) -> Result<vaults::VaultNote, String> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    workspace::list_notes(db.conn(), &project_id)
+    let vault = vaults::get_vault(db.conn(), &input.vault_id)?;
+    vaults::create_vault_note(
+        db.conn(),
+        &vault,
+        &input.path,
+        input.title.as_deref(),
+        input.body.as_deref(),
+    )
 }
 
 #[tauri::command]
-fn get_note(state: State<AppState>, note_id: String) -> Result<workspace::Note, String> {
+fn save_vault_note(
+    state: State<AppState>,
+    input: SaveVaultNoteInput,
+) -> Result<vaults::VaultNote, String> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    workspace::get_note(db.conn(), &note_id)
+    vaults::save_vault_note(
+        db.conn(),
+        &input.id,
+        input.title.as_deref(),
+        input.body.as_deref(),
+        input.path.as_deref(),
+    )
 }
 
 #[tauri::command]
-fn create_note(state: State<AppState>, input: CreateNoteInput) -> Result<workspace::Note, String> {
+fn delete_vault_note(state: State<AppState>, note_id: String) -> Result<(), String> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    let project = db
-        .get_project(&input.project_id)?
-        .ok_or_else(|| "项目不存在".to_string())?;
-    workspace::create_note(db.conn(), &project, &input.title, &input.body)
+    vaults::delete_vault_note(db.conn(), &note_id)
 }
 
 #[tauri::command]
-fn update_note(state: State<AppState>, input: UpdateNoteInput) -> Result<workspace::Note, String> {
+fn search_vault(
+    state: State<AppState>,
+    vault_id: String,
+    query: String,
+) -> Result<Vec<vaults::VaultHit>, String> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    workspace::update_note(db.conn(), &input.id, &input.title, &input.body)
+    vaults::search_vault(db.conn(), &vault_id, &query)
 }
 
 #[tauri::command]
-fn delete_note(state: State<AppState>, note_id: String) -> Result<(), String> {
+fn note_backlinks(
+    state: State<AppState>,
+    note_id: String,
+) -> Result<Vec<vaults::Backlink>, String> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    workspace::delete_note(db.conn(), &note_id)
+    vaults::note_backlinks(db.conn(), &note_id)
+}
+
+#[tauri::command]
+fn vault_graph(state: State<AppState>, vault_id: String) -> Result<vaults::Graph, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    vaults::vault_graph(db.conn(), &vault_id)
 }
 
 #[tauri::command]
@@ -549,55 +663,6 @@ fn search_workspace(
 ) -> Result<Vec<workspace::SearchHit>, String> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     workspace::search(db.conn(), &project_id, &query)
-}
-
-/// 笔记转任务：prompt 默认取笔记正文，随后写入 `derived_from` 链接。
-#[tauri::command]
-fn create_task_from_note(
-    state: State<AppState>,
-    input: CreateTaskFromNoteInput,
-) -> Result<TaskDetail, String> {
-    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    let conn = db.conn();
-    let note = workspace::get_note(conn, &input.note_id)?;
-    let project_id = item_project_id(conn, &input.note_id)?;
-    let project = db
-        .get_project(&project_id)?
-        .ok_or_else(|| "项目不存在".to_string())?;
-
-    let title = input
-        .title
-        .map(|title| title.trim().to_string())
-        .filter(|title| !title.is_empty())
-        .unwrap_or_else(|| note.title.clone());
-    let prompt = input
-        .prompt
-        .filter(|prompt| !prompt.trim().is_empty())
-        .unwrap_or_else(|| note.body.clone());
-    let commands = evidence::discover_commands(Path::new(&project.repo_path));
-    let criteria = evidence::default_acceptance(&commands);
-    if criteria.is_empty() {
-        return Err("未发现可执行的测试/构建命令，请手动提供验收标准".to_string());
-    }
-
-    let task = store::create_task(
-        conn,
-        store::NewTask {
-            project_id,
-            title,
-            prompt,
-            criteria,
-        },
-    )?;
-    let task_item = store::task_item_id(conn, &task.id)?;
-    if let Err(err) = store::link_item(conn, &input.note_id, &task_item, "derived_from") {
-        let _ = conn.execute(
-            "DELETE FROM items WHERE id = ?1",
-            rusqlite::params![task_item],
-        );
-        return Err(format!("创建任务后关联笔记失败：{err}"));
-    }
-    store::get_task(conn, &task.id)
 }
 
 #[tauri::command]
@@ -686,18 +751,19 @@ pub fn run() {
             let mut adapters = AdapterRegistry::new();
             adapters.register(Arc::new(agent::omp::OmpAdapter::new()));
             adapters.register(Arc::new(agent::fake::FakeAdapter::new()));
-            let adapters = Arc::new(adapters);
 
-            let adapter_id = std::env::var("TEMLI_AGENT").unwrap_or_else(|_| "omp".to_string());
-            let adapter = adapters
-                .get(&adapter_id)
-                .ok_or_else(|| std::io::Error::other(format!("适配器未注册：{adapter_id}")))?;
+            let default_agent = std::env::var("TEMLI_AGENT").unwrap_or_else(|_| "omp".to_string());
+            if adapters.get(&default_agent).is_none() {
+                return Err(std::io::Error::other(format!("适配器未注册：{default_agent}")).into());
+            }
+            let adapters = Arc::new(adapters);
 
             let db = Arc::new(Mutex::new(db));
             let github: Arc<dyn github::GitHubOps> = Arc::new(github::GhOps::new());
             let scheduler = Scheduler::new(orchestrator::RunContext {
                 db: Arc::clone(&db),
-                adapter,
+                adapters: Arc::clone(&adapters),
+                default_agent: default_agent.clone(),
                 data_dir: dir,
                 running: Arc::new(Mutex::new(HashSet::new())),
                 cancels: orchestrator::CancelRegistry::new(),
@@ -713,6 +779,7 @@ pub fn run() {
             app.manage(AppState {
                 db,
                 adapters,
+                default_agent,
                 scheduler,
                 sync,
             });
@@ -743,16 +810,23 @@ pub fn run() {
             set_auto_merge,
             get_require_checks,
             set_require_checks,
-            list_notes,
-            get_note,
-            create_note,
-            update_note,
-            delete_note,
+            set_task_agents,
+            add_vault,
+            list_vaults,
+            remove_vault,
+            index_vault,
+            vault_tree,
+            get_vault_note,
+            create_vault_note,
+            save_vault_note,
+            delete_vault_note,
+            search_vault,
+            note_backlinks,
+            vault_graph,
             list_docs,
             get_doc,
             reindex_workspace,
             search_workspace,
-            create_task_from_note,
             link_context,
             unlink_context,
             list_context

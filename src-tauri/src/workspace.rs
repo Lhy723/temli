@@ -1,9 +1,9 @@
-//! M5 知识 / 文档工作区：笔记文件、文档索引与 FTS 全文检索。
+//! M5 文档工作区：仓库 `docs/**/*.md` 索引与 FTS 全文检索。
 //!
 //! 权威边界（见 `docs/data-model.md`）：
-//! - 笔记正文在 `.temli/notes/<uuid>.md`，文件是权威，`items.body` 是检索缓存；
-//! - 文档由仓库 `docs/**/*.md` 扫描得到，DB 只存索引；
-//! - 两者统一写入 `search_fts`，保存 / 扫描后立即可以检索。
+//! - 文档正文在仓库 `docs/**/*.md`，DB 只存索引，文件是正文权威；
+//! - 扫描后写入 `search_fts`，扫描 / 保存后立即可以检索；
+//! - 笔记已迁到独立笔记库（`vaults`），本模块不再存储笔记。
 
 use crate::db::Project;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -11,33 +11,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use uuid::Uuid;
 
-const NOTES_DIR: &str = ".temli/notes";
 const DOCS_DIR: &str = "docs";
 const SEARCH_LIMIT: i64 = 50;
 
 // ---------------------------------------------------------------------------
 // 公开类型
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NoteMeta {
-    pub id: String,
-    pub title: String,
-    pub updated_at: String,
-    pub file_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Note {
-    pub id: String,
-    pub title: String,
-    pub body: String,
-    pub file_path: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocMeta {
@@ -60,180 +40,6 @@ pub struct SearchHit {
     pub kind: String,
     pub title: String,
     pub snippet: String,
-}
-
-// ---------------------------------------------------------------------------
-// 笔记
-// ---------------------------------------------------------------------------
-
-/// 新建笔记：先写文件，再写 `items` 与 `search_fts`；DB 失败时回滚文件。
-pub fn create_note(
-    conn: &Connection,
-    project: &Project,
-    title: &str,
-    body: &str,
-) -> Result<Note, String> {
-    let title = clean_title(title);
-    if title.is_empty() {
-        return Err("笔记标题不能为空".to_string());
-    }
-    let id = Uuid::new_v4().to_string();
-    let file_path = note_file_path(&id);
-    let absolute = project_path(&project.repo_path).join(&file_path);
-    let now = now(conn)?;
-
-    write_note_file(&absolute, &id, &title, &now, body)?;
-    if let Err(err) = insert_note_row(conn, &project.id, &id, &title, body, &file_path, &now) {
-        let _ = fs::remove_file(&absolute);
-        return Err(err);
-    }
-    read_note(conn, &id)
-}
-
-pub fn list_notes(conn: &Connection, project_id: &str) -> Result<Vec<NoteMeta>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, title, updated_at, COALESCE(file_path, '')
-             FROM items
-             WHERE project_id = ?1 AND kind = 'note'
-             ORDER BY updated_at DESC, title ASC",
-        )
-        .map_err(db_err)?;
-    let rows = stmt
-        .query_map(params![project_id], |row| {
-            Ok(NoteMeta {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                updated_at: row.get(2)?,
-                file_path: row.get(3)?,
-            })
-        })
-        .map_err(db_err)?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
-}
-
-/// 读取笔记：文件是正文权威；文件缺失或无法解析时回退到 DB 缓存正文。
-pub fn get_note(conn: &Connection, note_id: &str) -> Result<Note, String> {
-    let (mut note, repo_path) = conn
-        .query_row(
-            "SELECT i.id, i.title, i.body, COALESCE(i.file_path, ''), i.created_at,
-                    i.updated_at, p.repo_path
-             FROM items i JOIN projects p ON p.id = i.project_id
-             WHERE i.id = ?1 AND i.kind = 'note'",
-            params![note_id],
-            |row| {
-                Ok((
-                    Note {
-                        id: row.get(0)?,
-                        title: row.get(1)?,
-                        body: row.get(2)?,
-                        file_path: row.get(3)?,
-                        created_at: row.get(4)?,
-                        updated_at: row.get(5)?,
-                    },
-                    row.get::<_, String>(6)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(db_err)?
-        .ok_or_else(|| format!("笔记不存在：{note_id}"))?;
-
-    if note.file_path.is_empty() {
-        note.file_path = note_file_path(&note.id);
-    }
-    note.body = note_body_from_file(&repo_path, &note.file_path, note.body);
-    Ok(note)
-}
-
-pub fn update_note(
-    conn: &Connection,
-    note_id: &str,
-    title: &str,
-    body: &str,
-) -> Result<Note, String> {
-    let title = clean_title(title);
-    if title.is_empty() {
-        return Err("笔记标题不能为空".to_string());
-    }
-    let (file_path, repo_path, project_id) = conn
-        .query_row(
-            "SELECT i.file_path, p.repo_path, i.project_id
-             FROM items i JOIN projects p ON p.id = i.project_id
-             WHERE i.id = ?1 AND i.kind = 'note'",
-            params![note_id],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(db_err)?
-        .ok_or_else(|| format!("笔记不存在：{note_id}"))?;
-
-    let file_path = file_path
-        .filter(|path| !path.is_empty())
-        .unwrap_or_else(|| note_file_path(note_id));
-    let updated_at = now(conn)?;
-    let absolute = project_path(&repo_path).join(&file_path);
-    write_note_file(&absolute, note_id, &title, &updated_at, body)?;
-
-    let tx = conn.unchecked_transaction().map_err(db_err)?;
-    let changed = tx
-        .execute(
-            "UPDATE items
-             SET title = ?1, body = ?2, updated_at = ?3
-             WHERE id = ?4 AND kind = 'note'",
-            params![title, body, updated_at, note_id],
-        )
-        .map_err(db_err)?;
-    if changed == 0 {
-        return Err(format!("笔记不存在：{note_id}"));
-    }
-    index_item(&tx, &project_id, note_id, "note", &title, body)?;
-    tx.commit().map_err(db_err)?;
-    read_note(conn, note_id)
-}
-
-/// 删除笔记：删除文件、`items` 行与 FTS 索引（`links` 由外键级联清理）。
-pub fn delete_note(conn: &Connection, note_id: &str) -> Result<(), String> {
-    let (file_path, repo_path) = conn
-        .query_row(
-            "SELECT i.file_path, p.repo_path
-             FROM items i JOIN projects p ON p.id = i.project_id
-             WHERE i.id = ?1 AND i.kind = 'note'",
-            params![note_id],
-            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()
-        .map_err(db_err)?
-        .ok_or_else(|| format!("笔记不存在：{note_id}"))?;
-
-    let file_path = file_path
-        .filter(|path| !path.is_empty())
-        .unwrap_or_else(|| note_file_path(note_id));
-    let absolute = project_path(&repo_path).join(&file_path);
-    match fs::remove_file(&absolute) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(format!("删除笔记文件失败：{err}")),
-    }
-
-    let tx = conn.unchecked_transaction().map_err(db_err)?;
-    tx.execute(
-        "DELETE FROM search_fts WHERE entity_id = ?1",
-        params![note_id],
-    )
-    .map_err(db_err)?;
-    tx.execute(
-        "DELETE FROM items WHERE id = ?1 AND kind = 'note'",
-        params![note_id],
-    )
-    .map_err(db_err)?;
-    tx.commit().map_err(db_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +101,7 @@ pub fn scan_docs(conn: &Connection, project: &Project) -> Result<usize, String> 
         };
         scanned.push(ScannedDoc {
             id,
-            title: doc_title(file, &body),
+            title: markdown_title(file, &body),
             relative,
             body,
         });
@@ -398,7 +204,7 @@ pub fn get_doc(conn: &Connection, doc_id: &str) -> Result<Doc, String> {
 // 检索
 // ---------------------------------------------------------------------------
 
-/// 项目内 FTS5 检索；空查询返回空列表，正文片段用 `[...]` 标出命中词。
+/// 项目内文档 FTS5 检索；空查询返回空列表，正文片段用 `[...]` 标出命中词。
 pub fn search(conn: &Connection, project_id: &str, query: &str) -> Result<Vec<SearchHit>, String> {
     if query.trim().is_empty() {
         return Ok(Vec::new());
@@ -415,7 +221,7 @@ pub fn search(conn: &Connection, project_id: &str, query: &str) -> Result<Vec<Se
             "SELECT entity_id, kind, title,
                     snippet(search_fts, 4, '[', ']', '…', 12)
              FROM search_fts
-             WHERE search_fts MATCH ?1 AND project_id = ?2
+             WHERE search_fts MATCH ?1 AND project_id = ?2 AND kind = 'doc'
              ORDER BY rank
              LIMIT ?3",
         )
@@ -440,7 +246,7 @@ fn search_like(conn: &Connection, project_id: &str, query: &str) -> Result<Vec<S
         .prepare(
             "SELECT id, kind, title, COALESCE(body, '')
              FROM items
-             WHERE project_id = ?1 AND kind IN ('note', 'doc')
+             WHERE project_id = ?1 AND kind = 'doc'
                AND (title LIKE ?2 ESCAPE '\\' OR body LIKE ?2 ESCAPE '\\')
              ORDER BY updated_at DESC
              LIMIT ?3",
@@ -460,7 +266,7 @@ fn search_like(conn: &Connection, project_id: &str, query: &str) -> Result<Vec<S
     rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
 }
 
-fn like_pattern(query: &str) -> String {
+pub(crate) fn like_pattern(query: &str) -> String {
     format!(
         "%{}%",
         query
@@ -470,7 +276,7 @@ fn like_pattern(query: &str) -> String {
     )
 }
 
-fn like_snippet(body: &str, needle: &str) -> String {
+pub(crate) fn like_snippet(body: &str, needle: &str) -> String {
     let Some(byte_pos) = body.find(needle) else {
         return body.chars().take(80).collect();
     };
@@ -493,8 +299,8 @@ fn like_snippet(body: &str, needle: &str) -> String {
     )
 }
 
-/// 把笔记 / 文档写入 `search_fts`；先删同 id 旧行，保证保存后立刻是唯一索引。
-pub fn index_item(
+/// 把文档写入 `search_fts`；先删同 id 旧行，保证扫描后立刻是唯一索引。
+fn index_item(
     conn: &Connection,
     project_id: &str,
     id: &str,
@@ -521,138 +327,8 @@ fn db_err(err: rusqlite::Error) -> String {
     err.to_string()
 }
 
-fn now(conn: &Connection) -> Result<String, String> {
-    conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
-        row.get(0)
-    })
-    .map_err(db_err)
-}
-
 fn project_path(repo_path: &str) -> PathBuf {
     PathBuf::from(repo_path)
-}
-
-/// 标题写进单行 frontmatter：折叠换行与连续空白，避免破坏文件结构。
-fn clean_title(title: &str) -> String {
-    title.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn note_file_path(note_id: &str) -> String {
-    format!("{NOTES_DIR}/{note_id}.md")
-}
-
-fn note_file_content(id: &str, title: &str, updated_at: &str, body: &str) -> String {
-    format!("---\nid: {id}\ntitle: {title}\nupdated_at: {updated_at}\n---\n{body}")
-}
-
-fn write_note_file(
-    absolute: &Path,
-    id: &str,
-    title: &str,
-    updated_at: &str,
-    body: &str,
-) -> Result<(), String> {
-    if let Some(parent) = absolute.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("创建笔记目录失败：{err}"))?;
-    }
-    fs::write(absolute, note_file_content(id, title, updated_at, body))
-        .map_err(|err| format!("写入笔记文件失败：{err}"))
-}
-
-/// 解析简单 frontmatter；没有合法 frontmatter 返回 `None`，正文保持原样。
-fn parse_frontmatter(raw: &str) -> Option<(Vec<(&str, &str)>, &str)> {
-    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
-    let first_end = raw.find('\n')?;
-    if raw[..first_end].trim() != "---" {
-        return None;
-    }
-    let mut fields = Vec::new();
-    let mut pos = first_end + 1;
-    while pos <= raw.len() {
-        let line_end = raw[pos..]
-            .find('\n')
-            .map(|offset| pos + offset)
-            .unwrap_or(raw.len());
-        let line = &raw[pos..line_end];
-        if line.trim() == "---" {
-            let body_start = if line_end < raw.len() {
-                line_end + 1
-            } else {
-                line_end
-            };
-            return Some((fields, &raw[body_start..]));
-        }
-        if let Some((key, value)) = line.split_once(':') {
-            fields.push((key.trim(), value.trim()));
-        }
-        if line_end == raw.len() {
-            break;
-        }
-        pos = line_end + 1;
-    }
-    None
-}
-
-fn note_body_from_file(repo_path: &str, file_path: &str, fallback: String) -> String {
-    match fs::read_to_string(project_path(repo_path).join(file_path)) {
-        Ok(raw) => match parse_frontmatter(&raw) {
-            Some((_, body)) => body.to_string(),
-            None => {
-                let without_bom = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-                if without_bom.trim().is_empty() || without_bom.trim_start().starts_with("---") {
-                    // 空文件或 frontmatter 损坏：回退 DB 缓存正文。
-                    fallback
-                } else {
-                    // 外部编辑移除了 frontmatter；整个文件仍是用户最新正文。
-                    raw
-                }
-            }
-        },
-        Err(_) => fallback,
-    }
-}
-
-fn insert_note_row(
-    conn: &Connection,
-    project_id: &str,
-    id: &str,
-    title: &str,
-    body: &str,
-    file_path: &str,
-    at: &str,
-) -> Result<(), String> {
-    let tx = conn.unchecked_transaction().map_err(db_err)?;
-    tx.execute(
-        "INSERT INTO items
-             (id, project_id, kind, title, status, file_path, body, created_at, updated_at)
-         VALUES (?1, ?2, 'note', ?3, 'open', ?4, ?5, ?6, ?6)",
-        params![id, project_id, title, file_path, body, at],
-    )
-    .map_err(db_err)?;
-    index_item(&tx, project_id, id, "note", title, body)?;
-    tx.commit().map_err(db_err)
-}
-
-fn read_note(conn: &Connection, note_id: &str) -> Result<Note, String> {
-    conn.query_row(
-        "SELECT id, title, body, COALESCE(file_path, ''), created_at, updated_at
-         FROM items
-         WHERE id = ?1 AND kind = 'note'",
-        params![note_id],
-        |row| {
-            Ok(Note {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                body: row.get(2)?,
-                file_path: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(db_err)?
-    .ok_or_else(|| format!("笔记不存在：{note_id}"))
 }
 
 /// 递归收集 `*.md`；跳过隐藏目录（如 `.vitepress`）与符号链接。
@@ -677,7 +353,7 @@ fn collect_markdown_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Stri
                 .path()
                 .extension()
                 .and_then(|extension| extension.to_str())
-                .map_or(false, |extension| extension.eq_ignore_ascii_case("md"));
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
             if is_markdown {
                 out.push(entry.path());
             }
@@ -687,7 +363,7 @@ fn collect_markdown_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Stri
 }
 
 /// FNV-1a：跨 Rust 版本稳定的 64 位哈希。
-fn stable_hash(input: &str) -> u64 {
+pub(crate) fn stable_hash(input: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in input.as_bytes() {
         hash ^= u64::from(*byte);
@@ -704,7 +380,9 @@ fn doc_id(project_id: &str, relative_path: &str) -> String {
     )
 }
 
-fn doc_title(path: &Path, body: &str) -> String {
+/// 首个 `# ` 一级标题（跳过 frontmatter 与代码围栏）。
+fn first_heading(body: &str) -> Option<String> {
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
     let mut in_frontmatter = false;
     let mut in_fence = false;
     let mut first = true;
@@ -733,14 +411,21 @@ fn doc_title(path: &Path, body: &str) -> String {
         if let Some(heading) = line.trim_start().strip_prefix("# ") {
             let heading = heading.trim();
             if !heading.is_empty() {
-                return heading.to_string();
+                return Some(heading.to_string());
             }
         }
     }
-    path.file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or_else(|| "untitled".to_string())
+    None
+}
+
+/// Markdown 标题：首个 H1，否则文件名 stem。
+pub(crate) fn markdown_title(path: &Path, body: &str) -> String {
+    first_heading(body).unwrap_or_else(|| {
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or_else(|| "untitled".to_string())
+    })
 }
 
 fn repo_relative(repo_root: &Path, path: &Path) -> String {
@@ -756,7 +441,7 @@ fn repo_relative(repo_root: &Path, path: &Path) -> String {
 }
 
 /// 将用户输入转成安全的多词 FTS5 查询：每个词做引号转义并启用前缀匹配。
-fn fts_match_query(query: &str) -> Option<String> {
+pub(crate) fn fts_match_query(query: &str) -> Option<String> {
     let mut parts = Vec::new();
     for token in query.split_whitespace() {
         if !token.chars().any(|character| character.is_alphanumeric()) {
@@ -806,12 +491,6 @@ mod tests {
                 project,
             }
         }
-
-        fn add_project(&self, label: &str) -> Project {
-            let repo = self.root.join(format!("repo-{label}"));
-            fs::create_dir_all(&repo).expect("创建第二个临时仓库");
-            register(&self.db, &repo, label)
-        }
     }
 
     impl Drop for Fixture {
@@ -839,58 +518,6 @@ mod tests {
         let path = repo.join(relative);
         fs::create_dir_all(path.parent().unwrap()).expect("创建文档目录");
         fs::write(path, contents).expect("写入文档");
-    }
-
-    fn note_path(fixture: &Fixture, note: &Note) -> PathBuf {
-        fixture.repo.join(&note.file_path)
-    }
-
-    #[test]
-    fn note_create_update_delete_roundtrip_and_search() {
-        let fixture = Fixture::new("note");
-        let conn = fixture.db.conn();
-
-        let note = create_note(conn, &fixture.project, "记录", "alpha first").unwrap();
-        let path = note_path(&fixture, &note);
-        assert!(path.exists(), "笔记文件应写入 .temli/notes");
-        assert_eq!(list_notes(conn, &fixture.project.id).unwrap().len(), 1);
-        assert_eq!(get_note(conn, &note.id).unwrap().body, "alpha first");
-
-        let raw = fs::read_to_string(&path).unwrap();
-        let (fields, body) = parse_frontmatter(&raw).expect("笔记文件应带 frontmatter");
-        assert_eq!(body, "alpha first");
-        assert!(
-            fields
-                .iter()
-                .any(|(key, value)| *key == "id" && *value == note.id.as_str())
-        );
-        assert!(fields.iter().any(|(key, _)| *key == "title"));
-        assert!(fields.iter().any(|(key, _)| *key == "updated_at"));
-
-        let updated = update_note(conn, &note.id, "记录 v2", "beta second").unwrap();
-        assert_eq!(updated.title, "记录 v2");
-        assert!(fs::read_to_string(&path).unwrap().contains("beta second"));
-        assert!(
-            search(conn, &fixture.project.id, "alpha")
-                .unwrap()
-                .is_empty(),
-            "更新后旧正文不应再命中"
-        );
-        let hits = search(conn, &fixture.project.id, "beta").unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, note.id);
-        assert_eq!(hits[0].kind, "note");
-        assert!(hits[0].snippet.contains("[beta]"), "{}", hits[0].snippet);
-
-        delete_note(conn, &note.id).unwrap();
-        assert!(!path.exists(), "删除笔记应删除文件");
-        assert!(list_notes(conn, &fixture.project.id).unwrap().is_empty());
-        assert!(get_note(conn, &note.id).is_err());
-        assert!(
-            search(conn, &fixture.project.id, "beta")
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[test]
@@ -964,88 +591,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-    }
 
-    #[test]
-    fn search_is_project_scoped_with_body_snippet() {
-        let fixture = Fixture::new("search");
-        let other = fixture.add_project("other");
-        let conn = fixture.db.conn();
-
-        let mine = create_note(conn, &fixture.project, "One", "shared alpha body").unwrap();
-        let theirs = create_note(conn, &other, "Two", "shared alpha body").unwrap();
-
-        let hits = search(conn, &fixture.project.id, "alpha").unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, mine.id);
-        assert!(hits[0].snippet.contains("[alpha]"), "{}", hits[0].snippet);
-
-        let other_hits = search(conn, &other.id, "alpha").unwrap();
-        assert_eq!(other_hits.len(), 1);
-        assert_eq!(other_hits[0].id, theirs.id);
-
+        // 两字中文查询走 LIKE。
+        let short = search(conn, &fixture.project.id, "入门").unwrap();
+        assert_eq!(short.len(), 1);
+        assert!(short[0].snippet.contains("[入门]"), "{}", short[0].snippet);
         assert!(search(conn, &fixture.project.id, "   ").unwrap().is_empty());
-        assert!(
-            search(conn, &fixture.project.id, "missing-term")
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn note_get_prefers_file_and_falls_back_to_db_body() {
-        let fixture = Fixture::new("fallback");
-        let conn = fixture.db.conn();
-        let note = create_note(conn, &fixture.project, "标题", "数据库正文").unwrap();
-        let path = note_path(&fixture, &note);
-
-        fs::remove_file(&path).unwrap();
-        assert_eq!(get_note(conn, &note.id).unwrap().body, "数据库正文");
-
-        // 外部编辑移除 frontmatter：整个文件是最新正文。
-        fs::write(&path, "手工编辑的正文").unwrap();
-        assert_eq!(get_note(conn, &note.id).unwrap().body, "手工编辑的正文");
-
-        // 空文件视为文件丢失，回退 DB 缓存正文。
-        fs::write(&path, "").unwrap();
-        assert_eq!(get_note(conn, &note.id).unwrap().body, "数据库正文");
-
-        // 有 frontmatter 起始标记但缺少结束分隔符：回退 DB 缓存正文。
-        fs::write(&path, "---\nid: broken").unwrap();
-        assert_eq!(get_note(conn, &note.id).unwrap().body, "数据库正文");
-
-        // 合法 frontmatter 时取分隔符之后的正文。
-        fs::write(
-            &path,
-            format!(
-                "---\nid: {}\ntitle: 标题\nupdated_at: 2026-01-01T00:00:00.000Z\n---\n文件正文",
-                note.id
-            ),
-        )
-        .unwrap();
-        assert_eq!(get_note(conn, &note.id).unwrap().body, "文件正文");
-        assert_eq!(
-            list_notes(conn, &fixture.project.id).unwrap()[0].id,
-            note.id
-        );
-    }
-    #[test]
-    fn search_supports_short_cjk_queries() {
-        let fixture = Fixture::new("cjk");
-        let conn = fixture.db.conn();
-        create_note(conn, &fixture.project, "中文", "这是一段笔记正文").unwrap();
-
-        let two = search(conn, &fixture.project.id, "笔记").unwrap();
-        assert_eq!(two.len(), 1, "两字中文查询应命中");
-        assert!(two[0].snippet.contains("[笔记]"), "{}", two[0].snippet);
-
-        let three = search(conn, &fixture.project.id, "笔记正").unwrap();
-        assert_eq!(three.len(), 1, "trigram 查询应命中");
-        assert!(
-            search(conn, &fixture.project.id, "不存在")
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[test]

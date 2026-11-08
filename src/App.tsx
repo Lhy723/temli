@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Button, Card, Chip, Input } from "@heroui/react";
 import { DecisionInbox } from "./components/DecisionInbox";
 import { TasksPanel } from "./components/TasksPanel";
+import { Vaults } from "./components/Vaults";
 import { Workspace } from "./components/Workspace";
 import {
   Bot,
@@ -336,14 +337,7 @@ export default function App() {
                 </>
               )}
 
-              {active === "notes" && (
-                <>
-                  {!current && <EmptyProject onRegister={startRegister} />}
-                  {current && (
-                    <Workspace projectId={current.id} mode="notes" />
-                  )}
-                </>
-              )}
+              {active === "notes" && <Vaults />}
 
               {active !== "overview" &&
                 active !== "my" &&

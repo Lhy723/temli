@@ -21,7 +21,9 @@ import {
   GitBranch,
   GitPullRequest,
   Inbox,
+  LayoutGrid,
   Link2,
+  List,
   ListChecks,
   Play,
   Plus,
@@ -46,11 +48,11 @@ import {
   getRequireChecks,
   getTask,
   linkContext,
+  listAdapters,
   listContext,
   listDependencies,
   listDocs,
   listEvents,
-  listNotes,
   listTasks,
   publishTask,
   reindexWorkspace,
@@ -59,6 +61,7 @@ import {
   setAutoMerge,
   setProjectConcurrency,
   setRequireChecks,
+  setTaskAgents,
   startTask,
   statusLabel,
   statusTone,
@@ -66,6 +69,7 @@ import {
   textList,
   unlinkContext,
   verdictLabel,
+  type AgentManifest,
   type ContextItem,
   type EventRow,
   type ProjectIssue,
@@ -88,11 +92,55 @@ const POLLING_STATUSES: Record<string, true> = {
   verifying: true,
 };
 
+type BoardColumn = {
+  key: string;
+  title: string;
+  statuses: string[];
+};
+
+// 看板四阶段；未列出的状态（failed / interrupted）归入“异常/中断”列。
+const BOARD_COLUMNS: BoardColumn[] = [
+  { key: "backlog", title: "准备开发", statuses: ["draft", "ready"] },
+  {
+    key: "active",
+    title: "排队/开发中",
+    statuses: ["queued", "running", "verifying"],
+  },
+  { key: "review", title: "待合并", statuses: ["needs_human"] },
+  { key: "done", title: "已完成", statuses: ["merged"] },
+];
+
+const ADAPTER_DEFAULT_KEY = "__default__";
+const ADAPTER_FOLLOW_KEY = "__follow__";
+
+type TaskAgentInfo = {
+  developer: string | null;
+  reviewer: string | null;
+};
+
+// list_tasks / get_task 都返回任务级适配器字段；null 表示回退默认。
+function taskAgentInfo(task: TaskSummary | TaskDetail["task"]): TaskAgentInfo {
+  return {
+    developer: task.developer_adapter,
+    reviewer: task.reviewer_adapter,
+  };
+}
+
+function adapterLabel(adapters: AgentManifest[], id: string | null): string {
+  if (!id) return "默认适配器";
+  const name = adapters.find((adapter) => adapter.id === id)?.name;
+  return name && name.trim() ? name : id;
+}
+
 export function TasksPanel({ projectId }: { projectId: string }) {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [view, setView] = useState<"board" | "table">("board");
+  const [adapters, setAdapters] = useState<AgentManifest[]>([]);
+  const [adaptersLoading, setAdaptersLoading] = useState(true);
+  const [adaptersError, setAdaptersError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [events, setEvents] = useState<EventRow[]>([]);
@@ -198,29 +246,42 @@ export function TasksPanel({ projectId }: { projectId: string }) {
 
   useEffect(() => {
     let cancelled = false;
+    setAdaptersLoading(true);
+    setAdaptersError(null);
+    listAdapters()
+      .then((next) => {
+        if (!cancelled) setAdapters(next);
+      })
+      .catch((e) => {
+        if (!cancelled) setAdaptersError(errorText(e));
+      })
+      .finally(() => {
+        if (!cancelled) setAdaptersLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
     setContextOptions([]);
     setContextOptionsLoading(true);
     setContextOptionsError(null);
     Promise.all([
-      listNotes(projectId),
       reindexWorkspace(projectId)
         .catch(() => null)
         .then(() => listDocs(projectId)),
     ])
-      .then(([notes, docs]) => {
+      .then(([docs]) => {
         if (cancelled) return;
-        setContextOptions([
-          ...notes.map((note) => ({
-            id: note.id,
-            kind: "note" as const,
-            title: note.title,
-          })),
-          ...docs.map((doc) => ({
+        setContextOptions(
+          docs.map((doc) => ({
             id: doc.id,
             kind: "doc" as const,
             title: doc.title,
           })),
-        ]);
+        );
       })
       .catch((e) => {
         if (!cancelled) setContextOptionsError(errorText(e));
@@ -661,6 +722,29 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     }
   }
 
+  async function saveSelectedAgents(
+    developer: string | null,
+    reviewer: string | null,
+  ): Promise<string | null> {
+    const taskId = selectedRef.current;
+    if (!taskId) return "未选择任务。";
+    try {
+      await setTaskAgents({
+        task_id: taskId,
+        developer_adapter: developer,
+        reviewer_adapter: reviewer,
+      });
+    } catch (e) {
+      return errorText(e);
+    }
+    try {
+      await Promise.all([loadDetail(taskId, true), refreshTasks()]);
+    } catch (e) {
+      return errorText(e);
+    }
+    return null;
+  }
+
   async function resolveTaskDecision(
     decisionId: string,
     resolution: "allow" | "deny",
@@ -756,10 +840,34 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     <div className="relative flex h-full min-h-0 gap-3">
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 pb-2">
-          <span className="flex items-center gap-1.5 text-ui-sm text-[var(--muted)]">
-            <CircleDot size={14} />
-            {tasks.length} 个任务
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="flex items-center gap-1.5 text-ui-sm text-[var(--muted)]">
+              <CircleDot size={14} />
+              {tasks.length} 个任务
+            </span>
+            <div className="flex items-center rounded-md border border-[var(--border)] p-0.5">
+              <Button
+                variant={view === "board" ? "secondary" : "ghost"}
+                size="sm"
+                className="h-6 gap-1 px-2 text-ui-sm"
+                aria-pressed={view === "board"}
+                onPress={() => setView("board")}
+              >
+                <LayoutGrid size={13} />
+                看板
+              </Button>
+              <Button
+                variant={view === "table" ? "secondary" : "ghost"}
+                size="sm"
+                className="h-6 gap-1 px-2 text-ui-sm"
+                aria-pressed={view === "table"}
+                onPress={() => setView("table")}
+              >
+                <List size={13} />
+                列表
+              </Button>
+            </div>
+          </div>
           <div className="flex items-center gap-2">
             <Switch
               size="sm"
@@ -888,7 +996,16 @@ export function TasksPanel({ projectId }: { projectId: string }) {
             </div>
           )}
 
-          {!loading && tasks.length > 0 && (
+          {!loading && tasks.length > 0 && view === "board" && (
+            <TaskBoard
+              tasks={tasks}
+              issues={issues}
+              selectedId={selectedId}
+              onSelect={selectTask}
+            />
+          )}
+
+          {!loading && tasks.length > 0 && view === "table" && (
             <TaskTable
               tasks={tasks}
               selectedId={selectedId}
@@ -903,6 +1020,10 @@ export function TasksPanel({ projectId }: { projectId: string }) {
           detail={detail}
           events={events}
           tasks={tasks}
+          adapters={adapters}
+          adaptersLoading={adaptersLoading}
+          adaptersError={adaptersError}
+          onSaveAgents={saveSelectedAgents}
           dependencies={dependencies}
           dependencyError={dependencyError}
           addingDependency={addingDependency}
@@ -949,6 +1070,165 @@ export function TasksPanel({ projectId }: { projectId: string }) {
           onClose={closeDetail}
         />
       )}
+    </div>
+  );
+}
+
+function TaskBoard({
+  tasks,
+  issues,
+  selectedId,
+  onSelect,
+}: {
+  tasks: TaskSummary[];
+  issues: ProjectIssue[];
+  selectedId: string | null;
+  onSelect: (taskId: string) => void;
+}) {
+  const issueByTask = new Map<string, ProjectIssue>();
+  for (const issue of issues) {
+    if (issue.task_id) issueByTask.set(issue.task_id, issue);
+  }
+  const knownStatuses = new Set(
+    BOARD_COLUMNS.flatMap((column) => column.statuses),
+  );
+  const columns = BOARD_COLUMNS.map((column) => ({
+    ...column,
+    tasks: tasks.filter((task) => column.statuses.includes(task.status)),
+  }));
+  const otherTasks = tasks.filter((task) => !knownStatuses.has(task.status));
+  if (otherTasks.length > 0) {
+    columns.push({
+      key: "other",
+      title: "异常/中断",
+      statuses: [],
+      tasks: otherTasks,
+    });
+  }
+
+  return (
+    <div className="flex min-h-full items-start gap-2 overflow-x-auto pb-2">
+      {columns.map((column) => (
+        <section
+          key={column.key}
+          aria-label={column.title}
+          className="flex w-[224px] min-w-[200px] shrink-0 flex-col gap-1.5"
+        >
+          <div className="flex items-center justify-between px-0.5">
+            <span className="text-ui-sm font-medium">{column.title}</span>
+            <span className="text-label text-[var(--muted)]">
+              {column.tasks.length}
+            </span>
+          </div>
+          {column.tasks.length === 0 ? (
+            <p className="rounded-md border border-dashed border-[var(--border)] px-2 py-3 text-center text-ui-sm text-[var(--muted)]">
+              暂无任务
+            </p>
+          ) : (
+            <div className="grid gap-1.5">
+              {column.tasks.map((task) => (
+                <TaskCard
+                  key={task.id}
+                  task={task}
+                  issue={issueByTask.get(task.id) ?? null}
+                  selected={selectedId === task.id}
+                  onSelect={onSelect}
+                />
+              ))}
+            </div>
+          )}
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function TaskCard({
+  task,
+  issue,
+  selected,
+  onSelect,
+}: {
+  task: TaskSummary;
+  issue: ProjectIssue | null;
+  selected: boolean;
+  onSelect: (taskId: string) => void;
+}) {
+  const agents = taskAgentInfo(task);
+  const developer = agents.developer;
+  const reviewer = agents.reviewer ?? agents.developer;
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      aria-pressed={selected}
+      onClick={() => onSelect(task.id)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelect(task.id);
+        }
+      }}
+      className={`anim-fast cursor-pointer rounded-md border bg-[var(--background)] px-2 py-1.5 hover:bg-[var(--background-secondary)] ${
+        selected ? "border-[var(--accent)]" : "border-[var(--border)]"
+      }`}
+    >
+      <p className="line-clamp-2 text-ui-sm font-medium" title={task.title}>
+        {task.title}
+      </p>
+      <div className="mt-1 flex flex-wrap items-center gap-1">
+        <Chip size="sm" variant="soft" color={statusTone(task.status)}>
+          {statusLabel(task.status)}
+        </Chip>
+        <span className="text-label text-[var(--muted)]">
+          尝试 {task.attempts}
+        </span>
+        <span className="text-label text-[var(--muted)]">
+          验收 {task.criterion_count}
+        </span>
+      </div>
+      <div className="mt-1 flex flex-wrap items-center gap-1">
+        {issue && issue.github_number != null && (
+          <span
+            className="rounded border border-[var(--border)] px-1 font-mono text-label text-[var(--muted)]"
+            title={issue.title}
+          >
+            #{issue.github_number}
+          </span>
+        )}
+        {issue &&
+          (issue.github_state ? (
+            <Chip
+              size="sm"
+              variant="soft"
+              color={statusTone(issue.github_state)}
+            >
+              {statusLabel(issue.github_state)}
+            </Chip>
+          ) : (
+            <Chip size="sm" variant="tertiary" color="default">
+              未发布
+            </Chip>
+          ))}
+        {issue?.ghost && (
+          <Chip size="sm" variant="soft" color="warning">
+            远端已删除
+          </Chip>
+        )}
+        <span
+          className="rounded border border-[var(--border)] px-1 text-label text-[var(--muted)]"
+          title="开发适配器"
+        >
+          开发 {developer ?? "默认"}
+        </span>
+        <span
+          className="rounded border border-[var(--border)] px-1 text-label text-[var(--muted)]"
+          title="审查适配器（未设置时跟随开发者）"
+        >
+          审查 {reviewer ?? "默认"}
+        </span>
+      </div>
     </div>
   );
 }
@@ -1104,6 +1384,10 @@ function DetailPane({
   detail,
   events,
   tasks,
+  adapters,
+  adaptersLoading,
+  adaptersError,
+  onSaveAgents,
   dependencies,
   dependencyError,
   addingDependency,
@@ -1140,6 +1424,13 @@ function DetailPane({
   detail: TaskDetail | null;
   events: EventRow[];
   tasks: TaskSummary[];
+  adapters: AgentManifest[];
+  adaptersLoading: boolean;
+  adaptersError: string | null;
+  onSaveAgents: (
+    developer: string | null,
+    reviewer: string | null,
+  ) => Promise<string | null>;
   dependencies: TaskDependencies | null;
   dependencyError: string | null;
   addingDependency: boolean;
@@ -1177,11 +1468,28 @@ function DetailPane({
   const [contextKey, setContextKey] = useState<string | null>(null);
   const [prLinkError, setPrLinkError] = useState<string | null>(null);
   const detailTaskId = detail?.task.id ?? null;
+  const savedDeveloper = detail ? taskAgentInfo(detail.task).developer : null;
+  const savedReviewer = detail ? taskAgentInfo(detail.task).reviewer : null;
+  const [developerKey, setDeveloperKey] = useState<string | null>(
+    savedDeveloper,
+  );
+  const [reviewerKey, setReviewerKey] = useState<string | null>(
+    savedReviewer ?? savedDeveloper,
+  );
+  const [reviewerFollows, setReviewerFollows] = useState(
+    savedReviewer === null,
+  );
+  const [agentsSaving, setAgentsSaving] = useState(false);
+  const [agentsSaveError, setAgentsSaveError] = useState<string | null>(null);
   useEffect(() => {
     setDependsOnKey(null);
     setContextKey(null);
     setPrLinkError(null);
-  }, [detailTaskId]);
+    setDeveloperKey(savedDeveloper);
+    setReviewerKey(savedReviewer ?? savedDeveloper);
+    setReviewerFollows(savedReviewer === null);
+    setAgentsSaveError(null);
+  }, [detailTaskId, savedDeveloper, savedReviewer]);
 
   const review = detail?.review ?? null;
   const riskFlags = review ? textList(review.risk_flags) : [];
@@ -1214,6 +1522,37 @@ function DetailPane({
     detail.task.status === "running" ||
     detail.task.status === "verifying" ||
     detail.task.status === "merged";
+  const agentsDirty =
+    detail !== null &&
+    (developerKey !== savedDeveloper ||
+      (reviewerFollows
+        ? savedReviewer !== null
+        : reviewerKey !== savedReviewer));
+  const knownAdapterIds = new Set(adapters.map((adapter) => adapter.id));
+  const adapterFallbackLabel = adaptersLoading
+    ? "加载中"
+    : adaptersError
+      ? "未校验"
+      : "未注册";
+  const unregisteredAdapterIds = Array.from(
+    new Set(
+      [developerKey, reviewerKey].filter(
+        (id): id is string => id !== null && !knownAdapterIds.has(id),
+      ),
+    ),
+  );
+
+  async function submitAgents() {
+    if (!detail || agentsSaving || !agentsDirty) return;
+    setAgentsSaving(true);
+    setAgentsSaveError(null);
+    const failure = await onSaveAgents(
+      developerKey,
+      reviewerFollows ? null : reviewerKey,
+    );
+    if (failure) setAgentsSaveError(failure);
+    setAgentsSaving(false);
+  }
 
   async function submitDependency() {
     if (!dependsOnKey || addingDependency) return;
@@ -1229,7 +1568,8 @@ function DetailPane({
 
   return (
     <aside className="absolute inset-y-0 right-0 z-10 flex h-full w-[400px] max-w-full shrink-0 flex-col overflow-hidden rounded-md border border-[var(--border)] bg-[var(--background)] shadow-[0_8px_24px_rgba(0,0,0,0.12)] xl:static xl:w-[380px] xl:shadow-none">
-      <header className="flex shrink-0 items-start gap-2 border-b border-[var(--border)] px-3 py-2">
+      <header className="shrink-0 border-b border-[var(--border)] px-3 py-2">
+        <div className="flex items-start gap-2">
         <div className="min-w-0 flex-1">
           <p className="truncate text-ui font-medium">
             {detail ? detail.task.title : "任务详情"}
@@ -1282,6 +1622,203 @@ function DetailPane({
         >
           <X size={14} />
         </Button>
+        </div>
+        {detail && (
+          <div className="mt-1.5 grid gap-1">
+            <div className="flex items-end gap-1.5">
+              <div className="grid min-w-0 flex-1 gap-0.5">
+                <span className="text-label text-[var(--muted)]">开发</span>
+                <Select
+                  aria-label="开发适配器"
+                  className="w-full min-w-0"
+                  placeholder={adaptersLoading ? "加载中…" : "默认适配器"}
+                  selectedKey={developerKey ?? ADAPTER_DEFAULT_KEY}
+                  onSelectionChange={(key) => {
+                    const next =
+                      key == null || String(key) === ADAPTER_DEFAULT_KEY
+                        ? null
+                        : String(key);
+                    if (reviewerFollows) setReviewerKey(next);
+                    setDeveloperKey(next);
+                    setAgentsSaveError(null);
+                  }}
+                  isDisabled={agentsSaving}
+                >
+                  <Select.Trigger className="h-7 text-ui">
+                    <Select.Value />
+                    <Select.Indicator />
+                  </Select.Trigger>
+                  <Select.Popover>
+                    <ListBox>
+                      <ListBox.Item
+                        id={ADAPTER_DEFAULT_KEY}
+                        textValue="默认适配器"
+                      >
+                        <span className="flex min-w-0 flex-1 items-center gap-2">
+                          <span className="min-w-0 flex-1 truncate">
+                            默认适配器
+                          </span>
+                          <ListBox.ItemIndicator />
+                        </span>
+                      </ListBox.Item>
+                      {adapters.map((adapter) => (
+                        <ListBox.Item
+                          key={adapter.id}
+                          id={adapter.id}
+                          textValue={`${adapter.name} (${adapter.id})`}
+                        >
+                          <span className="flex min-w-0 flex-1 items-center gap-2">
+                            <span className="min-w-0 flex-1 truncate">
+                              {adapter.name}
+                            </span>
+                            <span className="shrink-0 font-mono text-label text-[var(--muted)]">
+                              {adapter.id}
+                            </span>
+                            <ListBox.ItemIndicator />
+                          </span>
+                        </ListBox.Item>
+                      ))}
+                      {unregisteredAdapterIds.map((id) => (
+                        <ListBox.Item
+                          key={`missing-${id}`}
+                          id={id}
+                          textValue={`${id}（${adapterFallbackLabel}）`}
+                        >
+                          <span className="flex min-w-0 flex-1 items-center gap-2">
+                            <span className="min-w-0 flex-1 truncate font-mono">
+                              {id}
+                            </span>
+                            <Chip
+                              size="sm"
+                              variant="soft"
+                              color={
+                                adaptersLoading || adaptersError
+                                  ? "default"
+                                  : "warning"
+                              }
+                              className="shrink-0"
+                            >
+                              {adapterFallbackLabel}
+                            </Chip>
+                            <ListBox.ItemIndicator />
+                          </span>
+                        </ListBox.Item>
+                      ))}
+                    </ListBox>
+                  </Select.Popover>
+                </Select>
+              </div>
+              <div className="grid min-w-0 flex-1 gap-0.5">
+                <span className="text-label text-[var(--muted)]">审查</span>
+                <Select
+                  aria-label="审查适配器"
+                  className="w-full min-w-0"
+                  placeholder={adaptersLoading ? "加载中…" : "跟随开发者"}
+                  selectedKey={
+                    reviewerFollows ? ADAPTER_FOLLOW_KEY : reviewerKey
+                  }
+                  onSelectionChange={(key) => {
+                    if (key == null) return;
+                    const raw = String(key);
+                    const following = raw === ADAPTER_FOLLOW_KEY;
+                    setReviewerFollows(following);
+                    setReviewerKey(following ? developerKey : raw);
+                    setAgentsSaveError(null);
+                  }}
+                  isDisabled={agentsSaving}
+                >
+                  <Select.Trigger className="h-7 text-ui">
+                    <Select.Value />
+                    <Select.Indicator />
+                  </Select.Trigger>
+                  <Select.Popover>
+                    <ListBox>
+                      <ListBox.Item
+                        id={ADAPTER_FOLLOW_KEY}
+                        textValue={`跟随开发者（${adapterLabel(
+                          adapters,
+                          developerKey,
+                        )}）`}
+                      >
+                        <span className="flex min-w-0 flex-1 items-center gap-2">
+                          <span className="min-w-0 flex-1 truncate">
+                            跟随开发者
+                          </span>
+                          <span className="shrink-0 truncate text-label text-[var(--muted)]">
+                            {adapterLabel(adapters, developerKey)}
+                          </span>
+                          <ListBox.ItemIndicator />
+                        </span>
+                      </ListBox.Item>
+                      {adapters.map((adapter) => (
+                        <ListBox.Item
+                          key={adapter.id}
+                          id={adapter.id}
+                          textValue={`${adapter.name} (${adapter.id})`}
+                        >
+                          <span className="flex min-w-0 flex-1 items-center gap-2">
+                            <span className="min-w-0 flex-1 truncate">
+                              {adapter.name}
+                            </span>
+                            <span className="shrink-0 font-mono text-label text-[var(--muted)]">
+                              {adapter.id}
+                            </span>
+                            <ListBox.ItemIndicator />
+                          </span>
+                        </ListBox.Item>
+                      ))}
+                      {unregisteredAdapterIds.map((id) => (
+                        <ListBox.Item
+                          key={`missing-${id}`}
+                          id={id}
+                          textValue={`${id}（${adapterFallbackLabel}）`}
+                        >
+                          <span className="flex min-w-0 flex-1 items-center gap-2">
+                            <span className="min-w-0 flex-1 truncate font-mono">
+                              {id}
+                            </span>
+                            <Chip
+                              size="sm"
+                              variant="soft"
+                              color={
+                                adaptersLoading || adaptersError
+                                  ? "default"
+                                  : "warning"
+                              }
+                              className="shrink-0"
+                            >
+                              {adapterFallbackLabel}
+                            </Chip>
+                            <ListBox.ItemIndicator />
+                          </span>
+                        </ListBox.Item>
+                      ))}
+                    </ListBox>
+                  </Select.Popover>
+                </Select>
+              </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-7 shrink-0 px-2.5 text-ui"
+                onPress={() => void submitAgents()}
+                isDisabled={!agentsDirty || agentsSaving}
+              >
+                {agentsSaving ? "保存中…" : "保存"}
+              </Button>
+            </div>
+            {adaptersError && (
+              <p role="alert" className="text-ui-sm text-[var(--danger)]">
+                适配器列表加载失败：{adaptersError}
+              </p>
+            )}
+            {agentsSaveError && (
+              <p role="alert" className="text-ui-sm text-[var(--danger)]">
+                {agentsSaveError}
+              </p>
+            )}
+          </div>
+        )}
       </header>
 
       {cancelError && (
