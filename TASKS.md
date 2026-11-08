@@ -50,6 +50,8 @@
 
 ## 验证
 
-- `cargo test --lib`：97 passed
+- `cargo test --lib`：102 passed
 - `npm run build`：通过
 - 原生冒烟 2 次（OMP 真实执行，temli-demo）：均以 evidence exit 0 + 审查 pass 自动合并；第二次确认 `setWidget` 不再产生审批决策
+- 审计完整性：artifact（diff.patch + files.json）与 review（review.json）均已作为 evidence 落库
+- 规划路径测试：grounded 成功、解析失败回退、命令未发现回退、空命令跳过（5 个测试）

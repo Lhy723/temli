@@ -204,6 +204,26 @@ fn run_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> {
     transition(&ctx.db, task_id, TaskStatus::Verifying)?;
 
     let diff = evidence::collect_diff(&worktree, &base_sha)?;
+    let diff_patch_path = output_dir.join("diff.patch");
+    std::fs::write(&diff_patch_path, &diff.patch).map_err(|e| e.to_string())?;
+    let files_path = output_dir.join("files.json");
+    let files_json = serde_json::to_vec_pretty(&diff.files).map_err(|e| e.to_string())?;
+    std::fs::write(&files_path, &files_json).map_err(|e| e.to_string())?;
+    {
+        let guard = lock_db(&ctx.db)?;
+        store::add_evidence(
+            guard.conn(),
+            NewEvidence {
+                run_id: run_id.clone(),
+                criterion_id: None,
+                kind: "artifact".into(),
+                cmd: Some("git diff".into()),
+                exit_code: None,
+                duration_ms: None,
+                output_path: Some(diff_patch_path.to_string_lossy().into_owned()),
+            },
+        )?;
+    }
     let risk = evidence::classify_risk(&diff.files);
     let test_files = evidence::test_ci_files(&diff.files);
     let has_high_risk = risk.iter().any(|flag| {
@@ -259,6 +279,7 @@ fn run_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> {
         review.verdict.clone()
     };
 
+    let review_path = output_dir.join("review.json");
     {
         let guard = lock_db(&ctx.db)?;
         store::set_review(
@@ -269,6 +290,25 @@ fn run_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> {
                 summary: Some(review.summary.clone()),
                 risk_flags: review.risk_flags.clone(),
                 test_diff: review.test_diff.clone(),
+            },
+        )?;
+        let review_json = serde_json::json!({
+            "verdict": verdict.clone(),
+            "summary": review.summary.clone(),
+            "risk_flags": review.risk_flags.clone(),
+            "test_diff": review.test_diff.clone(),
+        });
+        std::fs::write(&review_path, review_json.to_string()).map_err(|e| e.to_string())?;
+        store::add_evidence(
+            guard.conn(),
+            NewEvidence {
+                run_id: run_id.clone(),
+                criterion_id: None,
+                kind: "review".into(),
+                cmd: Some("reviewer".into()),
+                exit_code: None,
+                duration_ms: None,
+                output_path: Some(review_path.to_string_lossy().into_owned()),
             },
         )?;
     }
@@ -876,8 +916,28 @@ mod tests {
 
         let guard = ctx.db.lock().unwrap();
         let detail = store::get_task(guard.conn(), &task_id).unwrap();
-        assert_eq!(detail.evidence.len(), 1);
-        assert_eq!(detail.evidence[0].exit_code, Some(0));
+        let criterion = detail
+            .evidence
+            .iter()
+            .find(|row| row.criterion_id.as_deref() == Some("c-1"))
+            .expect("criterion evidence");
+        assert_eq!(criterion.exit_code, Some(0));
+        assert_eq!(
+            detail
+                .evidence
+                .iter()
+                .filter(|row| row.kind == "artifact")
+                .count(),
+            1
+        );
+        assert_eq!(
+            detail
+                .evidence
+                .iter()
+                .filter(|row| row.kind == "review")
+                .count(),
+            1
+        );
         assert_eq!(detail.review.unwrap().verdict, "pass");
         assert!(detail.decisions.is_empty());
     }
@@ -890,7 +950,12 @@ mod tests {
 
         let guard = ctx.db.lock().unwrap();
         let detail = store::get_task(guard.conn(), &task_id).unwrap();
-        assert_eq!(detail.evidence[0].exit_code, Some(1));
+        let criterion = detail
+            .evidence
+            .iter()
+            .find(|row| row.criterion_id.as_deref() == Some("c-1"))
+            .expect("criterion evidence");
+        assert_eq!(criterion.exit_code, Some(1));
         assert_eq!(detail.decisions.len(), 1);
         assert_eq!(detail.decisions[0].status, "open");
     }
