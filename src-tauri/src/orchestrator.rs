@@ -1317,10 +1317,21 @@ fn auto_merge_pull_request(
             let _ = mark_pr_state(ctx, run_id, &pr, "cancelled");
             return Err(AutoMergeFailure::Cancelled);
         }
-        let checks = checks_result.map_err(|err| AutoMergeFailure::PullRequest {
-            url: pr.url.clone(),
-            message: format!("读取 PR 检查失败：{err}"),
-        })?;
+        let checks = match checks_result {
+            Ok(checks) => checks,
+            Err(err) => {
+                // 网络抖动不应终止自动合并：记下错误，继续轮询到超时。
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(AutoMergeFailure::PullRequest {
+                        url: pr.url.clone(),
+                        message: format!("读取 PR 检查失败（重试超时）：{err}"),
+                    });
+                }
+                std::thread::sleep((deadline - now).min(AUTO_MERGE_CHECK_INTERVAL));
+                continue;
+            }
+        };
         if checks.is_empty() && cfg.require_checks {
             // 要求检查的项目不接受空检查列表，直接交给人工处理，而不是轮询到超时。
             return Err(AutoMergeFailure::PullRequest {

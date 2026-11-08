@@ -237,6 +237,22 @@ impl GhOps {
         }
         Ok(parsed)
     }
+    /// GET 请求对 curl 级网络错误做有限重试，避免一次 TLS 抖动终止自动合并。
+    fn get_with_retry(&self, url: &str) -> Result<HttpOutput, String> {
+        let mut last = String::new();
+        for attempt in 0..3 {
+            match self.call("GET", url, None, None) {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    last = err;
+                    if attempt < 2 {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                }
+            }
+        }
+        Err(last)
+    }
 }
 
 impl GitHubOps for GhOps {
@@ -323,7 +339,7 @@ impl GitHubOps for GhOps {
 
     fn pull_request_checks(&self, repo: &str, number: u64) -> Result<Vec<CheckRun>, String> {
         let pr_url = format!("{API_BASE}/repos/{repo}/pulls/{number}");
-        let pr_resp = self.call("GET", &pr_url, None, None)?;
+        let pr_resp = self.get_with_retry(&pr_url)?;
         ensure_ok(&pr_resp, "获取 PR")?;
         let head: PullHeadPayload =
             serde_json::from_str(&pr_resp.body).map_err(|e| format!("解析 PR head 失败: {e}"))?;
@@ -332,7 +348,7 @@ impl GitHubOps for GhOps {
             "{API_BASE}/repos/{repo}/commits/{}/check-runs?per_page=100",
             head.head.sha
         );
-        let resp = self.call("GET", &checks_url, None, None)?;
+        let resp = self.get_with_retry(&checks_url)?;
         ensure_ok(&resp, "获取 PR 检查")?;
         parse_check_runs(&resp.body)
     }
