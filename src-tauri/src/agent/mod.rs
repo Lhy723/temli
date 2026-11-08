@@ -1,10 +1,35 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
+pub mod claude;
+pub mod codex;
 pub mod fake;
 pub mod omp;
+
+/// 适配器可承担的编排角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    Developer,
+    Reviewer,
+}
+
+impl AgentRole {
+    /// 默认角色集合：同时可做开发者与审查者。
+    pub fn all() -> Vec<AgentRole> {
+        vec![AgentRole::Developer, AgentRole::Reviewer]
+    }
+}
+
+fn default_roles() -> Vec<AgentRole> {
+    AgentRole::all()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentManifest {
@@ -12,6 +37,9 @@ pub struct AgentManifest {
     pub name: String,
     pub version: String,
     pub capabilities: Capabilities,
+    /// 该适配器可承担的角色；缺省为两种角色都支持。
+    #[serde(default = "default_roles")]
+    pub roles: Vec<AgentRole>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -177,6 +205,57 @@ impl AdapterRegistry {
     }
 }
 
+/// `--version` 探测超时。
+const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 在独立线程中执行 `<program> --version`，主线程最多等待 5 秒。
+///
+/// 成功时返回第一条非空输出行作为版本号；命令可用但无输出时返回 `None`。
+fn probe_version(program: &str) -> Result<Option<String>, String> {
+    let (tx, rx) = mpsc::channel::<std::io::Result<std::process::Output>>();
+    let command_program = program.to_string();
+    let _ = thread::spawn(move || {
+        let _ = tx.send(
+            Command::new(&command_program)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .output(),
+        );
+    });
+
+    let output = match rx.recv_timeout(VERSION_TIMEOUT) {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => return Err(format!("未找到 {program} 可执行文件: {error}")),
+        Err(_) => {
+            return Err(format!(
+                "{program} --version 超时（{} 秒）",
+                VERSION_TIMEOUT.as_secs()
+            ));
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("");
+        return Err(if detail.is_empty() {
+            format!("{program} --version 退出码 {:?}", output.status.code())
+        } else {
+            format!("{program} --version 失败: {detail}")
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +269,7 @@ mod tests {
                 name: "Stub".into(),
                 version: "0.0.1".into(),
                 capabilities: Capabilities::default(),
+                roles: AgentRole::all(),
             }
         }
         fn detect(&self) -> DetectResult {

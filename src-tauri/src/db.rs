@@ -323,6 +323,15 @@ impl Db {
             tx.commit().map_err(|e| e.to_string())?;
         }
 
+        if current < 8 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch("ALTER TABLE tasks ADD COLUMN model TEXT;")
+                .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (8)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
         Ok(())
     }
 

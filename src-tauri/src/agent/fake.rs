@@ -90,6 +90,7 @@ impl AgentAdapter for FakeAdapter {
                 usage: false,
                 ..Capabilities::default()
             },
+            roles: super::AgentRole::all(),
         }
     }
 

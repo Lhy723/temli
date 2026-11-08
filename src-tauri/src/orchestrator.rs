@@ -350,7 +350,7 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
                 task_id: task_id.to_string(),
                 adapter_id: agents.developer.manifest().id,
                 adapter_version: Some(agents.developer.manifest().version),
-                model: None,
+                model: task.model.clone(),
                 branch: Some(branch.clone()),
                 worktree_path: Some(worktree.to_string_lossy().into_owned()),
                 base_sha: Some(base_sha.clone()),
@@ -391,7 +391,7 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
         run_id: run_id.clone(),
         cwd: worktree.clone(),
         prompt,
-        model: None,
+        model: task.model.clone(),
         max_minutes: u64::from(max_minutes),
         max_cost_usd: None,
         env_allowlist: Vec::new(),
@@ -1764,7 +1764,8 @@ fn review_run(
         run_id: Uuid::new_v4().to_string(),
         cwd: worktree.to_path_buf(),
         prompt,
-        model: None,
+        // 审查角色沿用任务的模型覆盖；后续如需角色级模型再从独立字段读取。
+        model: task.model.clone(),
         max_minutes: 10,
         max_cost_usd: None,
         env_allowlist: Vec::new(),
@@ -1820,7 +1821,7 @@ fn close_run(ctx: &RunContext, run_id: &str, status: &str, error: Option<&str>) 
 mod tests {
     use super::*;
     use crate::agent::{
-        AdapterRegistry, AgentManifest, AuthState, Capabilities, DetectResult, EventSink,
+        AdapterRegistry, AgentManifest, AgentRole, AuthState, Capabilities, DetectResult, EventSink,
     };
     use crate::github::{CheckRun, PullRequest};
     use crate::store::{Criterion, NewRun, NewTask};
@@ -1832,6 +1833,7 @@ mod tests {
             id: id.into(),
             name: "Scripted".into(),
             version: "0.0.1".into(),
+            roles: vec![AgentRole::Developer, AgentRole::Reviewer],
             capabilities: Capabilities {
                 streaming: true,
                 approvals: true,
@@ -2014,6 +2016,61 @@ mod tests {
             });
             Ok(SessionHandle {
                 id: "review-fake-1".into(),
+            })
+        }
+
+        fn respond(
+            &self,
+            _handle: &SessionHandle,
+            _request_id: &str,
+            _decision: Decision,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn cancel(&self, _handle: &SessionHandle) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// 记录每次启动收到的 `RunSpec.model`，worker / reviewer 共用同一脚本。
+    struct ModelRecordingAdapter {
+        models: Mutex<Vec<Option<String>>>,
+    }
+
+    impl ModelRecordingAdapter {
+        fn new() -> Self {
+            Self {
+                models: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn models(&self) -> Vec<Option<String>> {
+            self.models.lock().unwrap().clone()
+        }
+    }
+
+    impl AgentAdapter for ModelRecordingAdapter {
+        fn manifest(&self) -> AgentManifest {
+            test_manifest("model-recorder")
+        }
+
+        fn detect(&self) -> DetectResult {
+            ok_detect()
+        }
+
+        fn start(&self, spec: RunSpec, sink: EventSink) -> Result<SessionHandle, String> {
+            self.models.lock().unwrap().push(spec.model.clone());
+            fs::write(spec.cwd.join("done.txt"), "ok\n").map_err(|e| e.to_string())?;
+            sink(AgentEvent::TextDelta {
+                text: r#"{"verdict":"pass","summary":"model recorded","risk_flags":[],"test_diff":[]}"#
+                    .into(),
+            });
+            sink(AgentEvent::Ended {
+                status: RunStatus::Completed,
+            });
+            Ok(SessionHandle {
+                id: "model-recorder-1".into(),
             })
         }
 
@@ -3656,6 +3713,31 @@ mod tests {
         assert_eq!(detail.task.status, TaskStatus::Merged);
         let review = detail.review.expect("review");
         assert_eq!(review.summary.as_deref(), Some("reviewed by dev-fake"));
+    }
+
+    #[test]
+    fn task_model_override_reaches_worker_and_reviewer_specs() {
+        let recorder = Arc::new(ModelRecordingAdapter::new());
+        let agent: Arc<dyn AgentAdapter> = recorder.clone();
+        let (ctx, task_id) = setup_agents("test -f done.txt", move |_| vec![agent], None, false);
+        {
+            let guard = ctx.db.lock().unwrap();
+            store::set_task_model(guard.conn(), &task_id, Some("gpt-5.2-codex")).unwrap();
+        }
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Merged);
+        let models = recorder.models();
+        assert_eq!(models.len(), 2, "worker 与 reviewer 各启动一次");
+        assert_eq!(
+            models,
+            vec![
+                Some("gpt-5.2-codex".to_string()),
+                Some("gpt-5.2-codex".to_string())
+            ],
+            "worker 与 reviewer 的 RunSpec 都应带上任务模型"
+        );
     }
 
     #[test]

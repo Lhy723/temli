@@ -63,6 +63,7 @@ import {
   setProjectConcurrency,
   setRequireChecks,
   setTaskAgents,
+  setTaskModel,
   startTask,
   statusLabel,
   statusTone,
@@ -71,6 +72,7 @@ import {
   unlinkContext,
   verdictLabel,
   type AgentManifest,
+  type AgentRole,
   type ContextItem,
   type EventRow,
   type ProjectIssue,
@@ -123,6 +125,19 @@ function issueNeedsTask(issue: ProjectIssue): boolean {
 const ADAPTER_DEFAULT_KEY = "__default__";
 const ADAPTER_FOLLOW_KEY = "__follow__";
 
+const AGENT_ROLE_LABEL: Record<AgentRole, string> = {
+  developer: "开发",
+  reviewer: "审查",
+};
+const DEFAULT_AGENT_ROLES: AgentRole[] = ["developer", "reviewer"];
+
+// 未声明 roles 的旧清单按“开发 + 审查”处理，避免选择器出现空列表。
+function adapterRoles(adapter: AgentManifest): AgentRole[] {
+  return adapter.roles && adapter.roles.length > 0
+    ? adapter.roles
+    : DEFAULT_AGENT_ROLES;
+}
+
 type TaskAgentInfo = {
   developer: string | null;
   reviewer: string | null;
@@ -140,6 +155,21 @@ function adapterLabel(adapters: AgentManifest[], id: string | null): string {
   if (!id) return "默认适配器";
   const name = adapters.find((adapter) => adapter.id === id)?.name;
   return name && name.trim() ? name : id;
+}
+
+function AgentRoleTags({ adapter }: { adapter: AgentManifest }) {
+  return (
+    <>
+      {adapterRoles(adapter).map((role) => (
+        <span
+          key={role}
+          className="shrink-0 rounded border border-[var(--border)] px-1 text-label text-[var(--muted)]"
+        >
+          {AGENT_ROLE_LABEL[role]}
+        </span>
+      ))}
+    </>
+  );
 }
 
 export function TasksPanel({
@@ -802,6 +832,24 @@ export function TasksPanel({
     return null;
   }
 
+  async function saveSelectedModel(
+    model: string | null,
+  ): Promise<string | null> {
+    const taskId = selectedRef.current;
+    if (!taskId) return "未选择任务。";
+    try {
+      await setTaskModel({ task_id: taskId, model });
+    } catch (e) {
+      return errorText(e);
+    }
+    try {
+      await Promise.all([loadDetail(taskId, true), refreshTasks()]);
+    } catch (e) {
+      return errorText(e);
+    }
+    return null;
+  }
+
   async function resolveTaskDecision(
     decisionId: string,
     resolution: "allow" | "deny",
@@ -1142,6 +1190,7 @@ export function TasksPanel({
           adaptersLoading={adaptersLoading}
           adaptersError={adaptersError}
           onSaveAgents={saveSelectedAgents}
+          onSaveModel={saveSelectedModel}
           dependencies={dependencies}
           dependencyError={dependencyError}
           addingDependency={addingDependency}
@@ -1381,6 +1430,14 @@ function TaskCard({
         >
           审查 {reviewer ?? "默认"}
         </span>
+        {task.model && (
+          <span
+            className="rounded border border-[var(--border)] px-1 text-label text-[var(--muted)]"
+            title="任务级模型覆盖"
+          >
+            模型 {task.model}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -1597,6 +1654,7 @@ function DetailPane({
   adaptersLoading,
   adaptersError,
   onSaveAgents,
+  onSaveModel,
   dependencies,
   dependencyError,
   addingDependency,
@@ -1640,6 +1698,7 @@ function DetailPane({
     developer: string | null,
     reviewer: string | null,
   ) => Promise<string | null>;
+  onSaveModel: (model: string | null) => Promise<string | null>;
   dependencies: TaskDependencies | null;
   dependencyError: string | null;
   addingDependency: boolean;
@@ -1679,6 +1738,7 @@ function DetailPane({
   const detailTaskId = detail?.task.id ?? null;
   const savedDeveloper = detail ? taskAgentInfo(detail.task).developer : null;
   const savedReviewer = detail ? taskAgentInfo(detail.task).reviewer : null;
+  const savedModel = detail ? (detail.task.model ?? null) : null;
   const [developerKey, setDeveloperKey] = useState<string | null>(
     savedDeveloper,
   );
@@ -1690,6 +1750,9 @@ function DetailPane({
   );
   const [agentsSaving, setAgentsSaving] = useState(false);
   const [agentsSaveError, setAgentsSaveError] = useState<string | null>(null);
+  const [modelInput, setModelInput] = useState(savedModel ?? "");
+  const [modelSaving, setModelSaving] = useState(false);
+  const [modelSaveError, setModelSaveError] = useState<string | null>(null);
   useEffect(() => {
     setDependsOnKey(null);
     setContextKey(null);
@@ -1698,7 +1761,9 @@ function DetailPane({
     setReviewerKey(savedReviewer ?? savedDeveloper);
     setReviewerFollows(savedReviewer === null);
     setAgentsSaveError(null);
-  }, [detailTaskId, savedDeveloper, savedReviewer]);
+    setModelInput(savedModel ?? "");
+    setModelSaveError(null);
+  }, [detailTaskId, savedDeveloper, savedReviewer, savedModel]);
 
   const review = detail?.review ?? null;
   const riskFlags = review ? textList(review.risk_flags) : [];
@@ -1750,6 +1815,31 @@ function DetailPane({
       ),
     ),
   );
+  // 审查下拉优先只列声明了 reviewer 角色的适配器；一个都没有时退回完整列表。
+  const reviewerCapable = adapters.filter((adapter) =>
+    adapterRoles(adapter).includes("reviewer"),
+  );
+  const reviewerCandidates =
+    reviewerCapable.length > 0 ? reviewerCapable : adapters;
+  const reviewerCandidateIds = new Set(
+    reviewerCandidates.map((adapter) => adapter.id),
+  );
+  // 已保存/当前选择的适配器即使不支持审查也要可选，便于看清并改回。
+  const retainedReviewerAdapters = adapters.filter(
+    (adapter) =>
+      !reviewerCandidateIds.has(adapter.id) &&
+      ((!reviewerFollows && adapter.id === reviewerKey) ||
+        adapter.id === savedReviewer),
+  );
+  const reviewerAdapterOptions = [
+    ...reviewerCandidates,
+    ...retainedReviewerAdapters,
+  ];
+  const normalizedModel = modelInput.trim() === "" ? null : modelInput.trim();
+  const normalizedSavedModel =
+    savedModel && savedModel.trim() ? savedModel.trim() : null;
+  const modelDirty =
+    detail !== null && normalizedModel !== normalizedSavedModel;
 
   async function submitAgents() {
     if (!detail || agentsSaving || !agentsDirty) return;
@@ -1761,6 +1851,15 @@ function DetailPane({
     );
     if (failure) setAgentsSaveError(failure);
     setAgentsSaving(false);
+  }
+
+  async function submitModel() {
+    if (!detail || modelSaving || !modelDirty) return;
+    setModelSaving(true);
+    setModelSaveError(null);
+    const failure = await onSaveModel(normalizedModel);
+    if (failure) setModelSaveError(failure);
+    setModelSaving(false);
   }
 
   async function submitDependency() {
@@ -1880,6 +1979,7 @@ function DetailPane({
                             <span className="min-w-0 flex-1 truncate">
                               {adapter.name}
                             </span>
+                            <AgentRoleTags adapter={adapter} />
                             <span className="shrink-0 font-mono text-label text-[var(--muted)]">
                               {adapter.id}
                             </span>
@@ -1959,7 +2059,7 @@ function DetailPane({
                           <ListBox.ItemIndicator />
                         </span>
                       </ListBox.Item>
-                      {adapters.map((adapter) => (
+                      {reviewerAdapterOptions.map((adapter) => (
                         <ListBox.Item
                           key={adapter.id}
                           id={adapter.id}
@@ -1969,9 +2069,20 @@ function DetailPane({
                             <span className="min-w-0 flex-1 truncate">
                               {adapter.name}
                             </span>
+                            <AgentRoleTags adapter={adapter} />
                             <span className="shrink-0 font-mono text-label text-[var(--muted)]">
                               {adapter.id}
                             </span>
+                            {!reviewerCandidateIds.has(adapter.id) && (
+                              <Chip
+                                size="sm"
+                                variant="soft"
+                                color="warning"
+                                className="shrink-0"
+                              >
+                                不支持审查
+                              </Chip>
+                            )}
                             <ListBox.ItemIndicator />
                           </span>
                         </ListBox.Item>
@@ -2016,6 +2127,38 @@ function DetailPane({
                 {agentsSaving ? "保存中…" : "保存"}
               </Button>
             </div>
+            <div className="flex items-end gap-1.5">
+              <div className="grid min-w-0 flex-1 gap-0.5">
+                <span className="text-label text-[var(--muted)]">模型</span>
+                <Input
+                  aria-label="任务模型"
+                  placeholder="默认模型"
+                  value={modelInput}
+                  onChange={(event) => {
+                    setModelInput(event.target.value);
+                    setModelSaveError(null);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void submitModel();
+                    }
+                  }}
+                  disabled={modelSaving}
+                  fullWidth
+                />
+              </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-7 shrink-0 px-2.5 text-ui"
+                aria-label="保存模型"
+                onPress={() => void submitModel()}
+                isDisabled={!modelDirty || modelSaving}
+              >
+                {modelSaving ? "保存中…" : "保存"}
+              </Button>
+            </div>
             {adaptersError && (
               <p role="alert" className="text-ui-sm text-[var(--danger)]">
                 适配器列表加载失败：{adaptersError}
@@ -2024,6 +2167,11 @@ function DetailPane({
             {agentsSaveError && (
               <p role="alert" className="text-ui-sm text-[var(--danger)]">
                 {agentsSaveError}
+              </p>
+            )}
+            {modelSaveError && (
+              <p role="alert" className="text-ui-sm text-[var(--danger)]">
+                {modelSaveError}
               </p>
             )}
           </div>
