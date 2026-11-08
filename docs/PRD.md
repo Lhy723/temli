@@ -25,18 +25,20 @@ flowchart LR
 
 ## 3. 信息架构
 
-- 侧栏：概览、知识、文档、项目、Agent
+- 布局参考 Linear：侧栏 + 标签条 + 主内容卡片（详见 [UI 规范](./ui.md)）
+- 侧栏一级：概览、我的任务、审查、Agent；空间分组：项目、视图、文档、知识
 - 默认落地：**概览** = 项目现状 + 决策收件箱 + 执行队列
 - 文档正文在仓库 `docs/`；笔记在项目内 `.temli/notes/`（gitignored）；元数据、状态与检索索引在 SQLite
 - Agent 空间展示会话、证据、审查报告、审批请求；任务本体属于项目空间
+- 组件库 HeroUI v3（React 19 + Tailwind v4）；不修改组件内部样式
 
 ## 4. 里程碑
 
 ### M0 应用骨架
-Tauri 2 + React + TS 外壳；SQLite（含 FTS5）与迁移；项目注册（本地路径 + GitHub 仓库）；IPC 层；无业务逻辑。
+Tauri 2 + React 19 + TypeScript + Tailwind v4 + HeroUI v3 外壳；Linear 式三栏布局（侧栏 / 标签条 / 主卡片）；SQLite（含 FTS5）与迁移；项目注册（本地路径 + GitHub 仓库）；IPC 层；无业务逻辑。
 
 ### M1 证据门（v1 核心）
-Issue/任务模型与验收标准；单任务经 `omp --mode rpc` 执行；四类证据采集（测试、构建/lint、审查、产物）；状态机与决策收件箱；高风险变更识别。
+Issue/任务模型与验收标准；Agent 适配器接口与注册表（`fake` 适配器 + OMP 实现，OMP 经 `omp --mode rpc` 执行）；四类证据采集（测试、构建/lint、审查、产物）；状态机与决策收件箱；高风险变更识别。
 
 ### M2 队列与 worktree
 任务队列串行消费；每任务独立 worktree 与分支；提交、证据归档、合并队列（串行、合并后重跑证据）；失败重试。
@@ -48,7 +50,7 @@ Issue/任务模型与验收标准；单任务经 `omp --mode rpc` 执行；四�
 按 60s 轮询（条件请求）镜像 Issue；本地编辑带版本号提交；冲突时 GitHub 权威；PR 创建与 checks 展示；自动合并默认关闭，证据门全绿方可开启。
 
 ### v1 明确不做
-跨项目知识库、向量检索、多 Agent 后端、夜间守护进程、团队协作、移动端、遥测。
+跨项目知识库、向量检索、OMP 之外的 Agent 后端实现（接口预留）、夜间守护进程、团队协作、移动端、遥测。
 
 ## 5. 关键机制
 
@@ -80,6 +82,9 @@ Agent 可以修改测试与 CI，但审查报告必须逐项列出测试/CI diff
 ### 5.6 预算与重试
 单任务默认 30 分钟上限、3 次重试；超限进入决策收件箱，不无限重试。
 
+### 5.7 Agent 适配器
+核心只依赖适配器契约，不依赖 OMP 协议细节。v1 内置 `omp` 与测试用 `fake`；新增 Claude Code、Codex 等后端只实现适配器并注册自身能力，不改调度器与证据门。能力缺失时降级（无审批能力 → 强制人工）。契约与事件归一化见 [Agent 适配器](./agent-plugins.md)。
+
 ## 6. 决策记录
 
 | # | 决策 | 选择 |
@@ -95,8 +100,11 @@ Agent 可以修改测试与 CI，但审查报告必须逐项列出测试/CI diff
 | 9 | 后台 | 菜单栏常驻继续 |
 | 10 | 测试完整性 | 允许修改，审查必须高亮 |
 | 11 | 首个目标 | 新建带测试的小 demo 仓库 |
+| 12 | 界面布局 | 参考 Linear（侧栏 + 标签条 + 主卡片） |
+| 13 | 组件库 | HeroUI v3，不改组件内部样式 |
+| 14 | Agent 接入 | 插件式适配器契约，v1 仅实现 OMP |
 
-技术默认：macOS arm64、Tauri 2、React、TypeScript、SQLite/FTS5、TipTap；Agent 通过 `omp --mode rpc`（stdio JSONL）接入，适配器只暴露启动/事件流/审批回传三个方法。
+技术默认：macOS arm64、Tauri 2、React 19、TypeScript、Tailwind v4、HeroUI v3、SQLite/FTS5、TipTap；Agent 通过适配器接入，OMP 适配器走 `omp --mode rpc`（stdio JSONL，含审批帧与取消）。
 
 ## 7. 非功能要求
 

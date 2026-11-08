@@ -37,7 +37,7 @@ tasks(id, item_id UNIQUE, acceptance_json, priority,
 -- 一任务对应一个 issue；acceptance_json 为 [{id, cmd, expect_exit, expect_match}]
 -- 依赖不存本表：唯一事实源是 links.rel='blocks'（见 §2.1）
 
-runs(id, task_id, attempt, agent, model, worktree_path, branch, base_sha,
+runs(id, task_id, attempt, adapter_id, adapter_version, model, worktree_path, branch, base_sha,
      head_sha, status, started_at, ended_at, session_id, error)
 
 evidence(id, run_id, criterion_id, kind CHECK(kind IN ('test','build','lint','review','artifact')),
