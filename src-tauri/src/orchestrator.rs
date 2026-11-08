@@ -9,7 +9,7 @@ use crate::prompts;
 use crate::store::{
     self, NewDecision, NewEvent, NewEvidence, NewReview, NewRun, TaskRow, TaskStatus,
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -197,9 +197,215 @@ fn auto_merge_config(ctx: &RunContext, project: &crate::db::Project) -> Option<A
     })
 }
 
-/// PR 检查轮询间隔与总超时。
+/// 自动文档调度的静态条件：项目开启、当前任务不是文档任务、仓库有文档落点、
+/// 且能发现至少一条验收命令。拆成纯函数，避免把递归保护漏在发现命令的分支里。
+fn docs_scheduling_eligible(
+    project_enabled: bool,
+    task_is_docs: bool,
+    has_docs_target: bool,
+    command_count: usize,
+) -> bool {
+    project_enabled && !task_is_docs && has_docs_target && command_count > 0
+}
+
+/// 仓库是否具备文档落点：`docs/` 目录或 `CHANGELOG.md`。
+fn docs_targets_exist(repo: &Path) -> bool {
+    repo.join("docs").is_dir() || repo.join("CHANGELOG.md").is_file()
+}
+
+/// 最近一次运行记录里由 `git diff` 产出的 `files.json` 路径。写入证据时只登记了
+/// 补丁文件，`files.json` 与补丁位于同一 run 输出目录，这里按 run id 直接定位。
+fn latest_run_files(ctx: &RunContext, task_id: &str) -> Vec<String> {
+    let run_id = {
+        let Ok(guard) = ctx.db.lock() else {
+            return Vec::new();
+        };
+        guard
+            .conn()
+            .query_row(
+                "SELECT id FROM runs WHERE task_id = ?1 ORDER BY attempt DESC LIMIT 1",
+                params![task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    };
+    let Some(run_id) = run_id else {
+        return Vec::new();
+    };
+    let path = ctx.data_dir.join("runs").join(run_id).join("files.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(files) = serde_json::from_str::<Vec<evidence::FileChange>>(&raw) else {
+        return Vec::new();
+    };
+    files
+        .into_iter()
+        .map(|file| format!("{}（{}）", file.path, file.status))
+        .collect()
+}
+
+/// 自动文档任务的 prompt：只允许改文档，并以本次改动文件与合并提交为依据。
+fn docs_task_prompt(
+    task_title: &str,
+    merge_commit: &str,
+    default_branch: &str,
+    files: &[String],
+    commands: &[evidence::DiscoveredCommand],
+) -> String {
+    let mut prompt = format!(
+        "任务「{task_title}」已合并到 {default_branch}（合并提交：{merge_commit}）。\n\n\
+         请只为这次改动更新项目文档：\n\
+         - 依据下方改动文件与合并提交，检查 `docs/` 与 `CHANGELOG.md` 是否需要补充或修正。\n\
+         - 只修改 `docs/` 目录与 `CHANGELOG.md`；不要修改任何源代码、测试、构建配置或 `.temli/`。\n\
+         - 完成后运行仓库既有测试命令，确保改动可合并。\n"
+    );
+    prompt.push_str("\n本次改动的文件：\n");
+    if files.is_empty() {
+        prompt.push_str("-（未找到改动文件清单，请以合并提交为准）\n");
+    } else {
+        for file in files {
+            prompt.push_str("- ");
+            prompt.push_str(file);
+            prompt.push('\n');
+        }
+    }
+    prompt.push_str("\n可运行的验收命令：\n");
+    for command in commands {
+        prompt.push_str("- ");
+        prompt.push_str(&command.cmd);
+        prompt.push('\n');
+    }
+    prompt
+}
+
+/// 记录文档任务调度事件；事件写入失败不影响任务结果。
+fn append_docs_event(
+    ctx: &RunContext,
+    project_id: &str,
+    task_id: &str,
+    kind: &str,
+    payload: serde_json::Value,
+) {
+    if let Ok(guard) = ctx.db.lock() {
+        let _ = store::append_event(
+            guard.conn(),
+            NewEvent {
+                project_id: project_id.to_string(),
+                entity: "task".into(),
+                entity_id: task_id.to_string(),
+                kind: kind.into(),
+                payload,
+            },
+        );
+    }
+}
+
+/// 合并成功后按项目配置排队一个自动文档任务。
+///
+/// 任何失败（开关读取、命令发现、任务创建）都只记录事件并返回，绝不改变已经
+/// 合并的任务状态；自动文档任务自身 `auto_docs=1`，因此不会再触发递归调度。
+fn maybe_schedule_docs_task(
+    ctx: &RunContext,
+    project: &crate::db::Project,
+    task: &TaskRow,
+    merge_commit: &str,
+) {
+    let (project_enabled, task_is_docs) = {
+        let Ok(guard) = ctx.db.lock() else {
+            return;
+        };
+        let enabled = store::project_auto_docs(guard.conn(), &project.id).unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        // 读取失败按“已经是文档任务”处理，宁可少调度也不能递归。
+        let is_docs = store::task_auto_docs(guard.conn(), &task.id).unwrap_or(true);
+        (enabled, is_docs)
+    };
+    if !project_enabled || task_is_docs {
+        return;
+    }
+
+    let repo = Path::new(&project.repo_path);
+    let has_docs_target = docs_targets_exist(repo);
+    let commands = evidence::discover_commands(repo);
+    if !docs_scheduling_eligible(
+        project_enabled,
+        task_is_docs,
+        has_docs_target,
+        commands.len(),
+    ) {
+        if commands.is_empty() {
+            append_docs_event(
+                ctx,
+                &project.id,
+                &task.id,
+                "docs_task_skipped",
+                serde_json::json!({ "reason": "no_commands" }),
+            );
+        }
+        return;
+    }
+
+    let merge_commit = merge_commit.to_string();
+    let files = latest_run_files(ctx, &task.id);
+    let title = format!("文档：{}", task.title);
+    let prompt = docs_task_prompt(
+        &task.title,
+        &merge_commit,
+        &project.default_branch,
+        &files,
+        &commands,
+    );
+    let criteria = evidence::default_acceptance(&commands);
+
+    let created = {
+        let Ok(guard) = ctx.db.lock() else {
+            return;
+        };
+        store::create_docs_task(
+            guard.conn(),
+            &project.id,
+            &task.id,
+            &title,
+            &prompt,
+            criteria,
+        )
+    };
+    match created {
+        Ok(detail) => append_docs_event(
+            ctx,
+            &project.id,
+            &task.id,
+            "docs_task_scheduled",
+            serde_json::json!({
+                "docs_task_id": detail.task.id,
+                "title": title,
+                "merge_commit": merge_commit,
+            }),
+        ),
+        Err(err) => append_docs_event(
+            ctx,
+            &project.id,
+            &task.id,
+            "docs_task_failed",
+            serde_json::json!({ "error": err }),
+        ),
+    }
+}
+
+/// PR 检查轮询间隔与总超时（测试里缩短，避免真实等待 10 分钟）。
+#[cfg(not(test))]
 const AUTO_MERGE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const AUTO_MERGE_CHECK_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(not(test))]
 const AUTO_MERGE_CHECK_TIMEOUT: Duration = Duration::from_secs(600);
+#[cfg(test)]
+const AUTO_MERGE_CHECK_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// 永远不会再变绿的检查结论；出现任意一条就没必要继续轮询到超时。
 const FAILED_CHECK_BUCKETS: &[&str] = &[
@@ -681,7 +887,7 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
                 &run_id,
                 &review.summary,
             ) {
-                Ok(pr) => {
+                Ok((pr, merged_sha)) => {
                     let guard = lock_db(&ctx.db)?;
                     store::append_event(
                         guard.conn(),
@@ -701,6 +907,7 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
                     let _ = gitops::remove_worktree(&repo, &worktree);
                     close_run(ctx, &run_id, "completed", None);
                     transition(&ctx.db, task_id, TaskStatus::Merged)?;
+                    maybe_schedule_docs_task(ctx, &project, &task, &merged_sha);
                     return Ok(());
                 }
                 Err(AutoMergeFailure::Setup(err)) => {
@@ -806,6 +1013,7 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
                 let _ = gitops::remove_worktree(&repo, &worktree);
                 close_run(ctx, &run_id, "completed", None);
                 transition(&ctx.db, task_id, TaskStatus::Merged)?;
+                maybe_schedule_docs_task(ctx, &project, &task, &sha);
                 return Ok(());
             }
             Err(MergeFailure::Merge(err)) => {
@@ -1265,7 +1473,7 @@ fn auto_merge_pull_request(
     task: &TaskRow,
     run_id: &str,
     review_summary: &str,
-) -> Result<crate::github::PullRequest, AutoMergeFailure> {
+) -> Result<(crate::github::PullRequest, String), AutoMergeFailure> {
     let current_branch = gitops::current_branch(repo).map_err(AutoMergeFailure::Setup)?;
     if current_branch != default_branch {
         return Err(AutoMergeFailure::Setup(format!(
@@ -1443,7 +1651,7 @@ fn auto_merge_pull_request(
             message: format!("PR 已合并，但本地 {default_branch} 未前进，请人工核对"),
         });
     }
-    Ok(pr)
+    Ok((pr, after_sha))
 }
 
 /// 上下文中单项正文的最大字符数。
@@ -1920,6 +2128,61 @@ mod tests {
         }
     }
 
+    /// 普通任务写 `done.txt`；自动文档任务只写 `docs/generated.md`；被要求审查时
+    /// 输出通过裁决。用于验证文档任务调度与“文档任务不再递归”的完整流程。
+    struct DocsFlowAdapter;
+
+    impl AgentAdapter for DocsFlowAdapter {
+        fn manifest(&self) -> AgentManifest {
+            test_manifest("docs-flow")
+        }
+
+        fn detect(&self) -> DetectResult {
+            ok_detect()
+        }
+
+        fn start(&self, spec: RunSpec, sink: EventSink) -> Result<SessionHandle, String> {
+            if spec.prompt.contains("verdict") {
+                sink(AgentEvent::TextDelta {
+                    text: r#"{"verdict":"pass","summary":"looks good","risk_flags":[],"test_diff":[]}"#
+                        .into(),
+                });
+                sink(AgentEvent::Ended {
+                    status: RunStatus::Completed,
+                });
+                return Ok(SessionHandle {
+                    id: "docs-flow-review-1".into(),
+                });
+            }
+            if spec.prompt.contains("任务：文档：") {
+                fs::create_dir_all(spec.cwd.join("docs")).map_err(|e| e.to_string())?;
+                fs::write(spec.cwd.join("docs/generated.md"), "generated\n")
+                    .map_err(|e| e.to_string())?;
+            } else {
+                fs::write(spec.cwd.join("done.txt"), "ok\n").map_err(|e| e.to_string())?;
+            }
+            sink(AgentEvent::Ended {
+                status: RunStatus::Completed,
+            });
+            Ok(SessionHandle {
+                id: "docs-flow-1".into(),
+            })
+        }
+
+        fn respond(
+            &self,
+            _handle: &SessionHandle,
+            _request_id: &str,
+            _decision: Decision,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn cancel(&self, _handle: &SessionHandle) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
     /// 只执行开发脚本：写 `done.txt`；被要求审查时输出带自身标记的通过裁决。
     struct DeveloperFake {
         starts: AtomicUsize,
@@ -2344,6 +2607,8 @@ mod tests {
         cancel_on_checks: Mutex<Option<(Arc<Mutex<HashSet<String>>>, String)>>,
         /// 远端合并成功后把本地默认分支改成分叉提交，模拟本地同步失败。
         diverge_local: Mutex<bool>,
+        /// 前 N 次读取检查返回网络错误，模拟 TLS 抖动。
+        checks_failures: Mutex<usize>,
     }
 
     impl FakeGitHubOps {
@@ -2356,7 +2621,12 @@ mod tests {
                 repo: Mutex::new(None),
                 cancel_on_checks: Mutex::new(None),
                 diverge_local: Mutex::new(false),
+                checks_failures: Mutex::new(0),
             }
+        }
+
+        fn fail_checks_times(&self, times: usize) {
+            *self.checks_failures.lock().unwrap() = times;
         }
 
         fn simulate_merge_in(&self, repo: PathBuf) {
@@ -2434,6 +2704,13 @@ mod tests {
 
         fn pull_request_checks(&self, _repo: &str, _number: u64) -> Result<Vec<CheckRun>, String> {
             self.calls.lock().unwrap().push("pull_request_checks");
+            {
+                let mut failures = self.checks_failures.lock().unwrap();
+                if *failures > 0 {
+                    *failures -= 1;
+                    return Err("curl: (35) SSL_ERROR_SYSCALL".to_string());
+                }
+            }
             let cancel = self.cancel_on_checks.lock().unwrap().take();
             if let Some((cancelled, task_id)) = cancel {
                 cancelled.lock().unwrap().insert(task_id);
@@ -2653,6 +2930,248 @@ mod tests {
         };
         let guard = ctx.db.lock().unwrap();
         store::set_project_require_checks(guard.conn(), &project_id, enabled).unwrap();
+    }
+
+    fn set_auto_docs(ctx: &RunContext, task_id: &str, enabled: bool) {
+        let project_id = {
+            let guard = ctx.db.lock().unwrap();
+            store::get_task(guard.conn(), task_id)
+                .unwrap()
+                .task
+                .project_id
+        };
+        let guard = ctx.db.lock().unwrap();
+        store::set_project_auto_docs(guard.conn(), &project_id, enabled).unwrap();
+    }
+
+    /// 在仓库里提交文档落点；`with_commands` 时再补一个可发现的 `make test`。
+    fn commit_docs_fixture(repo: &Path, with_commands: bool) {
+        fs::write(repo.join("CHANGELOG.md"), "# Changelog\n").unwrap();
+        if with_commands {
+            fs::write(repo.join("Makefile"), "test:\n\t@true\n").unwrap();
+        }
+        run_git(repo, &["add", "-A"]);
+        run_git(
+            repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "docs fixture",
+            ],
+        );
+    }
+
+    fn tasks_for_project(ctx: &RunContext, task_id: &str) -> Vec<store::TaskSummary> {
+        let guard = ctx.db.lock().unwrap();
+        let project_id = store::get_task(guard.conn(), task_id)
+            .unwrap()
+            .task
+            .project_id;
+        store::list_tasks_for_project(guard.conn(), &project_id).unwrap()
+    }
+
+    fn event_count(ctx: &RunContext, task_id: &str, kind: &str) -> usize {
+        let guard = ctx.db.lock().unwrap();
+        guard
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE entity = 'task' AND entity_id = ?1 AND type = ?2",
+                params![task_id, kind],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as usize
+    }
+
+    fn docs_task_id(ctx: &RunContext, task_id: &str) -> Option<String> {
+        let guard = ctx.db.lock().unwrap();
+        let project_id = store::get_task(guard.conn(), task_id)
+            .unwrap()
+            .task
+            .project_id;
+        guard
+            .conn()
+            .query_row(
+                "SELECT t.id
+                 FROM tasks t JOIN items i ON i.id = t.item_id
+                 WHERE i.project_id = ?1 AND t.auto_docs = 1
+                 ORDER BY i.created_at ASC, t.id ASC
+                 LIMIT 1",
+                params![project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn auto_docs_task_count(ctx: &RunContext, task_id: &str) -> i64 {
+        let guard = ctx.db.lock().unwrap();
+        let project_id = store::get_task(guard.conn(), task_id)
+            .unwrap()
+            .task
+            .project_id;
+        guard
+            .conn()
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM tasks t JOIN items i ON i.id = t.item_id
+                 WHERE i.project_id = ?1 AND t.auto_docs = 1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn docs_scheduling_eligible_requires_all_conditions() {
+        assert!(docs_scheduling_eligible(true, false, true, 2));
+        assert!(!docs_scheduling_eligible(false, false, true, 2));
+        assert!(!docs_scheduling_eligible(true, true, true, 2));
+        assert!(!docs_scheduling_eligible(true, false, false, 2));
+        assert!(!docs_scheduling_eligible(true, false, true, 0));
+    }
+
+    #[test]
+    fn merge_schedules_one_queued_docs_task_with_derived_from() {
+        let (ctx, task_id) = setup_with("test -f done.txt", |_| Arc::new(DocsFlowAdapter));
+        let repo = repo_of(&ctx, &task_id);
+        commit_docs_fixture(&repo, true);
+        set_auto_docs(&ctx, &task_id, true);
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Merged);
+
+        let tasks = tasks_for_project(&ctx, &task_id);
+        assert_eq!(tasks.len(), 2, "应恰好排入一个文档任务");
+        assert_eq!(
+            auto_docs_task_count(&ctx, &task_id),
+            1,
+            "自动文档任务必须恰好一个"
+        );
+
+        let docs_id = docs_task_id(&ctx, &task_id).expect("必须存在自动文档任务");
+        let guard = ctx.db.lock().unwrap();
+        let docs = store::get_task(guard.conn(), &docs_id).unwrap();
+        assert_eq!(docs.task.title, "文档：fixture task");
+        assert_eq!(docs.task.status, TaskStatus::Queued);
+        assert!(store::task_auto_docs(guard.conn(), &docs_id).unwrap());
+        assert_eq!(
+            docs.criteria
+                .iter()
+                .map(|criterion| criterion.cmd.as_str())
+                .collect::<Vec<_>>(),
+            vec!["make test"]
+        );
+        assert!(docs.task.prompt.contains("CHANGELOG.md"));
+        assert!(docs.task.prompt.contains("合并提交"));
+        assert!(docs.task.prompt.contains("done.txt"));
+
+        let linked: bool = guard
+            .conn()
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM links l
+                     JOIN tasks parent ON parent.item_id = l.from_item
+                     JOIN tasks docs ON docs.item_id = l.to_item
+                     WHERE parent.id = ?1 AND docs.id = ?2 AND l.rel = 'derived_from'
+                 )",
+                params![task_id, docs_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(linked, "文档任务必须通过 derived_from 关联父任务");
+        drop(guard);
+
+        assert_eq!(event_count(&ctx, &task_id, "docs_task_scheduled"), 1);
+    }
+
+    #[test]
+    fn merge_with_auto_docs_off_schedules_nothing() {
+        let (ctx, task_id) = setup_with("test -f done.txt", |_| Arc::new(DocsFlowAdapter));
+        let repo = repo_of(&ctx, &task_id);
+        commit_docs_fixture(&repo, true);
+        set_auto_docs(&ctx, &task_id, false);
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Merged);
+        assert_eq!(tasks_for_project(&ctx, &task_id).len(), 1);
+        assert!(docs_task_id(&ctx, &task_id).is_none());
+        assert_eq!(event_count(&ctx, &task_id, "docs_task_scheduled"), 0);
+    }
+
+    #[test]
+    fn docs_task_merge_does_not_schedule_another_docs_task() {
+        let (ctx, task_id) = setup_with("test -f done.txt", |_| Arc::new(DocsFlowAdapter));
+        let repo = repo_of(&ctx, &task_id);
+        commit_docs_fixture(&repo, true);
+        set_auto_docs(&ctx, &task_id, true);
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Merged);
+        let docs_id = docs_task_id(&ctx, &task_id).expect("首次合并应排入文档任务");
+
+        run_task_blocking(&ctx, &docs_id).unwrap();
+        assert_eq!(status(&ctx, &docs_id), TaskStatus::Merged);
+        assert_eq!(
+            tasks_for_project(&ctx, &task_id).len(),
+            2,
+            "文档任务合并后不得再排入新的文档任务"
+        );
+        assert_eq!(auto_docs_task_count(&ctx, &task_id), 1);
+        assert_eq!(event_count(&ctx, &docs_id, "docs_task_scheduled"), 0);
+        assert_eq!(event_count(&ctx, &task_id, "docs_task_scheduled"), 1);
+    }
+
+    #[test]
+    fn docs_scheduling_without_commands_logs_skip_and_keeps_merge() {
+        let (ctx, task_id) = setup_with("test -f done.txt", |_| Arc::new(DocsFlowAdapter));
+        let repo = repo_of(&ctx, &task_id);
+        commit_docs_fixture(&repo, false);
+        set_auto_docs(&ctx, &task_id, true);
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+        assert_eq!(
+            status(&ctx, &task_id),
+            TaskStatus::Merged,
+            "文档调度失败不得影响已合并状态"
+        );
+        assert_eq!(tasks_for_project(&ctx, &task_id).len(), 1);
+        assert!(docs_task_id(&ctx, &task_id).is_none());
+        assert_eq!(event_count(&ctx, &task_id, "docs_task_skipped"), 1);
+        assert_eq!(event_count(&ctx, &task_id, "docs_task_scheduled"), 0);
+    }
+
+    #[test]
+    fn merge_schedules_no_docs_task_without_docs_target() {
+        let (ctx, task_id) = setup_with("test -f done.txt", |_| Arc::new(DocsFlowAdapter));
+        let repo = repo_of(&ctx, &task_id);
+        fs::write(repo.join("Makefile"), "test:\n\t@true\n").unwrap();
+        run_git(&repo, &["add", "-A"]);
+        run_git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "commands only",
+            ],
+        );
+        set_auto_docs(&ctx, &task_id, true);
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Merged);
+        assert_eq!(tasks_for_project(&ctx, &task_id).len(), 1);
+        assert!(docs_task_id(&ctx, &task_id).is_none());
+        assert_eq!(event_count(&ctx, &task_id, "docs_task_scheduled"), 0);
     }
 
     #[test]
@@ -3323,6 +3842,42 @@ mod tests {
         let detail = store::get_task(guard.conn(), &task_id).unwrap();
         assert!(detail.decisions.is_empty());
         assert_eq!(detail.runs[0].status, "completed");
+        drop(guard);
+
+        assert!(docs_task_id(&ctx, &task_id).is_none(), "默认关闭自动文档");
+    }
+
+    #[test]
+    fn auto_merge_schedules_docs_task_after_squash_merge() {
+        let ops = Arc::new(FakeGitHubOps::new(vec![green_check("ci", "success")]));
+        let (ctx, task_id) = setup_full(
+            "test -f done.txt",
+            |_| Arc::new(DocsFlowAdapter),
+            Some(ops.clone()),
+            true,
+        );
+        let repo = repo_of(&ctx, &task_id);
+        ops.simulate_merge_in(repo.clone());
+        commit_docs_fixture(&repo, true);
+        set_auto_docs(&ctx, &task_id, true);
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Merged);
+        let docs_id = docs_task_id(&ctx, &task_id).expect("自动合并后应排入文档任务");
+        let guard = ctx.db.lock().unwrap();
+        let docs = store::get_task(guard.conn(), &docs_id).unwrap();
+        assert_eq!(docs.task.status, TaskStatus::Queued);
+        assert_eq!(docs.task.title, "文档：fixture task");
+        assert_eq!(
+            docs.criteria
+                .iter()
+                .map(|criterion| criterion.cmd.as_str())
+                .collect::<Vec<_>>(),
+            vec!["make test"]
+        );
+        drop(guard);
+        assert_eq!(event_count(&ctx, &task_id, "docs_task_scheduled"), 1);
     }
 
     /// 项目未要求检查时空检查列表直接通过：不轮询、不等超时，正常走合并。
@@ -3817,5 +4372,50 @@ mod tests {
             format!("{prompt_without_context}\n\n## 项目上下文\n\n### 设计文档\n关联文档的正文")
         );
         assert!(!prompt.contains("笔记不应注入"));
+    }
+    #[test]
+    fn auto_merge_retries_transient_check_read_failures() {
+        let ops = Arc::new(FakeGitHubOps::new(vec![green_check("ci", "success")]));
+        ops.fail_checks_times(2);
+        let (ctx, task_id) = setup_full(
+            "test -f done.txt",
+            |_| Arc::new(ScriptedAdapter),
+            Some(ops.clone()),
+            true,
+        );
+        let repo = repo_of(&ctx, &task_id);
+        ops.simulate_merge_in(repo);
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Merged);
+        assert_eq!(ops.merged.lock().unwrap().len(), 1, "重试后应完成合并");
+    }
+
+    #[test]
+    fn auto_merge_gives_up_when_check_reads_keep_failing() {
+        let ops = Arc::new(FakeGitHubOps::new(Vec::new()));
+        ops.fail_checks_times(usize::MAX);
+        let (ctx, task_id) = setup_full(
+            "test -f done.txt",
+            |_| Arc::new(ScriptedAdapter),
+            Some(ops.clone()),
+            true,
+        );
+        let repo = repo_of(&ctx, &task_id);
+        ops.simulate_merge_in(repo);
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::NeedsHuman);
+        assert!(ops.merged.lock().unwrap().is_empty(), "持续失败不得合并");
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        let decision = detail
+            .decisions
+            .iter()
+            .find(|decision| decision.kind == "checks_failed")
+            .expect("应创建 checks_failed 决策");
+        assert!(decision.prompt.contains("重试超时"), "{}", decision.prompt);
     }
 }
