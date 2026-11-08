@@ -33,6 +33,8 @@ Rules:
 - Never push directly to `main` or `develop`; both are protected by rulesets
   (PR required, no approvals, no required checks).
 - Use the prefixes above. Do not create `feat/*`, `fix/*`, or other ad-hoc names.
+- Bugfixes that target `develop` still branch as `feature/<slug>`; `hotfix/*` is
+  reserved for urgent `main` fixes that are back-merged into `develop`.
 - Features always target `develop`; releases and hotfixes target `main`.
 - After merging into `main`, always back-merge `main` into `develop`.
 - Deployable work only enters `main` through `release/*` or `hotfix/*`.
