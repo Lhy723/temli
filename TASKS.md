@@ -135,3 +135,12 @@
 - [x] 合入 develop（PR #31，Issue #30）
 - [x] 搜索可见性：未转任务且 closed/ghost 的同步 Issue 不再出现在结果（PR #32）
 - 备注：M7 审查子 Agent 超时未产出结论，改为主会话自检（无 blocker 发现）
+
+## 进行中：M8 多 Agent 后端与模型选择
+
+- [x] Codex 适配器（codex exec，workspace-write）— 真实 CLI 冒烟通过
+- [x] Claude Code 适配器（claude -p，acceptEdits）— 真实 CLI 冒烟通过
+- [x] Manifest roles（developer/reviewer）与 UI 筛选
+- [x] 任务级 model 字段、RunSpec 传递与 UI
+- [x] 审查修复：Claude 权限提示挂起、prompt 截断、取消竞态、进程组、env allowlist、run.model 落库
+- [x] 合入 develop（PR #35，Issue #34）

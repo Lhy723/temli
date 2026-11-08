@@ -9,6 +9,7 @@ export type TaskSummary = {
   created_at: string;
   developer_adapter: string | null;
   reviewer_adapter: string | null;
+  model?: string | null;
 };
 
 export type Criterion = {
@@ -28,6 +29,7 @@ export type TaskRow = {
   created_at: string;
   developer_adapter: string | null;
   reviewer_adapter: string | null;
+  model?: string | null;
 };
 
 export type RunRow = {
@@ -200,17 +202,25 @@ export type AgentCapabilities = {
   resume: boolean;
 };
 
+export type AgentRole = "developer" | "reviewer";
+
 export type AgentManifest = {
   id: string;
   name: string;
   version: string;
   capabilities: AgentCapabilities;
+  roles: AgentRole[];
 };
 
 export type SetTaskAgentsInput = {
   task_id: string;
   developer_adapter: string | null;
   reviewer_adapter: string | null;
+};
+
+export type SetTaskModelInput = {
+  task_id: string;
+  model: string | null;
 };
 
 export type Vault = {
@@ -484,6 +494,10 @@ export function listAdapters(): Promise<AgentManifest[]> {
 
 export function setTaskAgents(input: SetTaskAgentsInput): Promise<void> {
   return invoke<void>("set_task_agents", { input });
+}
+
+export function setTaskModel(input: SetTaskModelInput): Promise<void> {
+  return invoke<void>("set_task_model", { input });
 }
 
 export function addVault(input: AddVaultInput): Promise<Vault> {

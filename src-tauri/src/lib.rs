@@ -148,6 +148,14 @@ struct SetTaskAgentsInput {
     reviewer_adapter: Option<Option<String>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SetTaskModelInput {
+    task_id: String,
+    /// 缺省 / null / 空串 = 使用适配器默认模型。
+    #[serde(default)]
+    model: Option<String>,
+}
+
 /// 区分 JSON 字段缺省（外层 `None`）与显式 `null`（`Some(None)`）。
 fn double_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
 where
@@ -651,6 +659,12 @@ fn set_task_agents(state: State<AppState>, input: SetTaskAgentsInput) -> Result<
     )
 }
 
+#[tauri::command]
+fn set_task_model(state: State<AppState>, input: SetTaskModelInput) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::set_task_model(db.conn(), &input.task_id, input.model.as_deref())
+}
+
 // ---------------------------------------------------------------------------
 // 笔记库（vault）
 // ---------------------------------------------------------------------------
@@ -888,6 +902,8 @@ pub fn run() {
             let mut adapters = AdapterRegistry::new();
             adapters.register(Arc::new(agent::omp::OmpAdapter::new()));
             adapters.register(Arc::new(agent::fake::FakeAdapter::new()));
+            adapters.register(Arc::new(agent::codex::CodexAdapter::new()));
+            adapters.register(Arc::new(agent::claude::ClaudeAdapter::new()));
 
             let default_agent = std::env::var("TEMLI_AGENT").unwrap_or_else(|_| "omp".to_string());
             if adapters.get(&default_agent).is_none() {
@@ -949,6 +965,7 @@ pub fn run() {
             get_require_checks,
             set_require_checks,
             set_task_agents,
+            set_task_model,
             add_vault,
             list_vaults,
             remove_vault,
@@ -977,7 +994,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AuthState, Capabilities, DetectResult, RunStatus, SessionHandle};
+    use crate::agent::{
+        AgentRole, AuthState, Capabilities, DetectResult, RunStatus, SessionHandle,
+    };
     use rusqlite::params;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1009,6 +1028,7 @@ mod tests {
                 id: "scripted".to_string(),
                 name: "Scripted".to_string(),
                 version: "0.0.0".to_string(),
+                roles: vec![AgentRole::Developer, AgentRole::Reviewer],
                 capabilities: Capabilities::default(),
             }
         }

@@ -104,6 +104,9 @@ pub struct TaskRow {
     /// 任务级审查适配器；`None` 表示回退到开发者适配器。
     #[serde(default)]
     pub reviewer_adapter: Option<String>,
+    /// 任务级模型覆盖；`None` 表示使用适配器的默认模型。
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +123,9 @@ pub struct TaskSummary {
     /// 任务级审查适配器；`None` 表示未指派。
     #[serde(default)]
     pub reviewer_adapter: Option<String>,
+    /// 任务级模型覆盖；`None` 表示未指派。
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// 项目下的一条 issue item（GitHub 同步视图）。
@@ -349,7 +355,7 @@ pub fn create_task(conn: &Connection, input: NewTask) -> Result<TaskRow, String>
 
     conn.query_row(
         "SELECT t.id, i.project_id, i.title, i.status, t.prompt, t.attempts, t.max_minutes,
-                t.created_at, t.developer_adapter, t.reviewer_adapter
+                t.created_at, t.developer_adapter, t.reviewer_adapter, t.model
          FROM tasks t JOIN items i ON i.id = t.item_id
          WHERE t.id = ?1",
         params![task_id],
@@ -418,7 +424,7 @@ pub fn create_task_for_item(
 
     conn.query_row(
         "SELECT t.id, i.project_id, i.title, i.status, t.prompt, t.attempts, t.max_minutes,
-                t.created_at, t.developer_adapter, t.reviewer_adapter
+                t.created_at, t.developer_adapter, t.reviewer_adapter, t.model
          FROM tasks t JOIN items i ON i.id = t.item_id
          WHERE t.id = ?1",
         params![task_id],
@@ -513,6 +519,30 @@ pub fn set_task_agents(
     conn.execute(
         "UPDATE tasks SET developer_adapter = ?2, reviewer_adapter = ?3 WHERE id = ?1",
         params![task_id, developer, reviewer],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// 写入任务级模型覆盖；`None` 或空白串清除覆盖，回退到适配器默认模型。
+///
+/// 只校验任务存在——模型名是否被具体适配器接受由运行器/适配器判断。
+pub fn set_task_model(conn: &Connection, task_id: &str, model: Option<&str>) -> Result<(), String> {
+    let model = match model {
+        None => None,
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+    };
+    ensure_task(conn, task_id)?;
+    conn.execute(
+        "UPDATE tasks SET model = ?2 WHERE id = ?1",
+        params![task_id, model],
     )
     .map_err(db_err)?;
     Ok(())
@@ -622,7 +652,7 @@ pub fn task_dependencies(
     let blockers = query_related_tasks(
         conn,
         "SELECT t.id, i.title, i.status, t.attempts, t.acceptance_json, t.created_at,
-                t.developer_adapter, t.reviewer_adapter
+                t.developer_adapter, t.reviewer_adapter, t.model
          FROM links l
          JOIN tasks t ON t.item_id = l.from_item
          JOIN items i ON i.id = t.item_id
@@ -633,7 +663,7 @@ pub fn task_dependencies(
     let blocks = query_related_tasks(
         conn,
         "SELECT t.id, i.title, i.status, t.attempts, t.acceptance_json, t.created_at,
-                t.developer_adapter, t.reviewer_adapter
+                t.developer_adapter, t.reviewer_adapter, t.model
          FROM links l
          JOIN tasks t ON t.item_id = l.to_item
          JOIN items i ON i.id = t.item_id
@@ -977,7 +1007,7 @@ fn query_task_summaries(
     let mut stmt = conn
         .prepare(
             "SELECT t.id, i.title, i.status, t.attempts, t.acceptance_json, t.created_at,
-                    t.developer_adapter, t.reviewer_adapter
+                    t.developer_adapter, t.reviewer_adapter, t.model
              FROM tasks t JOIN items i ON i.id = t.item_id
              WHERE (?1 IS NULL OR i.project_id = ?1)
              ORDER BY t.created_at DESC, t.rowid DESC",
@@ -994,11 +1024,12 @@ pub fn get_task(conn: &Connection, task_id: &str) -> Result<TaskDetail, String> 
     let (task, acceptance_json) = conn
         .query_row(
             "SELECT t.id, i.project_id, i.title, i.status, t.prompt, t.attempts, t.max_minutes,
-                    t.created_at, t.developer_adapter, t.reviewer_adapter, t.acceptance_json
+                    t.created_at, t.developer_adapter, t.reviewer_adapter, t.model,
+                    t.acceptance_json
              FROM tasks t JOIN items i ON i.id = t.item_id
              WHERE t.id = ?1",
             params![task_id],
-            |row| Ok((read_task_row(row)?, row.get::<_, String>(10)?)),
+            |row| Ok((read_task_row(row)?, row.get::<_, String>(11)?)),
         )
         .optional()
         .map_err(db_err)?
@@ -1644,6 +1675,7 @@ fn read_task_summary(row: &Row<'_>) -> rusqlite::Result<TaskSummary> {
         created_at: row.get(5)?,
         developer_adapter: row.get(6)?,
         reviewer_adapter: row.get(7)?,
+        model: row.get(8)?,
     })
 }
 
@@ -1659,6 +1691,7 @@ fn read_task_row(row: &Row<'_>) -> rusqlite::Result<TaskRow> {
         created_at: row.get(7)?,
         developer_adapter: row.get(8)?,
         reviewer_adapter: row.get(9)?,
+        model: row.get(10)?,
     })
 }
 
@@ -3133,6 +3166,53 @@ mod tests {
         assert!(set_task_agents(conn, "missing-task", Some("omp"), None).is_err());
         assert!(task_agents(conn, "missing-task").is_err());
         assert_eq!(task_agents(conn, &task.id).unwrap(), (None, None));
+    }
+
+    #[test]
+    fn task_model_roundtrip_and_clear() {
+        let db = open_db();
+        let project_id = project(&db);
+        let conn = db.conn();
+        let task = create_task(conn, new_task(&project_id, criteria())).unwrap();
+        let blocker = create_task(conn, new_task(&project_id, criteria())).unwrap();
+        add_dependency(conn, &task.id, &blocker.id).unwrap();
+
+        // 新任务默认使用适配器默认模型。
+        assert_eq!(task.model, None);
+        assert_eq!(get_task(conn, &task.id).unwrap().task.model, None);
+        assert_eq!(list_tasks(conn).unwrap()[0].model, None);
+
+        // 写入时去掉首尾空白；任务详情、列表与依赖摘要都能读回。
+        set_task_model(conn, &blocker.id, Some("  gpt-5.2-codex  ")).unwrap();
+        assert_eq!(
+            get_task(conn, &blocker.id).unwrap().task.model.as_deref(),
+            Some("gpt-5.2-codex")
+        );
+        let listed = list_tasks(conn).unwrap();
+        let listed_blocker = listed.iter().find(|row| row.id == blocker.id).unwrap();
+        assert_eq!(listed_blocker.model.as_deref(), Some("gpt-5.2-codex"));
+        let (blockers, blocks) = task_dependencies(conn, &task.id).unwrap();
+        assert!(blocks.is_empty());
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].model.as_deref(), Some("gpt-5.2-codex"));
+
+        // 空串与 None 都清除覆盖。
+        set_task_model(conn, &blocker.id, Some("   ")).unwrap();
+        assert_eq!(get_task(conn, &blocker.id).unwrap().task.model, None);
+        set_task_model(conn, &blocker.id, Some("claude-sonnet-4-5")).unwrap();
+        set_task_model(conn, &blocker.id, None).unwrap();
+        assert_eq!(get_task(conn, &blocker.id).unwrap().task.model, None);
+        assert_eq!(
+            list_tasks(conn)
+                .unwrap()
+                .iter()
+                .find(|row| row.id == blocker.id)
+                .unwrap()
+                .model,
+            None
+        );
+
+        assert!(set_task_model(conn, "missing-task", Some("m")).is_err());
     }
 
     #[test]

@@ -505,8 +505,8 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
     use crate::agent::{
-        AdapterRegistry, AgentAdapter, AgentEvent, AgentManifest, AuthState, Capabilities,
-        Decision, DetectResult, EventSink, RunSpec, RunStatus, SessionHandle,
+        AdapterRegistry, AgentAdapter, AgentEvent, AgentManifest, AgentRole, AuthState,
+        Capabilities, Decision, DetectResult, EventSink, RunSpec, RunStatus, SessionHandle,
     };
     use crate::db::{Db, RegisterProjectInput};
     use crate::store::{Criterion, NewTask};
@@ -611,6 +611,7 @@ mod tests {
                 id: "scripted".to_string(),
                 name: "Scripted".to_string(),
                 version: "0.0.0".to_string(),
+                roles: vec![AgentRole::Developer, AgentRole::Reviewer],
                 capabilities: Capabilities {
                     streaming: true,
                     approvals: true,

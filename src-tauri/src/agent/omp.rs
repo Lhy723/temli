@@ -82,6 +82,7 @@ impl AgentAdapter for OmpAdapter {
                 cost_cap: false,
                 resume: false,
             },
+            roles: super::AgentRole::all(),
         }
     }
 
