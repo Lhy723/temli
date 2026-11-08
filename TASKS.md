@@ -155,3 +155,10 @@
 - [x] 合入 develop（PR #38，Issue #37）
 - [x] 真实 OMP 规划冒烟（ignored test，63s）：生成多 Issue 计划并通过校验、批量落库为 draft
 - [x] 规划 UI 闭环（mock IPC）：生成 → 预览（依赖/验收）→ 创建动作触发
+
+## 已完成：M10 真实 PR + CI + 自动合并
+
+- [x] temli-demo 增加 GitHub Actions（`npm test`）
+- [x] 开启 auto_merge + require_checks，真实 OMP 任务新增 greet + 测试
+- [x] app 创建 PR #3，checks 全绿后自动合并，本地 main 快进
+- [x] 修复：checks 读取的 curl/TLS 抖动重试（GhOps GET 3 次 + 轮询持续到超时）
