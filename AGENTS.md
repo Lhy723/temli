@@ -18,8 +18,10 @@ requests during development is pre-authorized — no per-action confirmation.
 
 ## Branch model (Git Flow)
 
-- `main` — production/stable. Receives only `release/*` and `hotfix/*` merges.
-- `develop` — integration branch, repository default. All feature work lands here.
+- `main` — production/stable and the repository default. Receives only
+  `release/*` and `hotfix/*` merges.
+- `develop` — integration branch. All feature work lands here; feature PRs must
+  explicitly target it with `--base develop` (the repo default is `main`).
 - `feature/<slug>` — new work, branched from `develop`, PR base `develop`.
 - `release/<version>` — stabilization cut from `develop`, PR base `main`;
   after merge, open a `main -> develop` sync PR.
