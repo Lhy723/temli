@@ -12,6 +12,22 @@
 - **规划与自动化**：想法拆分为多 Issue 计划；合并后可自动创建文档任务。
 - **桌面体验**：菜单栏常驻、关窗继续执行、任务与决策通知、⌘K 全局搜索。
 
+## 安装
+
+从源码构建（推荐，产物无 quarantine，直接可用）：
+
+```bash
+git clone https://github.com/Lhy723/temli.git
+cd temli && npm install
+npm run tauri build
+# 产物：src-tauri/target/release/bundle/macos/temli.app 与 dmg/
+```
+
+应用为 ad-hoc 签名、未公证。若使用 Release 里下载的 DMG，首次打开被 Gatekeeper 拦截时任选其一：
+
+- 终端执行 `xattr -cr /Applications/temli.app`；
+- 或「系统设置 → 隐私与安全性 → 仍要打开」（输管理员密码，仅需一次）。
+
 ## 开发
 
 前置：Node.js、Rust 与 Tauri 2 开发环境（主要目标 macOS arm64）。
