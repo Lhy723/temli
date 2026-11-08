@@ -123,115 +123,138 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-full overflow-hidden bg-[var(--background-secondary)] text-[var(--foreground)]">
-      <aside className="flex w-60 shrink-0 flex-col px-2 pb-2 pt-10">
-        <div className="flex items-center gap-1 pb-3">
+    <div className="text-ui flex h-full overflow-hidden bg-[var(--background-secondary)] text-[var(--foreground)]">
+      <aside className="flex w-[232px] shrink-0 flex-col px-2 pb-2 pt-9">
+        <div className="flex items-center gap-0.5">
           <Button
             variant="ghost"
             size="sm"
-            className="min-w-0 flex-1 justify-start gap-2"
+            className="h-8 min-w-0 flex-1 justify-start gap-1.5 px-1.5 text-ui font-medium"
             onPress={() => open("projects")}
           >
-            <FolderKanban size={16} />
+            <FolderKanban size={15} className="shrink-0 opacity-70" />
             <span className="truncate">{current?.name ?? "temli"}</span>
-            <ChevronDown size={14} className="shrink-0 opacity-60" />
+            <ChevronDown size={13} className="shrink-0 opacity-50" />
           </Button>
-          <Button isIconOnly variant="ghost" size="sm" aria-label="搜索">
-            <Search size={16} />
+          <Button
+            isIconOnly
+            variant="ghost"
+            size="sm"
+            className="h-8 w-8"
+            aria-label="搜索"
+          >
+            <Search size={15} />
           </Button>
         </div>
 
-        <nav className="flex flex-col gap-0.5">
+        <nav className="mt-3 flex flex-col gap-0.5">
           {NAV.map((item) => (
             <Button
               key={item.id}
-              variant="ghost"
+              variant={active === item.id ? "tertiary" : "ghost"}
               size="sm"
-              className="justify-start gap-2"
+              className="h-7 justify-start gap-2 px-2 text-ui font-normal"
               onPress={() => open(item.id)}
             >
-              <item.icon size={16} />
+              <item.icon size={16} className="opacity-70" />
               {item.label}
             </Button>
           ))}
         </nav>
 
-        <p className="px-2 pb-1 pt-4 text-xs text-[var(--muted)]">空间</p>
+        <p className="text-label px-2 pb-1.5 pt-4 font-medium uppercase tracking-wide text-[var(--muted)]">
+          空间
+        </p>
         <nav className="flex flex-col gap-0.5">
           {SPACE.map((item) => (
             <Button
               key={item.id}
-              variant="ghost"
+              variant={active === item.id ? "tertiary" : "ghost"}
               size="sm"
-              className="justify-start gap-2"
+              className="h-7 justify-start gap-2 px-2 text-ui font-normal"
               onPress={() => open(item.id)}
             >
-              <item.icon size={16} />
+              <item.icon size={16} className="opacity-70" />
               {item.label}
             </Button>
           ))}
         </nav>
 
         <div className="mt-auto flex items-center gap-2 px-2 pt-3">
-          <div className="flex size-6 items-center justify-center rounded-full bg-[var(--surface-secondary)] text-xs">
+          <div className="flex size-5 items-center justify-center rounded-full bg-[var(--surface-secondary)] text-label font-medium text-[var(--muted)]">
             L
           </div>
-          <span className="text-sm text-[var(--muted)]">本地工作区</span>
+          <span className="text-ui-sm text-[var(--muted)]">本地工作区</span>
         </div>
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
         <div
           data-tauri-drag-region
-          className="flex h-11 shrink-0 items-end gap-1 px-3"
+          className="flex h-10 shrink-0 items-end gap-0.5 px-2 pb-1"
         >
-          {tabs.map((tab) => (
-            <div
-              key={tab.id}
-              className={`group flex h-8 items-center gap-1 rounded-md px-2 text-sm ${
-                active === tab.id
-                  ? "bg-[var(--background)] shadow-sm"
-                  : "text-[var(--muted)]"
-              }`}
-            >
-              <button
-                type="button"
-                className="max-w-40 truncate"
-                onClick={() => setActive(tab.id)}
+          {tabs.map((tab) => {
+            const isActive = active === tab.id;
+            return (
+              <div
+                key={tab.id}
+                className={`anim-fast group flex h-7 items-center rounded-md border ${
+                  isActive
+                    ? "border-[var(--border)] bg-[var(--background)] shadow-[0_1px_2px_rgba(0,0,0,0.06)]"
+                    : "border-transparent hover:bg-[var(--background-tertiary)]"
+                }`}
               >
-                {tab.label}
-              </button>
-              <button
-                type="button"
-                aria-label={`关闭 ${tab.label}`}
-                className="opacity-0 transition-opacity group-hover:opacity-60"
-                onClick={() => close(tab.id)}
-              >
-                <X size={12} />
-              </button>
-            </div>
-          ))}
-          <Button isIconOnly variant="ghost" size="sm" aria-label="新建视图">
-            <Plus size={15} />
+                <button
+                  type="button"
+                  className={`tab-btn h-full pl-2.5 text-ui ${
+                    isActive
+                      ? "pr-2.5 text-[var(--foreground)]"
+                      : "pr-2.5 text-[var(--muted)]"
+                  }`}
+                  onClick={() => setActive(tab.id)}
+                >
+                  {tab.label}
+                </button>
+                <button
+                  type="button"
+                  aria-label={`关闭 ${tab.label}`}
+                  className={`icon-btn mr-1 flex size-5 items-center justify-center rounded opacity-0 transition-opacity duration-150 group-hover:opacity-60 hover:bg-[var(--surface-secondary)] ${
+                    isActive ? "" : "text-[var(--muted)]"
+                  }`}
+                  onClick={() => close(tab.id)}
+                >
+                  <X size={11} />
+                </button>
+              </div>
+            );
+          })}
+          <Button
+            isIconOnly
+            variant="ghost"
+            size="sm"
+            className="h-7 w-7"
+            aria-label="新建标签"
+          >
+            <Plus size={14} />
           </Button>
         </div>
 
-        <main className="min-h-0 flex-1 overflow-hidden px-2 pb-2">
-          <section className="flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--background)]">
-            <header className="flex items-center justify-between px-4 py-3">
-              <h1 className="text-sm font-medium">{TITLES[active]}</h1>
+        <main className="min-h-0 flex-1 overflow-hidden p-2 pt-0">
+          <section className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--background)] shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+            <header className="flex h-12 shrink-0 items-center justify-between border-b border-[var(--border)] px-4">
+              <h1 className="text-ui font-medium">{TITLES[active]}</h1>
               <Button
                 variant="primary"
                 size="sm"
-                className="gap-1"
+                className="h-7 gap-1 px-2.5 text-ui"
                 onPress={startRegister}
               >
-                <Plus size={15} />
+                <Plus size={14} />
                 注册项目
               </Button>
             </header>
 
-            <div className="flex items-center justify-between gap-2 px-4 pb-2">
+            <div className="flex h-9 shrink-0 items-center justify-between px-4">
               <div className="flex items-center gap-1">
                 <Chip variant="soft" color="default" size="sm">
                   全部
@@ -240,21 +263,29 @@ export default function App() {
                   进行中
                 </Chip>
               </div>
-              <Button isIconOnly variant="ghost" size="sm" aria-label="视图设置">
-                <SlidersHorizontal size={15} />
+              <Button
+                isIconOnly
+                variant="ghost"
+                size="sm"
+                className="h-6 w-6"
+                aria-label="视图设置"
+              >
+                <SlidersHorizontal size={14} />
               </Button>
             </div>
 
             <div className="min-h-0 flex-1 overflow-auto px-4 pb-4">
               {error && (
-                <p role="alert" className="mb-3 text-sm text-[var(--danger)]">
+                <p role="alert" className="mb-3 text-ui-sm text-[var(--danger)]">
                   {error}
                 </p>
               )}
 
               {active === "overview" && (
                 <>
-                  {projects.length === 0 && <EmptyProject onRegister={startRegister} />}
+                  {projects.length === 0 && (
+                    <EmptyProject onRegister={startRegister} />
+                  )}
                   {projects.length > 0 && <ProjectList projects={projects} />}
                 </>
               )}
@@ -280,9 +311,13 @@ export default function App() {
               )}
 
               {active !== "overview" && active !== "projects" && (
-                <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
-                  <p className="text-sm text-[var(--muted)]">{emptyCopy(active)}</p>
-                  <p className="text-xs text-[var(--muted)]">M0 骨架，功能在后续里程碑实现。</p>
+                <div className="flex h-full flex-col items-center justify-center gap-1.5 text-center">
+                  <p className="text-ui text-[var(--muted)]">
+                    {emptyCopy(active)}
+                  </p>
+                  <p className="text-ui-sm text-[var(--muted)] opacity-70">
+                    M0 骨架，功能在后续里程碑实现。
+                  </p>
                 </div>
               )}
             </div>
@@ -295,10 +330,10 @@ export default function App() {
 
 function EmptyProject({ onRegister }: { onRegister: () => void }) {
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
-      <Inbox size={26} className="text-[var(--muted)]" />
-      <p className="text-sm text-[var(--muted)]">{emptyCopy("overview")}</p>
-      <Button variant="primary" size="sm" onPress={onRegister}>
+    <div className="flex h-full flex-col items-center justify-center gap-2.5 text-center">
+      <Inbox size={20} className="text-[var(--muted)] opacity-70" />
+      <p className="text-ui text-[var(--muted)]">{emptyCopy("overview")}</p>
+      <Button variant="primary" size="sm" className="h-7 px-3 text-ui" onPress={onRegister}>
         注册项目
       </Button>
     </div>
@@ -307,8 +342,8 @@ function EmptyProject({ onRegister }: { onRegister: () => void }) {
 
 function ProjectList({ projects }: { projects: Project[] }) {
   return (
-    <div className="overflow-hidden rounded-lg border border-[var(--border)]">
-      <div className="grid grid-cols-[1.2fr_1.6fr_100px_90px] gap-3 border-b border-[var(--border)] px-3 py-2 text-xs text-[var(--muted)]">
+    <div className="overflow-hidden rounded-md border border-[var(--border)]">
+      <div className="text-ui-sm grid grid-cols-[1.2fr_1.8fr_100px_88px] gap-3 border-b border-[var(--border)] bg-[var(--background-secondary)] px-3 py-1.5 text-[var(--muted)]">
         <span>名称</span>
         <span>仓库</span>
         <span>分支</span>
@@ -317,7 +352,7 @@ function ProjectList({ projects }: { projects: Project[] }) {
       {projects.map((project) => (
         <div
           key={project.id}
-          className="grid grid-cols-[1.2fr_1.6fr_100px_90px] items-center gap-3 border-b border-[var(--border)] px-3 py-2 text-sm last:border-b-0"
+          className="anim-fast text-ui grid h-9 grid-cols-[1.2fr_1.8fr_100px_88px] items-center gap-3 border-b border-[var(--border)] px-3 last:border-b-0 hover:bg-[var(--background-secondary)]"
         >
           <span className="flex items-center gap-2">
             <FolderKanban size={15} className="text-[var(--muted)]" />
@@ -371,15 +406,15 @@ function RegisterProject({
   }
 
   return (
-    <Card className="mb-4 max-w-[720px]">
+    <Card className="mb-4 max-w-[680px]">
       <Card.Header>
-        <Card.Title>注册项目</Card.Title>
-        <Card.Description>
+        <Card.Title className="text-ui font-medium">注册项目</Card.Title>
+        <Card.Description className="text-ui-sm">
           本地仓库必须是 git 仓库，且 `.temli/` 已在 `.gitignore` 中忽略。
         </Card.Description>
       </Card.Header>
       <Card.Content className="grid gap-3">
-        <label className="grid gap-1 text-xs text-[var(--muted)]">
+        <label className="text-ui-sm grid gap-1 text-[var(--muted)]">
           仓库路径
           <Input
             aria-label="仓库路径"
@@ -388,7 +423,7 @@ function RegisterProject({
             onChange={(e) => setRepoPath(e.target.value)}
           />
         </label>
-        <label className="grid gap-1 text-xs text-[var(--muted)]">
+        <label className="text-ui-sm grid gap-1 text-[var(--muted)]">
           名称（可选）
           <Input
             aria-label="名称"
@@ -398,7 +433,7 @@ function RegisterProject({
           />
         </label>
         <div className="grid grid-cols-2 gap-3">
-          <label className="grid gap-1 text-xs text-[var(--muted)]">
+          <label className="text-ui-sm grid gap-1 text-[var(--muted)]">
             GitHub owner
             <Input
               aria-label="GitHub owner"
@@ -407,7 +442,7 @@ function RegisterProject({
               onChange={(e) => setOwner(e.target.value)}
             />
           </label>
-          <label className="grid gap-1 text-xs text-[var(--muted)]">
+          <label className="text-ui-sm grid gap-1 text-[var(--muted)]">
             GitHub repo
             <Input
               aria-label="GitHub repo"
@@ -417,7 +452,7 @@ function RegisterProject({
             />
           </label>
         </div>
-        <label className="grid gap-1 text-xs text-[var(--muted)]">
+        <label className="text-ui-sm grid gap-1 text-[var(--muted)]">
           默认分支
           <Input
             aria-label="默认分支"
@@ -426,11 +461,16 @@ function RegisterProject({
           />
         </label>
       </Card.Content>
-      <Card.Footer className="flex justify-end gap-2">
+      <Card.Footer className="flex justify-end gap-1.5">
         <Button variant="ghost" size="sm" onPress={onCancel} isDisabled={busy}>
           取消
         </Button>
-        <Button variant="primary" size="sm" onPress={submit} isDisabled={busy || !repoPath}>
+        <Button
+          variant="primary"
+          size="sm"
+          onPress={submit}
+          isDisabled={busy || !repoPath}
+        >
           {busy ? "注册中…" : "注册"}
         </Button>
       </Card.Footer>
