@@ -30,6 +30,25 @@ pub fn current_branch(repo: &Path) -> Result<String, String> {
     run(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
 }
 
+/// Whether `ancestor` is reachable from `descendant`. git 用退出码 1 表示
+/// “不是祖先”（正常结果），其余非零退出码（未知 rev、损坏仓库）才是错误。
+pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .map_err(|e| format!("git 执行失败: {e}"))?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git merge-base --is-ancestor {ancestor} {descendant} 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
 pub fn branch_exists(repo: &Path, branch: &str) -> bool {
     Command::new("git")
         .arg("-C")
@@ -107,16 +126,41 @@ pub fn rebase_in_progress(repo: &Path) -> bool {
     })
 }
 
-/// Rebase the worktree's current branch onto `target_ref`. A failed rebase is aborted so the
-/// worktree is left conflict-free; the git error including stderr is returned.
-pub fn rebase_onto(worktree: &Path, target_ref: &str) -> Result<(), String> {
+/// A failed rebase: `message` is the git error including stderr, `files` lists the
+/// unmerged paths (`git diff --name-only --diff-filter=U`). The rebase has already been
+/// aborted, so the worktree is left conflict-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebaseConflict {
+    pub message: String,
+    pub files: Vec<String>,
+}
+
+/// Rebase the worktree's current branch onto `target_ref`. On failure the conflicting
+/// paths are collected before aborting, so callers can decide between an automatic retry
+/// and a human decision.
+pub fn rebase_onto_with_conflicts(worktree: &Path, target_ref: &str) -> Result<(), RebaseConflict> {
     match run(worktree, &["rebase", target_ref]) {
         Ok(_) => Ok(()),
-        Err(err) => {
+        Err(message) => {
+            let files: Vec<String> = run(worktree, &["diff", "--name-only", "--diff-filter=U"])
+                .map(|out| {
+                    out.lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
             let _ = run(worktree, &["rebase", "--abort"]);
-            Err(err)
+            Err(RebaseConflict { message, files })
         }
     }
+}
+
+/// Compatibility wrapper around [`rebase_onto_with_conflicts`]; returns only the error text.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn rebase_onto(worktree: &Path, target_ref: &str) -> Result<(), String> {
+    rebase_onto_with_conflicts(worktree, target_ref).map_err(|conflict| conflict.message)
 }
 
 /// Hard-reset `repo` to `sha`, discarding tracked changes.
@@ -226,6 +270,23 @@ mod tests {
     }
 
     #[test]
+    fn detects_ancestry_between_commits() {
+        let repo = temp_repo();
+        let base = head_sha(&repo).unwrap();
+        fs::write(repo.join("b.txt"), "b\n").unwrap();
+        let next = commit_all(&repo, "second").unwrap().unwrap();
+
+        assert!(is_ancestor(&repo, &base, &next).unwrap());
+        assert!(is_ancestor(&repo, &next, &next).unwrap());
+        assert!(!is_ancestor(&repo, &next, &base).unwrap());
+        assert!(
+            is_ancestor(&repo, "no-such-rev", &next).is_err(),
+            "未知 rev 必须报错而不是当成非祖先"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn refuses_dirty_merge_and_duplicate_worktree() {
         let repo = temp_repo();
         fs::write(repo.join("dirty.txt"), "x\n").unwrap();
@@ -282,6 +343,31 @@ mod tests {
         assert!(err.contains("git rebase main 失败"), "{err}");
         assert!(!rebase_in_progress(&wt));
         assert_eq!(current_branch(&wt).unwrap(), "temli/2-run");
+        assert!(is_clean(&wt).unwrap());
+        assert_eq!(fs::read_to_string(wt.join("a.txt")).unwrap(), "feature\n");
+
+        remove_worktree(&repo, &wt).unwrap();
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rebase_conflict_reports_unmerged_files_before_aborting() {
+        let repo = temp_repo();
+        let wt = repo.with_extension("wt-conflict-files");
+        create_worktree(&repo, &wt, "temli/5-run", "HEAD").unwrap();
+
+        fs::write(wt.join("a.txt"), "feature\n").unwrap();
+        commit_all(&wt, "feature").unwrap();
+        fs::write(repo.join("a.txt"), "main\n").unwrap();
+        commit_all(&repo, "main").unwrap();
+
+        let conflict = rebase_onto_with_conflicts(&wt, "main").unwrap_err();
+        assert!(
+            conflict.message.contains("git rebase main 失败"),
+            "{conflict:?}"
+        );
+        assert_eq!(conflict.files, vec!["a.txt".to_string()]);
+        assert!(!rebase_in_progress(&wt));
         assert!(is_clean(&wt).unwrap());
         assert_eq!(fs::read_to_string(wt.join("a.txt")).unwrap(), "feature\n");
 

@@ -89,6 +89,21 @@ export type CreateTaskInput = {
   acceptance?: Criterion[];
 };
 
+export type DependencyInput = {
+  task_id: string;
+  depends_on_task_id: string;
+};
+
+export type TaskDependencies = {
+  blockers: TaskSummary[];
+  blocks: TaskSummary[];
+};
+
+export type SetProjectConcurrencyInput = {
+  project_id: string;
+  limit: number;
+};
+
 export function listTasks(projectId: string): Promise<TaskSummary[]> {
   return invoke<TaskSummary[]>("list_tasks", { projectId });
 }
@@ -122,6 +137,28 @@ export function resolveDecision(
 
 export function listEvents(taskId: string): Promise<EventRow[]> {
   return invoke<EventRow[]>("list_events", { taskId });
+}
+
+export function addDependency(input: DependencyInput): Promise<void> {
+  return invoke<void>("add_dependency", { input });
+}
+
+export function removeDependency(input: DependencyInput): Promise<void> {
+  return invoke<void>("remove_dependency", { input });
+}
+
+export function listDependencies(taskId: string): Promise<TaskDependencies> {
+  return invoke<TaskDependencies>("list_dependencies", { taskId });
+}
+
+export function getProjectConcurrency(projectId: string): Promise<number> {
+  return invoke<number>("get_project_concurrency", { projectId });
+}
+
+export function setProjectConcurrency(
+  input: SetProjectConcurrencyInput,
+): Promise<void> {
+  return invoke<void>("set_project_concurrency", { input });
 }
 
 const STATUS_LABELS: Record<string, string> = {

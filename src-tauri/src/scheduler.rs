@@ -1,21 +1,28 @@
-//! 单工作线程任务调度器。
+//! 有界并发任务调度器。
 //!
-//! `start_task` 只负责把任务压入 `queued`，真正的执行按 FIFO 在唯一的工作线程里
-//! 逐个进行，因此同一时刻最多只有一个任务占用工作区。任务结束后由本模块决定
-//! 自动重试还是转人工处理。
+//! `enqueue` 只负责把任务压入 `queued`。工作线程每 200ms 扫描一次项目，按项目
+//! 并发上限认领就绪任务；依赖尚未全部合并的任务不会被 `next_ready_tasks` 返回。
+//! 每个被认领的任务在独立线程里运行，单个运行失败（包括 panic）不会阻塞其它任务。
+//! 任务结束后由本模块决定自动重试还是转人工处理。
 
 use crate::orchestrator::{self, RunContext};
 use crate::store::{self, NewDecision, NewEvent, TaskStatus};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// 队列为空时的轮询间隔。
-const IDLE_POLL: Duration = Duration::from_millis(300);
+/// 调度扫描间隔。
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct Scheduler {
     ctx: RunContext,
+    /// 每个项目已认领但尚未收尾的任务数。
+    ///
+    /// 认领后到状态迁移为 `running` 之间（worktree 创建、运行记录写入）任务仍是
+    /// `queued`，而进入 `verifying` 后又会离开 `running`；只看数据库状态会低估
+    /// 占用。认领计数覆盖整个运行生命周期，保证并发上限不被突破。
+    inflight: Arc<Mutex<HashMap<String, usize>>>,
     /// 已请求取消的已认领任务。
     ///
     /// `RunContext.cancelled` 是给运行器握手阶段读取的共享意图，会被运行的收尾
@@ -24,9 +31,12 @@ pub struct Scheduler {
     cancel_requested: Mutex<HashSet<String>>,
 }
 
-/// 运行占位守卫：无论正常结束还是 panic 展开，都会释放 `RunContext.running` 中的 id。
+/// 运行占位守卫：无论正常结束、提前返回还是 panic 展开，都会释放运行集合与
+/// 项目并发计数。
 struct RunningGuard {
     running: Arc<Mutex<HashSet<String>>>,
+    inflight: Arc<Mutex<HashMap<String, usize>>>,
+    project_id: String,
     task_id: String,
 }
 
@@ -35,6 +45,18 @@ impl Drop for RunningGuard {
         if let Ok(mut running) = self.running.lock() {
             running.remove(&self.task_id);
         }
+        if let Ok(mut inflight) = self.inflight.lock() {
+            let remaining = match inflight.get_mut(&self.project_id) {
+                Some(count) => {
+                    *count = count.saturating_sub(1);
+                    *count
+                }
+                None => 0,
+            };
+            if remaining == 0 {
+                inflight.remove(&self.project_id);
+            }
+        }
     }
 }
 
@@ -42,11 +64,12 @@ impl Scheduler {
     pub fn new(ctx: RunContext) -> Arc<Self> {
         Arc::new(Self {
             ctx,
+            inflight: Arc::new(Mutex::new(HashMap::new())),
             cancel_requested: Mutex::new(HashSet::new()),
         })
     }
 
-    /// 启动唯一的工作线程；只能调用一次。
+    /// 启动唯一的调度扫描线程；只能调用一次。
     ///
     /// 线程创建失败必须上报：否则应用会在队列永远不会被消费的情况下继续运行。
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
@@ -138,7 +161,7 @@ impl Scheduler {
                 .lock()
                 .map_err(|_| "数据库锁被占用".to_string())?;
             let status = store::task_status(guard.conn(), task_id)?;
-            // 与 `run_one` 的认领顺序一致（先数据库锁、后运行集合），
+            // 与 `claim_next` 的认领顺序一致（先数据库锁、后运行集合），
             // 保证这里读到的状态与认领结果不会撕裂。
             let claimed = self
                 .ctx
@@ -174,88 +197,165 @@ impl Scheduler {
         }
     }
 
-    fn work_loop(&self) {
+    fn work_loop(self: Arc<Self>) {
         loop {
-            match self.next_queued() {
-                Ok(Some(task_id)) => {
-                    // 跳过（例如刚被取消）时稍作等待，避免空转。
-                    if !self.run_one(&task_id) {
-                        std::thread::sleep(IDLE_POLL);
-                    }
+            self.dispatch_round();
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// 扫描全部项目并尽量填满每个项目的并发额度。
+    ///
+    /// 单个项目出错只记录日志，不能影响其它项目继续调度。
+    fn dispatch_round(self: &Arc<Self>) {
+        let projects = {
+            let guard = match self.ctx.db.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    eprintln!("调度器无法锁定数据库读取项目：数据库锁被占用");
+                    return;
                 }
-                Ok(None) => std::thread::sleep(IDLE_POLL),
+            };
+            match guard.list_projects() {
+                Ok(projects) => projects,
                 Err(err) => {
-                    eprintln!("调度器读取队列失败：{err}");
-                    std::thread::sleep(IDLE_POLL);
+                    eprintln!("调度器读取项目列表失败：{err}");
+                    return;
                 }
+            }
+        };
+
+        for project in projects {
+            if let Err(err) = self.dispatch_project(&project.id) {
+                eprintln!("调度器派发项目 {} 的任务失败：{err}", project.id);
             }
         }
     }
 
-    fn next_queued(&self) -> Result<Option<String>, String> {
-        let guard = self
+    /// 启动线程失败时立即结束本项目本轮派发，不再继续认领。
+    ///
+    /// 线程创建失败通常意味着系统资源耗尽，继续认领只会堆积更多无法启动的
+    /// 任务并反复失败；把错误交给 [`Self::dispatch_round`] 记录，下个扫描周期
+    /// 再重试。认领占位已由 `spawn_run` 释放，任务仍停在 queued。
+    fn dispatch_project(self: &Arc<Self>, project_id: &str) -> Result<(), String> {
+        while let Some((task_id, guard)) = self.claim_next(project_id)? {
+            self.spawn_run(task_id, guard)?;
+        }
+        Ok(())
+    }
+
+    /// 在数据库锁内认领一个就绪任务。
+    ///
+    /// 候选按 [`store::next_ready_tasks`] 的顺序逐个尝试：已被其它线程认领
+    /// （登记在运行集合、数据库状态仍是 `queued`）或已不再就绪的任务直接跳过，
+    /// 让后面的就绪任务填补空余额度，而不是被队头的启动中任务挡住。
+    ///
+    /// 状态复查、运行集合登记与项目并发计数必须在同一把文件锁内完成：否则
+    /// `cancel` 可能在“确认 queued”之后、登记运行之前把任务退回 draft，任务
+    /// 仍会被启动；并发计数也会与认领结果撕裂。
+    ///
+    /// 返回 `None` 表示当前没有空余额度，或没有可认领的就绪任务。
+    fn claim_next(&self, project_id: &str) -> Result<Option<(String, RunningGuard)>, String> {
+        let db = self
             .ctx
             .db
             .lock()
             .map_err(|_| "数据库锁被占用".to_string())?;
-        store::next_queued_task(guard.conn())
+        let conn = db.conn();
+
+        let limit = store::project_concurrency(conn, project_id)?.max(1);
+        let running_count = count_running_tasks(conn, project_id)?;
+        let claimed_count = self
+            .inflight
+            .lock()
+            .map_err(|_| "运行计数锁被占用".to_string())?
+            .get(project_id)
+            .copied()
+            .unwrap_or(0);
+        // `running` 与认领计数覆盖的生命周期不同（认领早于 running、verifying
+        // 晚于 running），取较大值即可确保任一时刻都不超过上限。
+        if running_count.max(claimed_count as i64) >= limit {
+            return Ok(None);
+        }
+
+        let mut running = self
+            .ctx
+            .running
+            .lock()
+            .map_err(|_| "运行状态锁被占用".to_string())?;
+        for task_id in store::next_ready_tasks(conn, project_id)? {
+            // 已认领但尚未迁移到 running 的任务仍会出现在就绪查询里；继续看下一个
+            // 候选，避免它们长期占用队头却又不启动。
+            if running.contains(&task_id) {
+                continue;
+            }
+            // 查询与认领持有同一把锁，理论上状态不会变化；仍以库内就绪条件为准，
+            // 防止就绪列表来自更早的快照。
+            if !store::task_ready(conn, &task_id)? {
+                continue;
+            }
+            if !running.insert(task_id.clone()) {
+                continue;
+            }
+
+            let mut inflight = match self.inflight.lock() {
+                Ok(inflight) => inflight,
+                Err(_) => {
+                    running.remove(&task_id);
+                    return Err("运行计数锁被占用".to_string());
+                }
+            };
+            *inflight.entry(project_id.to_string()).or_insert(0) += 1;
+            drop(inflight);
+            drop(running);
+
+            return Ok(Some((
+                task_id.clone(),
+                RunningGuard {
+                    running: Arc::clone(&self.ctx.running),
+                    inflight: Arc::clone(&self.inflight),
+                    project_id: project_id.to_string(),
+                    task_id,
+                },
+            )));
+        }
+        Ok(None)
     }
 
-    fn run_one(&self, task_id: &str) -> bool {
-        // 状态校验与运行占位必须在同一把数据库锁内完成。否则 `cancel` 可能在
-        // “确认 queued” 之后、登记运行之前把任务退回 draft，任务仍会被启动。
-        let guard = {
-            let db = match self.ctx.db.lock() {
-                Ok(db) => db,
-                Err(_) => {
-                    eprintln!("调度器无法锁定数据库认领任务 {task_id}：数据库锁被占用");
-                    return false;
-                }
-            };
-            // 出队与真正开始之间可能被取消（queued → draft），此时跳过。
-            match store::task_status(db.conn(), task_id) {
-                Ok(TaskStatus::Queued) => {}
-                Ok(_) => return false,
-                Err(err) => {
-                    eprintln!("调度器读取任务 {task_id} 状态失败：{err}");
-                    return false;
-                }
-            }
-            let mut running = match self.ctx.running.lock() {
-                Ok(running) => running,
-                Err(_) => {
-                    eprintln!("调度器无法登记运行中的任务 {task_id}：运行状态锁被占用");
-                    return false;
-                }
-            };
-            if !running.insert(task_id.to_string()) {
-                return false;
-            }
-            RunningGuard {
-                running: Arc::clone(&self.ctx.running),
-                task_id: task_id.to_string(),
-            }
-        };
+    /// 在独立线程中运行已认领的任务；调度扫描线程绝不等候运行结束。
+    ///
+    /// 线程创建失败时闭包连同 `RunningGuard` 一起被丢弃，运行集合与并发计数
+    /// 自动释放，任务仍是 queued，下一轮扫描会重试。
+    fn spawn_run(self: &Arc<Self>, task_id: String, guard: RunningGuard) -> Result<(), String> {
+        let name = format!("temli-run-{}", short_id(&task_id));
+        let scheduler = Arc::clone(self);
+        std::thread::Builder::new()
+            .name(name.clone())
+            .spawn(move || scheduler.run_claimed(task_id, guard))
+            .map(|_| ())
+            .map_err(|err| format!("无法启动任务线程 {name}：{err}"))
+    }
 
-        // 单个运行失败（包括 panic）不能带走整个调度线程。
+    fn run_claimed(self: Arc<Self>, task_id: String, guard: RunningGuard) {
+        // 单个运行失败（包括 panic）不能带走调度线程或其它任务线程。
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-            orchestrator::run_task_blocking(&self.ctx, task_id)
+            orchestrator::run_task_blocking(&self.ctx, &task_id)
         }));
         let run_failed = match outcome {
             Ok(Ok(())) => false,
             Ok(Err(err)) => {
-                self.record_failure(task_id, &err);
+                self.record_failure(&task_id, &err);
                 true
             }
             Err(payload) => {
-                self.record_failure(task_id, &panic_message(payload));
+                self.record_failure(&task_id, &panic_message(payload));
                 true
             }
         };
 
+        self.settle(&task_id, run_failed);
+        // 收尾完成后再释放占位，避免自动重排的任务在 settle 期间被再次认领。
         drop(guard);
-        self.settle(task_id, run_failed);
-        true
     }
 
     /// 运行失败且未留下终态时补齐失败状态；运行开始前就失败的任务退回 draft，
@@ -296,8 +396,9 @@ impl Scheduler {
 
     /// 运行收尾：失败的任务在尝试次数未用尽时自动重排，用尽后转人工决策。
     ///
-    /// 用户取消只压制自动重排；次数用尽时仍必须留下 `retry_exhausted` 决策，
-    /// 否则任务会停在 `failed` 且没有任何人工入口。
+    /// 用户取消会压制自动重排，并把已重排回 `queued` 的任务退回 `draft`；
+    /// 次数用尽时仍必须留下 `retry_exhausted` 决策，否则任务会停在 `failed`
+    /// 且没有任何人工入口。
     fn settle(&self, task_id: &str, run_failed: bool) {
         // 运行结束（无论成败）都清除取消意图：本次运行已经消费掉它。
         let cancelled = self.take_cancelled(task_id);
@@ -312,7 +413,10 @@ impl Scheduler {
             match detail.task.status {
                 // 运行在开始前就失败（例如 worktree 创建失败）：退回 draft，
                 // 避免调度器反复取到同一个无法启动的 queued 任务。
-                TaskStatus::Queued if run_failed => {
+                // 运行期间被取消、随后又被重排回 queued 的任务（例如 rebase
+                // 重试）也必须退回 draft：取消意图已在这里消费，留着它会让调度
+                // 器继续启动一个用户已经取消的任务。
+                TaskStatus::Queued if run_failed || cancelled => {
                     store::transition(guard.conn(), task_id, TaskStatus::Draft)?;
                 }
                 TaskStatus::Failed => {
@@ -370,6 +474,23 @@ impl Scheduler {
     }
 }
 
+/// 统计项目内正在运行（适配器会话未结束）的任务数。
+fn count_running_tasks(conn: &rusqlite::Connection, project_id: &str) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM tasks t JOIN items i ON i.id = t.item_id
+         WHERE i.project_id = ?1 AND i.status = 'running'",
+        rusqlite::params![project_id],
+        |row| row.get(0),
+    )
+    .map_err(|err| format!("统计项目 {project_id} 运行中任务失败：{err}"))
+}
+
+/// 线程名里使用的任务 id 前缀。
+fn short_id(task_id: &str) -> &str {
+    task_id.get(..8).unwrap_or(task_id)
+}
+
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -391,7 +512,7 @@ mod tests {
     use crate::store::{Criterion, NewTask};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Instant;
 
     static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -420,6 +541,8 @@ mod tests {
         active: AtomicUsize,
         max_active: AtomicUsize,
         next_session: AtomicUsize,
+        /// worker `start` 的模拟耗时；并发测试把它调大，确保运行窗口重叠。
+        worker_delay_ms: AtomicU64,
     }
 
     impl ScriptedAdapter {
@@ -432,12 +555,19 @@ mod tests {
                 active: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
                 next_session: AtomicUsize::new(0),
+                worker_delay_ms: AtomicU64::new(100),
             }
         }
 
         /// 第一次 worker 启动以 `Ended(Failed)` 结束，之后的启动都成功。
         fn failing_first_worker(self) -> Self {
             self.fail_first_worker.store(true, Ordering::SeqCst);
+            self
+        }
+
+        /// 调整 worker 启动的模拟耗时，用于制造并发窗口。
+        fn with_worker_delay(self, millis: u64) -> Self {
+            self.worker_delay_ms.store(millis, Ordering::SeqCst);
             self
         }
 
@@ -531,8 +661,9 @@ mod tests {
             }
 
             self.worker_starts.fetch_add(1, Ordering::SeqCst);
-            // 模拟真实 worker 的启动耗时：串行调度下并发启动数必须保持 1。
-            std::thread::sleep(Duration::from_millis(100));
+            // 模拟真实 worker 的启动耗时：并发上限为 1 时必须保持串行。
+            let delay = self.worker_delay_ms.load(Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(delay));
             let result: Result<(), String> = if self.fail_first_worker.swap(false, Ordering::SeqCst)
             {
                 sink(AgentEvent::Ended {
@@ -540,16 +671,17 @@ mod tests {
                 });
                 Ok(())
             } else {
-                // 每个任务写入不同内容：后续任务基于前一任务合并后的提交工作，
-                // 相同内容会产生空 diff 而被判定为“没有改动”。
-                match fs::write(spec.cwd.join("done.txt"), format!("{title}\n")) {
+                // 每个任务写入自己的文件：并发任务的 worktree 基线相同，改同一个
+                // 文件会在合并时产生 add/add 冲突。
+                let file = format!("done-{title}.txt");
+                match fs::write(spec.cwd.join(file.as_str()), format!("{title}\n")) {
                     Ok(()) => {
                         sink(AgentEvent::Ended {
                             status: RunStatus::Completed,
                         });
                         Ok(())
                     }
-                    Err(err) => Err(format!("写入 done.txt 失败：{err}")),
+                    Err(err) => Err(format!("写入 {file} 失败：{err}")),
                 }
             };
             self.active.fetch_sub(1, Ordering::SeqCst);
@@ -666,14 +798,14 @@ mod tests {
                 prompt: format!("实现 {title}"),
                 criteria: vec![Criterion {
                     id: "c-1".to_string(),
-                    cmd: "test -f done.txt".to_string(),
+                    cmd: format!("test -f done-{title}.txt"),
                     expect_exit: 0,
                     expect_match: None,
                 }],
             },
         )
         .expect("创建任务");
-        // `next_queued_task` 按 `items.created_at` 排序；序号单调递增即可确定 FIFO 顺序。
+        // `next_ready_task` 按 `items.created_at` 排序；序号单调递增即可确定 FIFO 顺序。
         let order = TASK_ORDER.fetch_add(1, Ordering::Relaxed);
         guard
             .conn()
@@ -692,6 +824,26 @@ mod tests {
             .expect("读取任务")
             .task
             .status
+    }
+
+    fn set_project_limit(ctx: &RunContext, project_id: &str, limit: i64) {
+        let guard = ctx.db.lock().expect("数据库锁被占用");
+        store::set_project_concurrency(guard.conn(), project_id, limit).expect("设置并发上限");
+    }
+
+    /// 读取某条事件第一次落库时的 rowid；事件按写入顺序自增，可据此判断先后。
+    fn event_rowid(ctx: &RunContext, entity_id: &str, kind: &str) -> i64 {
+        let guard = ctx.db.lock().expect("数据库锁被占用");
+        guard
+            .conn()
+            .query_row(
+                "SELECT rowid FROM events
+                 WHERE entity_id = ?1 AND type = ?2
+                 ORDER BY rowid ASC LIMIT 1",
+                rusqlite::params![entity_id, kind],
+                |row| row.get(0),
+            )
+            .expect("读取事件 rowid")
     }
 
     fn wait_until(mut predicate: impl FnMut() -> bool, timeout: Duration) -> bool {
@@ -770,6 +922,147 @@ mod tests {
     }
 
     #[test]
+    fn project_limit_two_runs_independent_tasks_concurrently() {
+        let fixture = Fixture::new("concurrent-two");
+        // 运行窗口足够长，两次扫描之间启动的任务必然重叠。
+        let adapter = Arc::new(ScriptedAdapter::new().with_worker_delay(1_000));
+        let (ctx, project_id) = fixture.setup(adapter.clone());
+        set_project_limit(&ctx, &project_id, 2);
+
+        let first = add_task(&ctx, &project_id, "alpha");
+        let second = add_task(&ctx, &project_id, "beta");
+
+        let scheduler = Scheduler::new(ctx.clone());
+        scheduler.enqueue(&first).expect("入队第一个任务");
+        scheduler.enqueue(&second).expect("入队第二个任务");
+        scheduler.start().expect("启动调度线程");
+
+        let both_merged = wait_until(
+            || {
+                status(&ctx, &first) == TaskStatus::Merged
+                    && status(&ctx, &second) == TaskStatus::Merged
+            },
+            Duration::from_secs(15),
+        );
+        assert!(
+            both_merged,
+            "两个任务都应在 15 秒内合并，实际状态：first={:?} second={:?}",
+            status(&ctx, &first),
+            status(&ctx, &second)
+        );
+        assert_eq!(
+            adapter.max_active(),
+            2,
+            "并发上限为 2 时两个任务必须同时运行"
+        );
+        assert_eq!(adapter.worker_starts(), 2);
+
+        let mut titles = adapter
+            .worker_records()
+            .into_iter()
+            .map(|(title, _)| title)
+            .collect::<Vec<_>>();
+        titles.sort();
+        assert_eq!(titles, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn project_limit_one_never_overlaps_tasks() {
+        let fixture = Fixture::new("concurrent-one");
+        let adapter = Arc::new(ScriptedAdapter::new().with_worker_delay(500));
+        let (ctx, project_id) = fixture.setup(adapter.clone());
+        // 默认并发上限即 1。
+        {
+            let guard = ctx.db.lock().expect("数据库锁被占用");
+            assert_eq!(
+                store::project_concurrency(guard.conn(), &project_id).expect("读取并发上限"),
+                1
+            );
+        }
+
+        let first = add_task(&ctx, &project_id, "alpha");
+        let second = add_task(&ctx, &project_id, "beta");
+
+        let scheduler = Scheduler::new(ctx.clone());
+        scheduler.enqueue(&first).expect("入队第一个任务");
+        scheduler.enqueue(&second).expect("入队第二个任务");
+        scheduler.start().expect("启动调度线程");
+
+        let both_merged = wait_until(
+            || {
+                status(&ctx, &first) == TaskStatus::Merged
+                    && status(&ctx, &second) == TaskStatus::Merged
+            },
+            Duration::from_secs(15),
+        );
+        assert!(
+            both_merged,
+            "两个任务都应在 15 秒内合并，实际状态：first={:?} second={:?}",
+            status(&ctx, &first),
+            status(&ctx, &second)
+        );
+        assert_eq!(
+            adapter.max_active(),
+            1,
+            "并发上限为 1 时任何时刻都只能有一个任务运行"
+        );
+        assert_eq!(adapter.worker_starts(), 2);
+    }
+
+    #[test]
+    fn dependency_blocks_task_until_blocker_merges() {
+        let fixture = Fixture::new("dependency");
+        let adapter = Arc::new(ScriptedAdapter::new().with_worker_delay(300));
+        let (ctx, project_id) = fixture.setup(adapter.clone());
+        set_project_limit(&ctx, &project_id, 2);
+
+        let blocker = add_task(&ctx, &project_id, "alpha");
+        let dependent = add_task(&ctx, &project_id, "beta");
+        {
+            let guard = ctx.db.lock().expect("数据库锁被占用");
+            store::add_dependency(guard.conn(), &dependent, &blocker).expect("登记依赖");
+        }
+
+        let scheduler = Scheduler::new(ctx.clone());
+        scheduler.enqueue(&blocker).expect("入队前置任务");
+        scheduler.enqueue(&dependent).expect("入队依赖任务");
+        scheduler.start().expect("启动调度线程");
+
+        let both_merged = wait_until(
+            || {
+                status(&ctx, &blocker) == TaskStatus::Merged
+                    && status(&ctx, &dependent) == TaskStatus::Merged
+            },
+            Duration::from_secs(15),
+        );
+        assert!(
+            both_merged,
+            "两个任务都应在 15 秒内合并，实际状态：blocker={:?} dependent={:?}",
+            status(&ctx, &blocker),
+            status(&ctx, &dependent)
+        );
+
+        let starts = adapter
+            .worker_records()
+            .into_iter()
+            .map(|(title, _)| title)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            starts,
+            vec!["alpha".to_string(), "beta".to_string()],
+            "依赖任务必须在前置任务之后启动"
+        );
+        assert_eq!(adapter.max_active(), 1, "前置任务未合并时依赖任务不能启动");
+
+        let blocker_merged = event_rowid(&ctx, &blocker, "merged");
+        let dependent_started = event_rowid(&ctx, &dependent, "run_started");
+        assert!(
+            blocker_merged < dependent_started,
+            "依赖任务必须在前置任务合并后才开始运行（merged rowid {blocker_merged}，run_started rowid {dependent_started}）"
+        );
+    }
+
+    #[test]
     fn failed_run_is_retried_once_then_merges() {
         let fixture = Fixture::new("retry");
         let adapter = Arc::new(ScriptedAdapter::new().failing_first_worker());
@@ -838,8 +1131,11 @@ mod tests {
             );
         }
         assert!(
-            !scheduler.run_one(&task_id),
-            "已退回 draft 的任务不能被 worker 认领"
+            scheduler
+                .claim_next(&project_id)
+                .expect("读取就绪任务")
+                .is_none(),
+            "已退回 draft 的任务不能被调度器认领"
         );
         assert_eq!(adapter.worker_starts(), 0, "未启动工作线程时不应调用适配器");
     }
@@ -941,5 +1237,104 @@ mod tests {
                 .contains(&task_id),
             "运行收尾必须清除取消意图"
         );
+    }
+
+    #[test]
+    fn cancelled_queued_task_returns_to_draft_on_settle() {
+        let fixture = Fixture::new("cancel-requeued");
+        let (ctx, project_id) = fixture.setup(Arc::new(ScriptedAdapter::new()));
+        let task_id = add_task(&ctx, &project_id, "requeued");
+
+        let scheduler = Scheduler::new(ctx.clone());
+        scheduler.enqueue(&task_id).expect("入队任务");
+        // 模拟运行在 rebase 重试后把任务重新排回 queued，取消意图尚未被消费。
+        scheduler
+            .cancel_requested
+            .lock()
+            .expect("调度取消记录锁被占用")
+            .insert(task_id.clone());
+        ctx.cancelled
+            .lock()
+            .expect("取消意图锁被占用")
+            .insert(task_id.clone());
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Queued);
+
+        scheduler.settle(&task_id, false);
+
+        assert_eq!(
+            status(&ctx, &task_id),
+            TaskStatus::Draft,
+            "已取消并重排的 queued 任务必须在收尾时退回 draft"
+        );
+        assert!(
+            !ctx.cancelled
+                .lock()
+                .expect("取消意图锁被占用")
+                .contains(&task_id),
+            "收尾必须清除取消意图"
+        );
+        {
+            let guard = ctx.db.lock().expect("数据库锁被占用");
+            assert!(
+                store::next_queued_task(guard.conn())
+                    .expect("读取队列")
+                    .is_none(),
+                "已取消的任务不能留在队列里"
+            );
+        }
+    }
+
+    #[test]
+    fn claimed_queued_task_does_not_block_other_ready_tasks() {
+        let fixture = Fixture::new("starvation");
+        let (ctx, project_id) = fixture.setup(Arc::new(ScriptedAdapter::new()));
+        set_project_limit(&ctx, &project_id, 2);
+
+        let first = add_task(&ctx, &project_id, "alpha");
+        let second = add_task(&ctx, &project_id, "beta");
+
+        let scheduler = Scheduler::new(ctx.clone());
+        scheduler.enqueue(&first).expect("入队第一个任务");
+        scheduler.enqueue(&second).expect("入队第二个任务");
+
+        // 模拟第一个任务已被认领、仍在创建 worktree：数据库状态还是 queued，
+        // 但运行集合与项目认领计数已经登记。
+        ctx.running
+            .lock()
+            .expect("运行状态锁被占用")
+            .insert(first.clone());
+        *scheduler
+            .inflight
+            .lock()
+            .expect("运行计数锁被占用")
+            .entry(project_id.clone())
+            .or_insert(0) += 1;
+
+        let (claimed, guard) = scheduler
+            .claim_next(&project_id)
+            .expect("读取就绪任务")
+            .expect("必须越过已认领但未启动的任务继续认领");
+        assert_eq!(
+            claimed, second,
+            "队头任务仍在启动时，后面的就绪任务必须能填补空余额度"
+        );
+
+        // 额度已满：再次认领必须停下。
+        assert!(
+            scheduler
+                .claim_next(&project_id)
+                .expect("读取就绪任务")
+                .is_none(),
+            "额度用尽时不能再认领"
+        );
+
+        // 释放占位后第二个任务仍是 queued，可以再次被认领。
+        drop(guard);
+        let (reclaimed, guard) = scheduler
+            .claim_next(&project_id)
+            .expect("读取就绪任务")
+            .expect("释放额度后可再次认领");
+        assert_eq!(reclaimed, second);
+        drop(guard);
     }
 }

@@ -14,7 +14,7 @@ use db::{Db, Project, RegisterProjectInput, canonical_repo};
 use evidence::DiscoveredCommand;
 use rusqlite::params;
 use scheduler::Scheduler;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -44,6 +44,24 @@ struct CreateTaskInput {
 struct ResolveDecisionInput {
     id: String,
     resolution: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DependencyInput {
+    task_id: String,
+    depends_on_task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectConcurrencyInput {
+    project_id: String,
+    limit: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct DependencyList {
+    blockers: Vec<TaskSummary>,
+    blocks: Vec<TaskSummary>,
 }
 
 fn db_err(e: rusqlite::Error) -> String {
@@ -120,6 +138,40 @@ fn register_project(
 fn list_tasks(state: State<AppState>, project_id: String) -> Result<Vec<TaskSummary>, String> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     store::list_tasks_for_project(db.conn(), &project_id)
+}
+
+#[tauri::command]
+fn add_dependency(state: State<AppState>, input: DependencyInput) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::add_dependency(db.conn(), &input.task_id, &input.depends_on_task_id)
+}
+
+#[tauri::command]
+fn remove_dependency(state: State<AppState>, input: DependencyInput) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::remove_dependency(db.conn(), &input.task_id, &input.depends_on_task_id)
+}
+
+#[tauri::command]
+fn list_dependencies(state: State<AppState>, task_id: String) -> Result<DependencyList, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    let (blockers, blocks) = store::task_dependencies(db.conn(), &task_id)?;
+    Ok(DependencyList { blockers, blocks })
+}
+
+#[tauri::command]
+fn get_project_concurrency(state: State<AppState>, project_id: String) -> Result<i64, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::project_concurrency(db.conn(), &project_id)
+}
+
+#[tauri::command]
+fn set_project_concurrency(
+    state: State<AppState>,
+    input: ProjectConcurrencyInput,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::set_project_concurrency(db.conn(), &input.project_id, input.limit)
 }
 
 /// 规划器单次运行的硬超时（秒）；超时即取消并回退到默认验收标准。
@@ -401,6 +453,11 @@ pub fn run() {
             list_projects,
             register_project,
             list_tasks,
+            add_dependency,
+            remove_dependency,
+            list_dependencies,
+            get_project_concurrency,
+            set_project_concurrency,
             create_task,
             get_task,
             start_task,

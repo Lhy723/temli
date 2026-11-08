@@ -1,6 +1,6 @@
 # TASKS
 
-当前里程碑：M2 队列与安全合并（已合入）
+当前里程碑：M3 DAG 调度（已合入）
 
 ## 已完成
 
@@ -72,3 +72,18 @@
 
 - 队列串行：两个 queued 任务，一个在运行中被强制重启 → `interrupted`，另一个自动执行并以 evidence + 审查通过合并
 - 回滚/超时/重试/取消/串行队列用例由 `cargo test` 覆盖（121 tests）
+
+## 进行中：M3 DAG 调度
+
+- [x] 依赖边校验（同项目/自环/环）、就绪递归查询、并发配置 IPC
+- [x] 并发 worker 池（按项目 limit、默认 1）
+- [x] rebase 冲突阈值策略（≤3 文件且非高风险自动重排）
+- [x] 前端依赖展示与并发设置
+- [x] 独立审查（1 P1 / 2 P2 / 2 P3）
+- [x] 审查修复：spawn 失败热循环、claimed 任务饿死、取消后重排、认领后依赖、空冲突误重试
+- [x] 合入（PR #17）
+
+## M3 冒烟
+
+- 并发 2：gamma / delta 同时 running；delta 先合并，gamma 在合并时 rebase 到新 tip 后成功合并（修复前会 merge_failed）
+- 依赖/并发/串行/环检测由 `cargo test` 覆盖（144 tests）
