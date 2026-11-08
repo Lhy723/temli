@@ -193,6 +193,22 @@ fn plan_acceptance(
     if grounded { Some(criteria) } else { None }
 }
 
+/// 生成任务的验收标准：优先采用规划器输出，失败或未注册适配器时回退到默认标准。
+///
+/// 空命令列表由 [`plan_acceptance`] 直接返回 `None`，因此这里同样得到空默认列表，
+/// 由调用方转换成“未发现命令”的错误。
+fn generate_acceptance(
+    adapter: Option<&dyn AgentAdapter>,
+    repo: &Path,
+    title: &str,
+    intent: &str,
+    commands: &[DiscoveredCommand],
+) -> Vec<Criterion> {
+    adapter
+        .and_then(|adapter| plan_acceptance(adapter, repo, title, intent, commands))
+        .unwrap_or_else(|| evidence::default_acceptance(commands))
+}
+
 #[tauri::command]
 fn create_task(state: State<AppState>, input: CreateTaskInput) -> Result<TaskDetail, String> {
     let project = {
@@ -204,20 +220,14 @@ fn create_task(state: State<AppState>, input: CreateTaskInput) -> Result<TaskDet
     let criteria = if input.acceptance.is_empty() {
         let repo = PathBuf::from(&project.repo_path);
         let commands = evidence::discover_commands(&repo);
-        let planned = if commands.is_empty() {
-            None
-        } else {
-            state.adapters.get("omp").and_then(|adapter| {
-                plan_acceptance(
-                    adapter.as_ref(),
-                    &repo,
-                    &input.title,
-                    &input.prompt,
-                    &commands,
-                )
-            })
-        };
-        let generated = planned.unwrap_or_else(|| evidence::default_acceptance(&commands));
+        let adapter = state.adapters.get("omp");
+        let generated = generate_acceptance(
+            adapter.as_deref(),
+            &repo,
+            &input.title,
+            &input.prompt,
+            &commands,
+        );
         if generated.is_empty() {
             return Err("未发现可执行的测试/构建命令，请手动提供验收标准".to_string());
         }
@@ -395,4 +405,230 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{AuthState, Capabilities, DetectResult, RunStatus, SessionHandle};
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 脚本化适配器：`start` 同步发出一条 `TextDelta` 与 `Ended(Completed)`，
+    /// 不启动子进程、不调用模型；`starts` 记录被启动的次数。
+    struct ScriptedAdapter {
+        output: String,
+        starts: AtomicUsize,
+    }
+
+    impl ScriptedAdapter {
+        fn new(output: impl Into<String>) -> Self {
+            Self {
+                output: output.into(),
+                starts: AtomicUsize::new(0),
+            }
+        }
+
+        fn starts(&self) -> usize {
+            self.starts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl AgentAdapter for ScriptedAdapter {
+        fn manifest(&self) -> AgentManifest {
+            AgentManifest {
+                id: "scripted".to_string(),
+                name: "Scripted".to_string(),
+                version: "0.0.0".to_string(),
+                capabilities: Capabilities::default(),
+            }
+        }
+
+        fn detect(&self) -> DetectResult {
+            DetectResult {
+                available: true,
+                version: None,
+                auth: AuthState::Ok,
+                detail: None,
+            }
+        }
+
+        fn start(&self, _spec: RunSpec, sink: EventSink) -> Result<SessionHandle, String> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            sink(AgentEvent::TextDelta {
+                text: self.output.clone(),
+            });
+            sink(AgentEvent::Ended {
+                status: RunStatus::Completed,
+            });
+            Ok(SessionHandle {
+                id: "scripted-session".to_string(),
+            })
+        }
+
+        fn respond(
+            &self,
+            _handle: &SessionHandle,
+            _request_id: &str,
+            _decision: Decision,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn cancel(&self, _handle: &SessionHandle) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// 临时仓库夹具：`package.json` 提供 `test`/`build` 脚本。
+    /// `discover_commands` 只读取声明文件，`git init` 仅用于让夹具成为真实仓库。
+    struct RepoFixture {
+        path: PathBuf,
+    }
+
+    impl RepoFixture {
+        fn new(label: &str) -> Self {
+            let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "temli-planner-{}-{unique}-{label}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("创建临时仓库目录");
+            fs::write(
+                path.join("package.json"),
+                r#"{"scripts":{"test":"node --test","build":"tsc"}}"#,
+            )
+            .expect("写入 package.json");
+            let _ = std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&path)
+                .status();
+            Self { path }
+        }
+
+        fn commands(&self) -> Vec<DiscoveredCommand> {
+            evidence::discover_commands(&self.path)
+        }
+    }
+
+    impl Drop for RepoFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn criteria_json(cmd: &str) -> String {
+        format!(r#"[{{"id":"c-1","cmd":"{cmd}","expect_exit":0}}]"#)
+    }
+
+    #[test]
+    fn plan_acceptance_returns_grounded_criteria() {
+        let repo = RepoFixture::new("grounded");
+        let commands = repo.commands();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.cmd.as_str())
+                .collect::<Vec<_>>(),
+            vec!["npm run test", "npm run build"]
+        );
+        // 发现到的 npm 命令形如 `npm run <script>`，规划器输出必须逐字匹配。
+        let test_cmd = commands
+            .iter()
+            .find(|command| command.kind == evidence::CmdKind::Test)
+            .expect("夹具应发现 test 命令")
+            .cmd
+            .clone();
+        let adapter = ScriptedAdapter::new(criteria_json(&test_cmd));
+
+        let criteria = plan_acceptance(
+            &adapter,
+            &repo.path,
+            "新增解析器",
+            "支持输入解析",
+            &commands,
+        )
+        .expect("与发现命令一致的计划应被接受");
+
+        assert_eq!(criteria.len(), 1);
+        assert_eq!(criteria[0].id, "c-1");
+        assert_eq!(criteria[0].cmd, test_cmd);
+        assert_eq!(criteria[0].expect_exit, 0);
+        assert_eq!(adapter.starts(), 1);
+    }
+
+    #[test]
+    fn plan_acceptance_rejects_unparseable_output() {
+        let repo = RepoFixture::new("prose");
+        let commands = repo.commands();
+        let adapter = ScriptedAdapter::new("没有 JSON，直接运行测试即可。");
+
+        assert!(
+            plan_acceptance(&adapter, &repo.path, "t", "i", &commands).is_none(),
+            "纯文本输出必须回退（调用方使用默认验收标准）"
+        );
+        assert_eq!(adapter.starts(), 1);
+    }
+
+    #[test]
+    fn plan_acceptance_rejects_undiscovered_command() {
+        let repo = RepoFixture::new("ungrounded");
+        let commands = repo.commands();
+        let adapter = ScriptedAdapter::new(r#"[{"id":"c-1","cmd":"rm -rf /","expect_exit":0}]"#);
+
+        assert!(
+            plan_acceptance(&adapter, &repo.path, "t", "i", &commands).is_none(),
+            "未在发现列表中的命令必须被拒绝"
+        );
+        assert_eq!(adapter.starts(), 1);
+    }
+
+    #[test]
+    fn plan_acceptance_skips_adapter_without_commands() {
+        let adapter = ScriptedAdapter::new(criteria_json("npm run test"));
+
+        assert!(plan_acceptance(&adapter, Path::new("."), "t", "i", &[]).is_none());
+        assert_eq!(adapter.starts(), 0, "命令列表为空时不应启动规划器");
+    }
+
+    #[test]
+    fn acceptance_generation_falls_back_to_defaults() {
+        let repo = RepoFixture::new("fallback");
+        let commands = repo.commands();
+        let defaults = evidence::default_acceptance(&commands);
+        assert!(!defaults.is_empty(), "夹具应产生非空默认验收标准");
+        assert_eq!(defaults.len(), commands.len());
+
+        // 规划器输出无法解析：`generate_acceptance` 与 `create_task` 走同一路径，
+        // 必须回退到默认验收标准，而不是返回空列表。
+        let broken = ScriptedAdapter::new("no json here");
+        let broken_adapter: &dyn AgentAdapter = &broken;
+        let generated = generate_acceptance(Some(broken_adapter), &repo.path, "t", "i", &commands);
+        assert_eq!(generated, defaults);
+        assert_eq!(broken.starts(), 1);
+        assert_eq!(
+            generated
+                .iter()
+                .map(|criterion| criterion.cmd.as_str())
+                .collect::<Vec<_>>(),
+            vec!["npm run test", "npm run build"]
+        );
+
+        // 适配器未注册时同样回退。
+        assert_eq!(
+            generate_acceptance(None, &repo.path, "t", "i", &commands),
+            defaults
+        );
+
+        // 规划成功时使用规划器结果，而非默认标准。
+        let grounded = ScriptedAdapter::new(criteria_json(&commands[0].cmd));
+        let grounded_adapter: &dyn AgentAdapter = &grounded;
+        let planned = generate_acceptance(Some(grounded_adapter), &repo.path, "t", "i", &commands);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].cmd, commands[0].cmd);
+        assert_ne!(planned, defaults);
+    }
 }
