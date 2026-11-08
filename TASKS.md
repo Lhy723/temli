@@ -140,6 +140,8 @@
 
 - [x] Codex 适配器（codex exec，workspace-write）— 真实 CLI 冒烟通过
 - [x] Claude Code 适配器（claude -p，acceptEdits）— 真实 CLI 冒烟通过
+  - 最终参数组合（stdin + `--permission-prompts none`）冒烟：exit 0，生成文件（125s）
+- [x] Codex 最终 stdin 组合（`-`）冒烟：exit 0，生成文件（21s）
 - [x] Manifest roles（developer/reviewer）与 UI 筛选
 - [x] 任务级 model 字段、RunSpec 传递与 UI
 - [x] 审查修复：Claude 权限提示挂起、prompt 截断、取消竞态、进程组、env allowlist、run.model 落库
