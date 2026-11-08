@@ -5,6 +5,7 @@ use crate::agent::{
 use crate::db::Db;
 use crate::evidence::{self, RiskKind};
 use crate::gitops;
+use crate::notify;
 use crate::prompts;
 use crate::store::{
     self, NewDecision, NewEvent, NewEvidence, NewReview, NewRun, TaskRow, TaskStatus,
@@ -1729,6 +1730,8 @@ fn event_sink(
             AgentEvent::Error { .. } => "agent_error",
             _ => "agent_event",
         };
+        // 打开审批决策后提醒用户；在数据库锁之外发送，避免通知拖慢事件流。
+        let mut approval_notice: Option<String> = None;
         if let Ok(guard) = ctx.db.lock() {
             if let AgentEvent::ApprovalRequest {
                 request_id,
@@ -1752,6 +1755,12 @@ fn event_sink(
                     if let Ok(mut map) = decisions.lock() {
                         map.insert(request_id.clone(), decision.id);
                     }
+                    approval_notice = Some(match (title.trim(), detail.trim()) {
+                        ("", "") => String::new(),
+                        ("", detail) => detail.to_string(),
+                        (title, "") => title.to_string(),
+                        (title, detail) => format!("{title}：{detail}"),
+                    });
                 }
             }
             let _ = store::append_event(
@@ -1764,6 +1773,9 @@ fn event_sink(
                     payload,
                 },
             );
+        }
+        if let Some(reason) = approval_notice {
+            notify::decision(&reason);
         }
         let _ = tx.send(event);
     })

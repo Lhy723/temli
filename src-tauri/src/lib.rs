@@ -3,6 +3,7 @@ mod db;
 mod evidence;
 mod github;
 mod gitops;
+mod notify;
 mod orchestrator;
 mod planner;
 mod prompts;
@@ -28,7 +29,11 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use store::{Criterion, DecisionRow, EventRow, TaskDetail, TaskSummary};
-use tauri::{Manager, State};
+use tauri::{
+    Manager, State, WindowEvent,
+    menu::{MenuBuilder, MenuItemBuilder},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+};
 
 struct AppState {
     db: Arc<Mutex<Db>>,
@@ -1153,11 +1158,57 @@ fn cleanup_worktrees(db: &Db, data_dir: &Path) {
     }
 }
 
+/// 显示并聚焦主窗口；窗口尚未创建时静默跳过。
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// 创建菜单栏托盘图标：左键显示并聚焦主窗口，右键菜单提供“显示 / 退出”。
+///
+/// 关闭主窗口只会隐藏，因此退出应用的入口始终保留在托盘菜单里。
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show = MenuItemBuilder::with_id("tray-show", "显示 temli").build(app)?;
+    let quit = MenuItemBuilder::with_id("tray-quit", "退出 temli").build(app)?;
+    let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
+
+    let mut builder = TrayIconBuilder::with_id("temli")
+        .tooltip("temli")
+        .menu(&menu)
+        // 左键留给“显示主窗口”，菜单通过右键打开。
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "tray-show" => show_main_window(app),
+            "tray-quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            notify::init(app.handle().clone());
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
             let db = Db::open(&dir.join("temli.db")).map_err(std::io::Error::other)?;
@@ -1204,7 +1255,18 @@ pub fn run() {
                 scheduler,
                 sync,
             });
+
+            setup_tray(app)?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // 关闭主窗口只隐藏到托盘，调度器与后台同步继续运行。
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             list_projects,
@@ -1259,9 +1321,28 @@ pub fn run() {
             unlink_context,
             list_context
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(on_run_event);
 }
+
+/// macOS：窗口全部隐藏后点击 Dock 图标重新显示主窗口。
+#[cfg(target_os = "macos")]
+fn on_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
+    if let tauri::RunEvent::Reopen {
+        has_visible_windows,
+        ..
+    } = event
+    {
+        if !has_visible_windows {
+            show_main_window(app);
+        }
+    }
+}
+
+/// 其他平台没有 Reopen 事件，无需额外处理。
+#[cfg(not(target_os = "macos"))]
+fn on_run_event(_app: &tauri::AppHandle, _event: tauri::RunEvent) {}
 
 #[cfg(test)]
 mod tests {
