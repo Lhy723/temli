@@ -7,6 +7,8 @@ export type TaskSummary = {
   attempts: number;
   criterion_count: number;
   created_at: string;
+  developer_adapter: string | null;
+  reviewer_adapter: string | null;
 };
 
 export type Criterion = {
@@ -24,6 +26,8 @@ export type TaskRow = {
   prompt: string;
   attempts: number;
   created_at: string;
+  developer_adapter: string | null;
+  reviewer_adapter: string | null;
 };
 
 export type RunRow = {
@@ -164,6 +168,107 @@ export type SearchHit = {
   kind: string;
   title: string;
   snippet: string;
+};
+
+export type AgentCapabilities = {
+  streaming: boolean;
+  approvals: boolean;
+  cancel: boolean;
+  usage: boolean;
+  cost_cap: boolean;
+  resume: boolean;
+};
+
+export type AgentManifest = {
+  id: string;
+  name: string;
+  version: string;
+  capabilities: AgentCapabilities;
+};
+
+export type SetTaskAgentsInput = {
+  task_id: string;
+  developer_adapter: string | null;
+  reviewer_adapter: string | null;
+};
+
+export type Vault = {
+  id: string;
+  name: string;
+  root_path: string;
+  created_at: string;
+};
+
+/** 笔记库内的一条树项；目录项 is_dir=true（id/updated_at 可能为空）。 */
+export type VaultEntry = {
+  id?: string | null;
+  path: string;
+  title: string;
+  is_dir: boolean;
+  updated_at?: string | null;
+};
+
+export type VaultNote = {
+  id: string;
+  vault_id: string;
+  path: string;
+  title: string;
+  body: string;
+  updated_at: string;
+};
+
+export type VaultHit = {
+  id: string;
+  vault_id: string;
+  path: string;
+  title: string;
+  snippet: string;
+};
+
+export type Backlink = {
+  id: string;
+  path: string;
+  title: string;
+  /** 反向链接里书写的原始目标，例如 `[[目标|别名]]` 中的「目标」。 */
+  target: string;
+};
+
+export type VaultGraphNode = {
+  id: string;
+  path: string;
+  title: string;
+};
+
+export type VaultGraphEdge = {
+  /** 来源笔记 id。 */
+  from: string;
+  /** 已解析的目标笔记 id。 */
+  to: string;
+};
+
+export type VaultGraph = {
+  nodes: VaultGraphNode[];
+  edges: VaultGraphEdge[];
+};
+
+export type AddVaultInput = {
+  name: string;
+  root_path: string;
+  /** true 时目录不存在会自动创建；默认要求目录已存在。 */
+  create?: boolean;
+};
+
+export type CreateVaultNoteInput = {
+  vault_id: string;
+  path: string;
+  title: string;
+  body?: string;
+};
+
+export type SaveVaultNoteInput = {
+  note_id: string;
+  title: string;
+  body: string;
 };
 
 export type ContextItem = {
@@ -340,6 +445,67 @@ export function unlinkContext(input: LinkContextInput): Promise<void> {
 
 export function listContext(taskId: string): Promise<ContextItem[]> {
   return invoke<ContextItem[]>("list_context", { taskId });
+}
+
+export function listAdapters(): Promise<AgentManifest[]> {
+  return invoke<AgentManifest[]>("list_adapters");
+}
+
+export function setTaskAgents(input: SetTaskAgentsInput): Promise<void> {
+  return invoke<void>("set_task_agents", { input });
+}
+
+export function addVault(input: AddVaultInput): Promise<Vault> {
+  return invoke<Vault>("add_vault", { input });
+}
+
+export function listVaults(): Promise<Vault[]> {
+  return invoke<Vault[]>("list_vaults");
+}
+
+export function removeVault(vaultId: string): Promise<void> {
+  return invoke<void>("remove_vault", { vaultId });
+}
+
+export function indexVault(vaultId: string): Promise<number> {
+  return invoke<number>("index_vault", { vaultId });
+}
+
+export function vaultTree(vaultId: string): Promise<VaultEntry[]> {
+  return invoke<VaultEntry[]>("vault_tree", { vaultId });
+}
+
+export function getVaultNote(noteId: string): Promise<VaultNote> {
+  return invoke<VaultNote>("get_vault_note", { noteId });
+}
+
+export function createVaultNote(
+  input: CreateVaultNoteInput,
+): Promise<VaultNote> {
+  return invoke<VaultNote>("create_vault_note", { input });
+}
+
+export function saveVaultNote(input: SaveVaultNoteInput): Promise<VaultNote> {
+  return invoke<VaultNote>("save_vault_note", { input });
+}
+
+export function deleteVaultNote(noteId: string): Promise<void> {
+  return invoke<void>("delete_vault_note", { noteId });
+}
+
+export function searchVault(
+  vaultId: string,
+  query: string,
+): Promise<VaultHit[]> {
+  return invoke<VaultHit[]>("search_vault", { vaultId, query });
+}
+
+export function noteBacklinks(noteId: string): Promise<Backlink[]> {
+  return invoke<Backlink[]>("note_backlinks", { noteId });
+}
+
+export function vaultGraph(vaultId: string): Promise<VaultGraph> {
+  return invoke<VaultGraph>("vault_graph", { vaultId });
 }
 
 const STATUS_LABELS: Record<string, string> = {

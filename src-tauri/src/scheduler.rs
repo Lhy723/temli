@@ -505,8 +505,8 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
     use crate::agent::{
-        AgentAdapter, AgentEvent, AgentManifest, AuthState, Capabilities, Decision, DetectResult,
-        EventSink, RunSpec, RunStatus, SessionHandle,
+        AdapterRegistry, AgentAdapter, AgentEvent, AgentManifest, AuthState, Capabilities,
+        Decision, DetectResult, EventSink, RunSpec, RunStatus, SessionHandle,
     };
     use crate::db::{Db, RegisterProjectInput};
     use crate::store::{Criterion, NewTask};
@@ -769,9 +769,13 @@ mod tests {
                     repo.canonicalize().expect("规范化仓库路径"),
                 )
                 .expect("登记临时项目");
+            let default_agent = adapter.manifest().id;
+            let mut adapters = AdapterRegistry::new();
+            adapters.register(adapter);
             let ctx = RunContext {
                 db: Arc::new(Mutex::new(db)),
-                adapter,
+                adapters: Arc::new(adapters),
+                default_agent,
                 data_dir: self.root.join("data"),
                 running: Arc::new(Mutex::new(HashSet::new())),
                 cancels: orchestrator::CancelRegistry::new(),

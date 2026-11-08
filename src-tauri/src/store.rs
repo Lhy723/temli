@@ -98,6 +98,12 @@ pub struct TaskRow {
     pub attempts: u32,
     pub max_minutes: i64,
     pub created_at: String,
+    /// 任务级开发者适配器；`None` 表示使用运行上下文里的全局默认。
+    #[serde(default)]
+    pub developer_adapter: Option<String>,
+    /// 任务级审查适配器；`None` 表示回退到开发者适配器。
+    #[serde(default)]
+    pub reviewer_adapter: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +114,12 @@ pub struct TaskSummary {
     pub attempts: u32,
     pub criterion_count: usize,
     pub created_at: String,
+    /// 任务级开发者适配器；`None` 表示未指派。
+    #[serde(default)]
+    pub developer_adapter: Option<String>,
+    /// 任务级审查适配器；`None` 表示未指派。
+    #[serde(default)]
+    pub reviewer_adapter: Option<String>,
 }
 
 /// 项目下的一条 issue item（GitHub 同步视图）。
@@ -124,7 +136,7 @@ pub struct ProjectIssue {
     pub task_id: Option<String>,
 }
 
-/// 任务上下文里的一条关联条目（笔记 / 文档 / issue）。
+/// 任务上下文里的一条关联文档条目。
 ///
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextMeta {
@@ -133,8 +145,8 @@ pub struct ContextMeta {
     pub title: String,
 }
 
-/// `body` 来自 `items.body`：笔记与文档在保存/扫描时同步正文缓存，任务派发时
-/// 只读这份缓存，不接触文件系统。
+/// `body` 来自 `items.body`：文档在保存时同步正文缓存，任务派发时只读这份
+/// 缓存，不接触文件系统。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextItem {
     pub id: String,
@@ -337,7 +349,7 @@ pub fn create_task(conn: &Connection, input: NewTask) -> Result<TaskRow, String>
 
     conn.query_row(
         "SELECT t.id, i.project_id, i.title, i.status, t.prompt, t.attempts, t.max_minutes,
-                t.created_at
+                t.created_at, t.developer_adapter, t.reviewer_adapter
          FROM tasks t JOIN items i ON i.id = t.item_id
          WHERE t.id = ?1",
         params![task_id],
@@ -398,6 +410,57 @@ pub fn task_item_id(conn: &Connection, task_id: &str) -> Result<String, String> 
     .optional()
     .map_err(db_err)?
     .ok_or_else(|| format!("任务不存在：{task_id}"))
+}
+
+/// 读取任务级 agent 指派：`(developer_adapter, reviewer_adapter)`。
+///
+/// `None` 表示该角色未指派，由运行器回退到全局默认（审查角色回退到开发者）。
+pub fn task_agents(
+    conn: &Connection,
+    task_id: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    conn.query_row(
+        "SELECT developer_adapter, reviewer_adapter FROM tasks WHERE id = ?1",
+        params![task_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(db_err)?
+    .ok_or_else(|| format!("任务不存在：{task_id}"))
+}
+
+/// 写入任务级 agent 指派；`None` 清除指派并恢复默认。
+///
+/// 只校验 id 非空——适配器是否注册由运行器按注册表判断，存储层不持有注册表。
+pub fn set_task_agents(
+    conn: &Connection,
+    task_id: &str,
+    developer: Option<&str>,
+    reviewer: Option<&str>,
+) -> Result<(), String> {
+    let developer = normalize_agent_id("开发者", developer)?;
+    let reviewer = normalize_agent_id("审查者", reviewer)?;
+    ensure_task(conn, task_id)?;
+    conn.execute(
+        "UPDATE tasks SET developer_adapter = ?2, reviewer_adapter = ?3 WHERE id = ?1",
+        params![task_id, developer, reviewer],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+fn normalize_agent_id(role: &str, id: Option<&str>) -> Result<Option<String>, String> {
+    match id {
+        None => Ok(None),
+        Some(raw) => {
+            let id = raw.trim();
+            if id.is_empty() {
+                Err(format!("{role}适配器 id 不能为空"))
+            } else {
+                Ok(Some(id.to_string()))
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -489,7 +552,8 @@ pub fn task_dependencies(
     let item_id = task_item_id(conn, task_id)?;
     let blockers = query_related_tasks(
         conn,
-        "SELECT t.id, i.title, i.status, t.attempts, t.acceptance_json, t.created_at
+        "SELECT t.id, i.title, i.status, t.attempts, t.acceptance_json, t.created_at,
+                t.developer_adapter, t.reviewer_adapter
          FROM links l
          JOIN tasks t ON t.item_id = l.from_item
          JOIN items i ON i.id = t.item_id
@@ -499,7 +563,8 @@ pub fn task_dependencies(
     )?;
     let blocks = query_related_tasks(
         conn,
-        "SELECT t.id, i.title, i.status, t.attempts, t.acceptance_json, t.created_at
+        "SELECT t.id, i.title, i.status, t.attempts, t.acceptance_json, t.created_at,
+                t.developer_adapter, t.reviewer_adapter
          FROM links l
          JOIN tasks t ON t.item_id = l.to_item
          JOIN items i ON i.id = t.item_id
@@ -589,10 +654,10 @@ pub fn unlink_item(
     Ok(())
 }
 
-/// 任务条目通过 `links(rel='relates')` 关联的知识条目，按创建时间稳定排序。
+/// 任务条目通过 `links(rel='relates')` 关联的文档条目，按创建时间稳定排序。
 ///
-/// 只读取数据库缓存正文，并且只返回与任务同项目的条目；派发任务时由
-/// orchestrator 截断后注入 prompt。
+/// 只读取数据库缓存正文，只返回与任务同项目且 `kind='doc'` 的条目；笔记已迁往
+/// 独立 vault，不再注入任务上下文。派发任务时由 orchestrator 截断后注入 prompt。
 pub fn task_context_meta(conn: &Connection, task_id: &str) -> Result<Vec<ContextMeta>, String> {
     let item_id = task_item_id(conn, task_id)?;
     let mut stmt = conn
@@ -603,6 +668,7 @@ pub fn task_context_meta(conn: &Connection, task_id: &str) -> Result<Vec<Context
              JOIN items task_item ON task_item.id = l.from_item
              WHERE l.from_item = ?1 AND l.rel = 'relates'
                AND i.project_id = task_item.project_id
+               AND i.kind = 'doc'
              ORDER BY i.created_at ASC, i.id ASC",
         )
         .map_err(db_err)?;
@@ -628,6 +694,7 @@ pub fn task_context(conn: &Connection, task_id: &str) -> Result<Vec<ContextItem>
              JOIN items task_item ON task_item.id = l.from_item
              WHERE l.from_item = ?1 AND l.rel = 'relates'
                AND i.project_id = task_item.project_id
+               AND i.kind = 'doc'
              ORDER BY i.created_at ASC, i.id ASC",
         )
         .map_err(db_err)?;
@@ -840,7 +907,8 @@ fn query_task_summaries(
 ) -> Result<Vec<TaskSummary>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT t.id, i.title, i.status, t.attempts, t.acceptance_json, t.created_at
+            "SELECT t.id, i.title, i.status, t.attempts, t.acceptance_json, t.created_at,
+                    t.developer_adapter, t.reviewer_adapter
              FROM tasks t JOIN items i ON i.id = t.item_id
              WHERE (?1 IS NULL OR i.project_id = ?1)
              ORDER BY t.created_at DESC, t.rowid DESC",
@@ -857,11 +925,11 @@ pub fn get_task(conn: &Connection, task_id: &str) -> Result<TaskDetail, String> 
     let (task, acceptance_json) = conn
         .query_row(
             "SELECT t.id, i.project_id, i.title, i.status, t.prompt, t.attempts, t.max_minutes,
-                    t.created_at, t.acceptance_json
+                    t.created_at, t.developer_adapter, t.reviewer_adapter, t.acceptance_json
              FROM tasks t JOIN items i ON i.id = t.item_id
              WHERE t.id = ?1",
             params![task_id],
-            |row| Ok((read_task_row(row)?, row.get::<_, String>(8)?)),
+            |row| Ok((read_task_row(row)?, row.get::<_, String>(10)?)),
         )
         .optional()
         .map_err(db_err)?
@@ -1505,6 +1573,8 @@ fn read_task_summary(row: &Row<'_>) -> rusqlite::Result<TaskSummary> {
         attempts: row.get(3)?,
         criterion_count: criteria.len(),
         created_at: row.get(5)?,
+        developer_adapter: row.get(6)?,
+        reviewer_adapter: row.get(7)?,
     })
 }
 
@@ -1518,6 +1588,8 @@ fn read_task_row(row: &Row<'_>) -> rusqlite::Result<TaskRow> {
         attempts: row.get(5)?,
         max_minutes: row.get::<_, i64>(6)?,
         created_at: row.get(7)?,
+        developer_adapter: row.get(8)?,
+        reviewer_adapter: row.get(9)?,
     })
 }
 
@@ -2845,7 +2917,7 @@ mod tests {
     }
 
     #[test]
-    fn task_context_returns_only_linked_items_with_bodies() {
+    fn task_context_returns_only_linked_docs_with_bodies() {
         let db = open_db();
         let project_id = project(&db);
         let other_project_id = project(&db);
@@ -2853,11 +2925,12 @@ mod tests {
         let task = create_task(conn, new_task(&project_id, criteria())).unwrap();
         let task_item = task_item_id(conn, &task.id).unwrap();
 
+        // 笔记已迁往独立 vault：即使仍有关联边，也不能注入任务上下文。
         let note = insert_item(conn, &project_id, "note", "架构笔记", "笔记正文");
         let doc = insert_item(conn, &project_id, "doc", "设计文档", "文档正文");
-        let unrelated = insert_item(conn, &project_id, "note", "无关笔记", "不应出现");
-        let reverse = insert_item(conn, &project_id, "note", "反向笔记", "不应出现");
-        let foreign = insert_item(conn, &other_project_id, "note", "外部笔记", "不应出现");
+        let unrelated = insert_item(conn, &project_id, "doc", "无关文档", "不应出现");
+        let reverse = insert_item(conn, &project_id, "doc", "反本文档", "不应出现");
+        let foreign = insert_item(conn, &other_project_id, "doc", "外部文档", "不应出现");
 
         link_item(conn, &task_item, &note, "relates").unwrap();
         link_item(conn, &task_item, &doc, "relates").unwrap();
@@ -2866,21 +2939,61 @@ mod tests {
         link_item(conn, &reverse, &task_item, "relates").unwrap();
 
         let context = task_context(conn, &task.id).unwrap();
-        assert_eq!(context.len(), 2);
-        let ids: HashSet<&str> = context.iter().map(|item| item.id.as_str()).collect();
-        assert_eq!(ids, HashSet::from([note.as_str(), doc.as_str()]));
-        let note_item = context.iter().find(|item| item.id == note).unwrap();
-        assert_eq!(note_item.kind, "note");
-        assert_eq!(note_item.title, "架构笔记");
-        assert_eq!(note_item.body, "笔记正文");
-        let doc_item = context.iter().find(|item| item.id == doc).unwrap();
-        assert_eq!(doc_item.kind, "doc");
-        assert_eq!(doc_item.body, "文档正文");
-        assert!(!ids.contains(unrelated.as_str()));
-        assert!(!ids.contains(reverse.as_str()));
-        assert!(!ids.contains(foreign.as_str()));
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].id, doc);
+        assert_eq!(context[0].kind, "doc");
+        assert_eq!(context[0].title, "设计文档");
+        assert_eq!(context[0].body, "文档正文");
+
+        let meta = task_context_meta(conn, &task.id).unwrap();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].id, doc);
 
         assert!(task_context(conn, "missing-task").is_err());
+    }
+
+    #[test]
+    fn task_agents_roundtrip_and_validation() {
+        let db = open_db();
+        let project_id = project(&db);
+        let conn = db.conn();
+        let task = create_task(conn, new_task(&project_id, criteria())).unwrap();
+
+        // 新任务默认未指派，回退到运行器的全局默认。
+        assert_eq!(task_agents(conn, &task.id).unwrap(), (None, None));
+        assert_eq!(task.developer_adapter, None);
+        assert_eq!(task.reviewer_adapter, None);
+
+        set_task_agents(conn, &task.id, Some("omp"), Some("claude")).unwrap();
+        assert_eq!(
+            task_agents(conn, &task.id).unwrap(),
+            (Some("omp".to_string()), Some("claude".to_string()))
+        );
+        let detail = get_task(conn, &task.id).unwrap();
+        assert_eq!(detail.task.developer_adapter.as_deref(), Some("omp"));
+        assert_eq!(detail.task.reviewer_adapter.as_deref(), Some("claude"));
+        assert_eq!(
+            list_tasks(conn).unwrap()[0].developer_adapter.as_deref(),
+            Some("omp")
+        );
+
+        // 每次写入覆盖两个角色：传入 None 即清除该角色的指派。
+        set_task_agents(conn, &task.id, Some("other"), None).unwrap();
+        assert_eq!(
+            task_agents(conn, &task.id).unwrap(),
+            (Some("other".to_string()), None)
+        );
+
+        // 显式清除恢复默认。
+        set_task_agents(conn, &task.id, None, None).unwrap();
+        assert_eq!(task_agents(conn, &task.id).unwrap(), (None, None));
+
+        // 空 id 不能被写入。
+        assert!(set_task_agents(conn, &task.id, Some("  "), None).is_err());
+        assert!(set_task_agents(conn, &task.id, None, Some("")).is_err());
+        assert!(set_task_agents(conn, "missing-task", Some("omp"), None).is_err());
+        assert!(task_agents(conn, "missing-task").is_err());
+        assert_eq!(task_agents(conn, &task.id).unwrap(), (None, None));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # TASKS
 
-当前里程碑：M5 知识/文档工作空间（已合入 develop）
+当前里程碑：M6 独立笔记库 + 任务级 Agent 分配（已合入 develop）
 
 ## 已完成
 
@@ -86,7 +86,7 @@
 ## M3 冒烟
 
 - 并发 2：gamma / delta 同时 running；delta 先合并，gamma 在合并时 rebase 到新 tip 后成功合并（修复前会 merge_failed）
-- 依赖/并发/串行/环检测由 `cargo test` 覆盖（191 tests）
+- 依赖/并发/串行/环检测由 `cargo test` 覆盖（195 tests）
 
 ## 进行中：M4 GitHub 同步与自动合并
 
@@ -112,3 +112,16 @@
 - [x] 独立审查（1 P1 / 3 P2 / 多个 P3）
 - [x] 修复：中文短词搜索（trigram + LIKE 回退）、缺失仓库不清索引、笔记转任务空验收拒绝、保存/删除竞态、上下文摘要、稳定 doc id、符号链接/大文件保护
 - [x] 合入 develop（PR #23，Issue #22）
+
+## 进行中：M6 笔记库解耦 + 任务级 Agent 分配
+
+- [x] 迁移 v7：vaults / vault_notes / vault_links / notes_fts / 任务适配器字段
+- [x] Vaults 后端：多库、文件夹树、Markdown 文件权威、索引
+- [x] 双链/反链/图谱与 CJK 搜索
+- [x] 笔记与项目解耦；任务上下文仅文档
+- [x] 任务级 developer/reviewer 适配器解析与注册表校验
+- [x] 前端 Vault 空间（树/编辑器/预览/反链/图谱）
+- [x] 开发看板（四阶段）+ Agent 分配
+- [x] 独立审查（1 blocker / 1 major / 3 minor）
+- [x] 修复：上下文仍调用已删除的 list_notes、vault 符号链接逃逸、非原子写入、大小写重命名、混合短词搜索
+- [x] 合入 develop（PR #26，Issue #25）

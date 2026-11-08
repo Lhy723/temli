@@ -1,5 +1,6 @@
 use crate::agent::{
-    AgentAdapter, AgentEvent, Decision, EventSink, RunSpec, RunStatus, SessionHandle,
+    AdapterRegistry, AgentAdapter, AgentEvent, Decision, EventSink, RunSpec, RunStatus,
+    SessionHandle,
 };
 use crate::db::Db;
 use crate::evidence::{self, RiskKind};
@@ -20,7 +21,10 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct RunContext {
     pub db: Arc<Mutex<Db>>,
-    pub adapter: Arc<dyn AgentAdapter>,
+    /// 可用的 agent 适配器；任务级指派与默认值都从这里解析。
+    pub adapters: Arc<AdapterRegistry>,
+    /// 任务未指派开发者时使用的默认适配器 id。
+    pub default_agent: String,
     pub data_dir: PathBuf,
     /// 已启动但尚未结束的任务 id，防止同一任务被并发启动两次。
     pub running: Arc<Mutex<HashSet<String>>>,
@@ -236,6 +240,37 @@ fn describe_checks(checks: &[crate::github::CheckRun]) -> String {
         .join("\n")
 }
 
+/// 一次任务运行解析出的 agent：开发者执行实现，审查者输出裁决。
+struct TaskAgents {
+    developer: Arc<dyn AgentAdapter>,
+    reviewer: Arc<dyn AgentAdapter>,
+}
+
+fn lookup_adapter(ctx: &RunContext, role: &str, id: &str) -> Result<Arc<dyn AgentAdapter>, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(format!("未配置{role}适配器"));
+    }
+    ctx.adapters
+        .get(id)
+        .ok_or_else(|| format!("{role}适配器未注册：{id}"))
+}
+
+/// 任务级指派优先：开发者缺省为默认适配器，审查者缺省沿用开发者。
+fn resolve_task_agents(ctx: &RunContext, task: &TaskRow) -> Result<TaskAgents, String> {
+    let developer_id = task
+        .developer_adapter
+        .as_deref()
+        .unwrap_or(ctx.default_agent.as_str());
+    let developer = lookup_adapter(ctx, "开发者", developer_id)?;
+    let reviewer_id = task.reviewer_adapter.as_deref().unwrap_or(developer_id);
+    let reviewer = lookup_adapter(ctx, "审查者", reviewer_id)?;
+    Ok(TaskAgents {
+        developer,
+        reviewer,
+    })
+}
+
 pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> {
     let _cancel_intent_guard = CancelIntentGuard {
         cancelled: ctx.cancelled.clone(),
@@ -254,9 +289,6 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
             .ok_or_else(|| "项目不存在".to_string())?
     };
 
-    if task.status == TaskStatus::Draft {
-        transition(&ctx.db, task_id, TaskStatus::Ready)?;
-    }
     if !matches!(
         task.status,
         TaskStatus::Draft | TaskStatus::Ready | TaskStatus::Queued
@@ -265,6 +297,14 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
             "任务当前状态不可执行：{:?}（需要 draft / ready / queued）",
             task.status
         ));
+    }
+
+    // 适配器在任何状态迁移 / worktree 创建前解析：未注册的指派只报配置错误，
+    // 不给任务留下半启动的副作用。
+    let agents = resolve_task_agents(ctx, &task)?;
+
+    if task.status == TaskStatus::Draft {
+        transition(&ctx.db, task_id, TaskStatus::Ready)?;
     }
 
     let repo = PathBuf::from(&project.repo_path);
@@ -308,8 +348,8 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
             NewRun {
                 id: Some(run_id.clone()),
                 task_id: task_id.to_string(),
-                adapter_id: ctx.adapter.manifest().id,
-                adapter_version: Some(ctx.adapter.manifest().version),
+                adapter_id: agents.developer.manifest().id,
+                adapter_version: Some(agents.developer.manifest().version),
                 model: None,
                 branch: Some(branch.clone()),
                 worktree_path: Some(worktree.to_string_lossy().into_owned()),
@@ -357,13 +397,13 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
         env_allowlist: Vec::new(),
     };
 
-    let handle = ctx.adapter.start(spec, sink)?;
+    let handle = agents.developer.start(spec, sink)?;
 
     // 取消请求可能落在 start 的握手窗口内：此时会话尚未登记，事件流不会收到取消，
     // 必须在驱动前消费取消意图并主动终止刚启动的会话。
     if cancel_requested(ctx, task_id) {
-        let _ = ctx.adapter.cancel(&handle);
-        let _ = ctx.adapter.close(&handle);
+        let _ = agents.developer.cancel(&handle);
+        let _ = agents.developer.close(&handle);
         let interrupted = transition(&ctx.db, task_id, TaskStatus::Interrupted);
         close_run(ctx, &run_id, "cancelled", Some("cancelled during startup"));
         let _ = gitops::remove_worktree(&repo, &worktree);
@@ -377,24 +417,26 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
         task_id: task_id.to_string(),
     };
     ctx.cancels
-        .register(task_id, ctx.adapter.clone(), handle.clone());
-    let session_saved = lock_db(&ctx.db).and_then(|guard| match ctx.adapter.session_id(&handle) {
-        Some(sid) => store::set_run_session(guard.conn(), &run_id, &sid),
-        None => Ok(()),
-    });
+        .register(task_id, agents.developer.clone(), handle.clone());
+    let session_saved =
+        lock_db(&ctx.db).and_then(|guard| match agents.developer.session_id(&handle) {
+            Some(sid) => store::set_run_session(guard.conn(), &run_id, &sid),
+            None => Ok(()),
+        });
     if let Err(err) = session_saved {
-        let _ = ctx.adapter.close(&handle);
+        let _ = agents.developer.close(&handle);
         return Err(err);
     }
 
     let session = drive_session(
         ctx,
+        &agents.developer,
         &handle,
         &rx,
         &decisions,
         u64::from(max_minutes).saturating_mul(60),
     );
-    let _ = ctx.adapter.close(&handle);
+    let _ = agents.developer.close(&handle);
     // 会话已关闭：立即注销，避免 commit/verify 期间的取消请求命中旧句柄。
     // `_cancel_guard` 仍负责其余提前返回路径。
     ctx.cancels.clear(task_id);
@@ -516,7 +558,7 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
         .collect::<Vec<_>>();
 
     let review = match review_run(
-        ctx,
+        &agents.reviewer,
         &task,
         &worktree,
         &diff.patch,
@@ -623,7 +665,7 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
     let on_default_branch = gitops::current_branch(&repo)
         .map(|name| name == project.default_branch)
         .unwrap_or(false);
-    let approvals_supported = ctx.adapter.manifest().capabilities.approvals;
+    let approvals_supported = agents.developer.manifest().capabilities.approvals;
     let auto_merge = auto_merge_config(ctx, &project);
 
     if verdict == "pass" && ready && !has_high_risk && on_default_branch && approvals_supported {
@@ -1518,6 +1560,7 @@ enum SessionEnd {
 
 fn drive_session(
     ctx: &RunContext,
+    adapter: &Arc<dyn AgentAdapter>,
     handle: &SessionHandle,
     rx: &Receiver<AgentEvent>,
     decisions: &Arc<Mutex<HashMap<String, String>>>,
@@ -1528,8 +1571,8 @@ fn drive_session(
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(AgentEvent::Ended { status }) => return Ok(SessionEnd::Ended(status)),
             Ok(AgentEvent::ApprovalRequest { request_id, .. }) => {
-                if !wait_for_approval(ctx, handle, &request_id, decisions, deadline)? {
-                    let _ = ctx.adapter.cancel(handle);
+                if !wait_for_approval(ctx, adapter, handle, &request_id, decisions, deadline)? {
+                    let _ = adapter.cancel(handle);
                     return Ok(SessionEnd::TimedOut);
                 }
             }
@@ -1538,7 +1581,7 @@ fn drive_session(
             Err(RecvTimeoutError::Disconnected) => return Err("Agent 事件流中断".to_string()),
         }
         if Instant::now() >= deadline {
-            let _ = ctx.adapter.cancel(handle);
+            let _ = adapter.cancel(handle);
             return Ok(SessionEnd::TimedOut);
         }
     }
@@ -1547,6 +1590,7 @@ fn drive_session(
 /// 等待审批决策；返回 `Ok(true)` 表示已答复，`Ok(false)` 表示到达执行时限。
 fn wait_for_approval(
     ctx: &RunContext,
+    adapter: &Arc<dyn AgentAdapter>,
     handle: &SessionHandle,
     request_id: &str,
     decisions: &Arc<Mutex<HashMap<String, String>>>,
@@ -1557,7 +1601,7 @@ fn wait_for_approval(
         .ok()
         .and_then(|map| map.get(request_id).cloned());
     let Some(decision_id) = decision_id else {
-        ctx.adapter.respond(handle, request_id, Decision::Deny)?;
+        adapter.respond(handle, request_id, Decision::Deny)?;
         return Err("审批请求未登记".to_string());
     };
 
@@ -1581,14 +1625,14 @@ fn wait_for_approval(
                     Some(other) => Decision::Select(other.to_string()),
                     None => Decision::Deny,
                 };
-                ctx.adapter.respond(handle, request_id, decision)?;
+                adapter.respond(handle, request_id, decision)?;
                 return Ok(true);
             }
         }
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    let _ = ctx.adapter.respond(handle, request_id, Decision::Deny);
+    let _ = adapter.respond(handle, request_id, Decision::Deny);
     Ok(false)
 }
 
@@ -1692,7 +1736,7 @@ fn criterion_kind(cmd: &str) -> &'static str {
 }
 
 fn review_run(
-    ctx: &RunContext,
+    reviewer: &Arc<dyn AgentAdapter>,
     task: &TaskRow,
     worktree: &Path,
     patch: &str,
@@ -1725,9 +1769,9 @@ fn review_run(
         max_cost_usd: None,
         env_allowlist: Vec::new(),
     };
-    let handle = ctx.adapter.start(spec, sink)?;
-    let collected = drive_reviewer(ctx, &handle, &rx);
-    let _ = ctx.adapter.close(&handle);
+    let handle = reviewer.start(spec, sink)?;
+    let collected = drive_reviewer(reviewer, &handle, &rx);
+    let _ = reviewer.close(&handle);
     let text = collected?;
     prompts::parse_review(&text)
 }
@@ -1735,7 +1779,7 @@ fn review_run(
 /// 只接受 `Ended { status: Completed }` 作为成功终态：其余终态、断流、超时都是失败，
 /// 由调用方转入 needs_human，绝不让未完成的审查被当成通过。
 fn drive_reviewer(
-    ctx: &RunContext,
+    reviewer: &Arc<dyn AgentAdapter>,
     handle: &SessionHandle,
     rx: &Receiver<AgentEvent>,
 ) -> Result<String, String> {
@@ -1745,7 +1789,7 @@ fn drive_reviewer(
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(AgentEvent::TextDelta { text: delta }) => text.push_str(&delta),
             Ok(AgentEvent::ApprovalRequest { request_id, .. }) => {
-                let _ = ctx.adapter.respond(handle, &request_id, Decision::Deny);
+                let _ = reviewer.respond(handle, &request_id, Decision::Deny);
             }
             Ok(AgentEvent::Ended {
                 status: RunStatus::Completed,
@@ -1760,7 +1804,7 @@ fn drive_reviewer(
             }
         }
         if Instant::now() >= deadline {
-            let _ = ctx.adapter.cancel(handle);
+            let _ = reviewer.cancel(handle);
             return Err("审查超时".to_string());
         }
     }
@@ -1775,10 +1819,13 @@ fn close_run(ctx: &RunContext, run_id: &str, status: &str, error: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AgentManifest, AuthState, Capabilities, DetectResult, EventSink};
+    use crate::agent::{
+        AdapterRegistry, AgentManifest, AuthState, Capabilities, DetectResult, EventSink,
+    };
     use crate::github::{CheckRun, PullRequest};
     use crate::store::{Criterion, NewRun, NewTask};
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_manifest(id: &str) -> AgentManifest {
         AgentManifest {
@@ -1843,6 +1890,130 @@ mod tests {
             });
             Ok(SessionHandle {
                 id: "scripted-1".into(),
+            })
+        }
+
+        fn respond(
+            &self,
+            _handle: &SessionHandle,
+            _request_id: &str,
+            _decision: Decision,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn cancel(&self, _handle: &SessionHandle) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// 只执行开发脚本：写 `done.txt`；被要求审查时输出带自身标记的通过裁决。
+    struct DeveloperFake {
+        starts: AtomicUsize,
+        reviewer_starts: AtomicUsize,
+    }
+
+    impl DeveloperFake {
+        fn new() -> Self {
+            Self {
+                starts: AtomicUsize::new(0),
+                reviewer_starts: AtomicUsize::new(0),
+            }
+        }
+
+        fn starts(&self) -> usize {
+            self.starts.load(Ordering::SeqCst)
+        }
+
+        fn reviewer_starts(&self) -> usize {
+            self.reviewer_starts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl AgentAdapter for DeveloperFake {
+        fn manifest(&self) -> AgentManifest {
+            test_manifest("dev-fake")
+        }
+
+        fn detect(&self) -> DetectResult {
+            ok_detect()
+        }
+
+        fn start(&self, spec: RunSpec, sink: EventSink) -> Result<SessionHandle, String> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            if spec.prompt.contains("verdict") {
+                self.reviewer_starts.fetch_add(1, Ordering::SeqCst);
+                sink(AgentEvent::TextDelta {
+                    text: r#"{"verdict":"pass","summary":"reviewed by dev-fake","risk_flags":[],"test_diff":[]}"#
+                        .into(),
+                });
+                sink(AgentEvent::Ended {
+                    status: RunStatus::Completed,
+                });
+                return Ok(SessionHandle {
+                    id: "dev-fake-review-1".into(),
+                });
+            }
+            fs::write(spec.cwd.join("done.txt"), "ok\n").map_err(|e| e.to_string())?;
+            sink(AgentEvent::Ended {
+                status: RunStatus::Completed,
+            });
+            Ok(SessionHandle {
+                id: "dev-fake-1".into(),
+            })
+        }
+
+        fn respond(
+            &self,
+            _handle: &SessionHandle,
+            _request_id: &str,
+            _decision: Decision,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn cancel(&self, _handle: &SessionHandle) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// 只执行审查脚本：输出带自身标记的通过裁决。
+    struct ReviewerFake {
+        starts: AtomicUsize,
+    }
+
+    impl ReviewerFake {
+        fn new() -> Self {
+            Self {
+                starts: AtomicUsize::new(0),
+            }
+        }
+
+        fn starts(&self) -> usize {
+            self.starts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl AgentAdapter for ReviewerFake {
+        fn manifest(&self) -> AgentManifest {
+            test_manifest("review-fake")
+        }
+
+        fn detect(&self) -> DetectResult {
+            ok_detect()
+        }
+
+        fn start(&self, _spec: RunSpec, sink: EventSink) -> Result<SessionHandle, String> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            sink(AgentEvent::TextDelta {
+                text: r#"{"verdict":"pass","summary":"reviewed by review-fake","risk_flags":[],"test_diff":[]}"#
+                    .into(),
+            });
+            sink(AgentEvent::Ended {
+                status: RunStatus::Completed,
+            });
+            Ok(SessionHandle {
+                id: "review-fake-1".into(),
             })
         }
 
@@ -2311,6 +2482,16 @@ mod tests {
         ops: Option<Arc<dyn crate::github::GitHubOps>>,
         auto_merge: bool,
     ) -> (RunContext, String) {
+        setup_agents(cmd, |repo| vec![adapter(repo)], ops, auto_merge)
+    }
+
+    /// 注册多个适配器的夹具；第一个适配器同时作为默认值。
+    fn setup_agents(
+        cmd: &str,
+        adapters: impl FnOnce(&Path) -> Vec<Arc<dyn AgentAdapter>>,
+        ops: Option<Arc<dyn crate::github::GitHubOps>>,
+        auto_merge: bool,
+    ) -> (RunContext, String) {
         let repo = init_repo();
         if auto_merge {
             let remote = repo.with_extension("remote.git");
@@ -2356,9 +2537,19 @@ mod tests {
             },
         )
         .unwrap();
+        let built = adapters(&repo);
+        let default_agent = built
+            .first()
+            .map(|adapter| adapter.manifest().id)
+            .expect("至少提供一个适配器");
+        let mut registry = AdapterRegistry::new();
+        for adapter in built {
+            registry.register(adapter);
+        }
         let ctx = RunContext {
             db: Arc::new(Mutex::new(db)),
-            adapter: adapter(&repo),
+            adapters: Arc::new(registry),
+            default_agent,
             data_dir: db_dir.join("data"),
             running: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cancels: CancelRegistry::new(),
@@ -2929,7 +3120,7 @@ mod tests {
     #[test]
     fn cancel_during_handshake_interrupts_without_evidence() {
         let (ctx, task_id) = setup("true");
-        // 模拟取消请求落在 adapter.start 握手窗口内：会话尚未登记。
+        // 模拟取消请求落在开发者适配器 start 的握手窗口内：会话尚未登记。
         ctx.cancelled.lock().unwrap().insert(task_id.clone());
 
         run_task_blocking(&ctx, &task_id).unwrap();
@@ -3395,7 +3586,113 @@ mod tests {
     }
 
     #[test]
-    fn worker_prompt_injects_linked_note_body() {
+    fn assigned_developer_and_reviewer_run_their_own_sessions() {
+        let developer = Arc::new(DeveloperFake::new());
+        let reviewer = Arc::new(ReviewerFake::new());
+        let dev_agent: Arc<dyn AgentAdapter> = developer.clone();
+        let rev_agent: Arc<dyn AgentAdapter> = reviewer.clone();
+        let default_agent: Arc<dyn AgentAdapter> = Arc::new(ScriptedAdapter);
+        let (ctx, task_id) = setup_agents(
+            "test -f done.txt",
+            move |_| vec![default_agent, dev_agent, rev_agent],
+            None,
+            false,
+        );
+        {
+            let guard = ctx.db.lock().unwrap();
+            store::set_task_agents(
+                guard.conn(),
+                &task_id,
+                Some("dev-fake"),
+                Some("review-fake"),
+            )
+            .unwrap();
+        }
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(developer.starts(), 1, "开发者适配器执行实现");
+        assert_eq!(reviewer.starts(), 1, "审查必须交给任务指定的审查者");
+        let detail = {
+            let guard = ctx.db.lock().unwrap();
+            store::get_task(guard.conn(), &task_id).unwrap()
+        };
+        assert_eq!(detail.task.status, TaskStatus::Merged);
+        let review = detail.review.expect("review");
+        assert_eq!(review.verdict, "pass");
+        assert_eq!(
+            review.summary.as_deref(),
+            Some("reviewed by review-fake"),
+            "裁决必须来自指定的审查适配器"
+        );
+        let run = detail.runs.last().expect("run");
+        assert_eq!(run.adapter_id, "dev-fake", "运行记录归属开发者适配器");
+    }
+
+    #[test]
+    fn reviewer_falls_back_to_the_assigned_developer() {
+        let developer = Arc::new(DeveloperFake::new());
+        let dev_agent: Arc<dyn AgentAdapter> = developer.clone();
+        let default_agent: Arc<dyn AgentAdapter> = Arc::new(ScriptedAdapter);
+        let (ctx, task_id) = setup_agents(
+            "test -f done.txt",
+            move |_| vec![default_agent, dev_agent],
+            None,
+            false,
+        );
+        {
+            let guard = ctx.db.lock().unwrap();
+            store::set_task_agents(guard.conn(), &task_id, Some("dev-fake"), None).unwrap();
+        }
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(developer.starts(), 2, "实现与审查都使用该开发者适配器");
+        assert_eq!(developer.reviewer_starts(), 1);
+        let detail = {
+            let guard = ctx.db.lock().unwrap();
+            store::get_task(guard.conn(), &task_id).unwrap()
+        };
+        assert_eq!(detail.task.status, TaskStatus::Merged);
+        let review = detail.review.expect("review");
+        assert_eq!(review.summary.as_deref(), Some("reviewed by dev-fake"));
+    }
+
+    #[test]
+    fn unregistered_assigned_adapter_is_rejected_without_side_effects() {
+        let developer = Arc::new(DeveloperFake::new());
+        let dev_agent: Arc<dyn AgentAdapter> = developer.clone();
+        let (ctx, task_id) =
+            setup_agents("test -f done.txt", move |_| vec![dev_agent], None, false);
+
+        {
+            let guard = ctx.db.lock().unwrap();
+            store::set_task_agents(guard.conn(), &task_id, Some("ghost"), None).unwrap();
+        }
+        let err = run_task_blocking(&ctx, &task_id).unwrap_err();
+        assert!(err.contains("未注册") && err.contains("ghost"), "{err}");
+
+        {
+            let guard = ctx.db.lock().unwrap();
+            store::set_task_agents(guard.conn(), &task_id, None, Some("ghost-review")).unwrap();
+        }
+        let err = run_task_blocking(&ctx, &task_id).unwrap_err();
+        assert!(
+            err.contains("审查者") && err.contains("ghost-review"),
+            "{err}"
+        );
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Draft);
+        let run_count = {
+            let guard = ctx.db.lock().unwrap();
+            store::get_task(guard.conn(), &task_id).unwrap().runs.len()
+        };
+        assert_eq!(run_count, 0, "配置错误不能留下运行记录");
+        assert_eq!(developer.starts(), 0, "未注册的指派不能落到默认适配器");
+    }
+
+    #[test]
+    fn worker_prompt_injects_linked_doc_and_skips_notes() {
         let (ctx, task_id) = setup("test -f done.txt");
         let guard = ctx.db.lock().unwrap();
         let conn = guard.conn();
@@ -3403,20 +3700,29 @@ mod tests {
         let prompt_without_context = worker_prompt(conn, &task);
         assert!(!prompt_without_context.contains("## 项目上下文"));
 
+        let doc_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO items (id, project_id, kind, title, body)
+             VALUES (?1, ?2, 'doc', ?3, ?4)",
+            rusqlite::params![doc_id, task.project_id, "设计文档", "关联文档的正文"],
+        )
+        .unwrap();
         let note_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO items (id, project_id, kind, title, body)
              VALUES (?1, ?2, 'note', ?3, ?4)",
-            rusqlite::params![note_id, task.project_id, "架构笔记", "链接笔记的正文"],
+            rusqlite::params![note_id, task.project_id, "架构笔记", "笔记不应注入"],
         )
         .unwrap();
         let task_item = store::task_item_id(conn, &task.id).unwrap();
+        store::link_item(conn, &task_item, &doc_id, "relates").unwrap();
         store::link_item(conn, &task_item, &note_id, "relates").unwrap();
 
         let prompt = worker_prompt(conn, &task);
         assert_eq!(
             prompt,
-            format!("{prompt_without_context}\n\n## 项目上下文\n\n### 架构笔记\n链接笔记的正文")
+            format!("{prompt_without_context}\n\n## 项目上下文\n\n### 设计文档\n关联文档的正文")
         );
+        assert!(!prompt.contains("笔记不应注入"));
     }
 }
