@@ -14,7 +14,7 @@
 
 文件用 frontmatter `id` 标识而不是路径，重命名不断链；路径仅作索引字段。
 
-项目注册时必须校验 `.temli/` 已被忽略（`git check-ignore -q .temli`）；未忽略则阻止完成注册，并提示一键追加到 `.gitignore`。temli 自身仓库的根 `.gitignore` 同样包含 `.temli/`。
+项目注册时必须校验 `.temli/` 已被忽略（`git check-ignore -q .temli/`）；未忽略则阻止完成注册，并提示一键追加到 `.gitignore`。temli 自身仓库的根 `.gitignore` 同样包含 `.temli/`。
 
 ## 2. 实体
 
