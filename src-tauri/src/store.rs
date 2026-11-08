@@ -124,6 +124,25 @@ pub struct ProjectIssue {
     pub task_id: Option<String>,
 }
 
+/// 任务上下文里的一条关联条目（笔记 / 文档 / issue）。
+///
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextMeta {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+}
+
+/// `body` 来自 `items.body`：笔记与文档在保存/扫描时同步正文缓存，任务派发时
+/// 只读这份缓存，不接触文件系统。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextItem {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRow {
     pub id: String,
@@ -499,6 +518,128 @@ fn query_related_tasks(
     let mut stmt = conn.prepare(sql).map_err(db_err)?;
     let rows = stmt
         .query_map(params![item_id], read_task_summary)
+        .map_err(db_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+}
+
+// ---------------------------------------------------------------------------
+// 知识上下文
+// ---------------------------------------------------------------------------
+
+/// `links.rel` 的合法取值，与数据库 CHECK 约束保持一致。
+const LINK_RELS: &[&str] = &["derived_from", "implements", "blocks", "relates"];
+
+fn item_project(conn: &Connection, item_id: &str) -> Result<String, String> {
+    conn.query_row(
+        "SELECT project_id FROM items WHERE id = ?1",
+        params![item_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)?
+    .ok_or_else(|| format!("条目不存在：{item_id}"))
+}
+
+/// 建立条目链接（`derived_from` / `implements` / `blocks` / `relates`）。
+///
+/// 只允许同一项目内的条目互相链接；重复链接按幂等处理。任务依赖边请走
+/// [`add_dependency`]，那里还会做环检测。
+pub fn link_item(
+    conn: &Connection,
+    from_item: &str,
+    to_item: &str,
+    rel: &str,
+) -> Result<(), String> {
+    if !LINK_RELS.contains(&rel) {
+        return Err(format!("未知链接类型：{rel}"));
+    }
+
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    let from_project = item_project(&tx, from_item)?;
+    let to_project = item_project(&tx, to_item)?;
+    if from_project != to_project {
+        return Err("链接只能建立在同一项目的条目之间".to_string());
+    }
+    tx.execute(
+        "INSERT INTO links (id, from_item, to_item, rel)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (from_item, to_item, rel) DO NOTHING",
+        params![Uuid::new_v4().to_string(), from_item, to_item, rel],
+    )
+    .map_err(db_err)?;
+    tx.commit().map_err(db_err)
+}
+
+/// 删除条目链接；边不存在时视为已经删除（幂等）。
+pub fn unlink_item(
+    conn: &Connection,
+    from_item: &str,
+    to_item: &str,
+    rel: &str,
+) -> Result<(), String> {
+    if !LINK_RELS.contains(&rel) {
+        return Err(format!("未知链接类型：{rel}"));
+    }
+    conn.execute(
+        "DELETE FROM links
+         WHERE from_item = ?1 AND to_item = ?2 AND rel = ?3",
+        params![from_item, to_item, rel],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// 任务条目通过 `links(rel='relates')` 关联的知识条目，按创建时间稳定排序。
+///
+/// 只读取数据库缓存正文，并且只返回与任务同项目的条目；派发任务时由
+/// orchestrator 截断后注入 prompt。
+pub fn task_context_meta(conn: &Connection, task_id: &str) -> Result<Vec<ContextMeta>, String> {
+    let item_id = task_item_id(conn, task_id)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT i.id, i.kind, i.title
+             FROM links l
+             JOIN items i ON i.id = l.to_item
+             JOIN items task_item ON task_item.id = l.from_item
+             WHERE l.from_item = ?1 AND l.rel = 'relates'
+               AND i.project_id = task_item.project_id
+             ORDER BY i.created_at ASC, i.id ASC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![item_id], |row| {
+            Ok(ContextMeta {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                title: row.get(2)?,
+            })
+        })
+        .map_err(db_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+}
+
+pub fn task_context(conn: &Connection, task_id: &str) -> Result<Vec<ContextItem>, String> {
+    let item_id = task_item_id(conn, task_id)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT i.id, i.kind, i.title, i.body
+             FROM links l
+             JOIN items i ON i.id = l.to_item
+             JOIN items task_item ON task_item.id = l.from_item
+             WHERE l.from_item = ?1 AND l.rel = 'relates'
+               AND i.project_id = task_item.project_id
+             ORDER BY i.created_at ASC, i.id ASC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![item_id], |row| {
+            Ok(ContextItem {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                title: row.get(2)?,
+                body: row.get(3)?,
+            })
+        })
         .map_err(db_err)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
 }
@@ -1651,6 +1792,23 @@ mod tests {
         task
     }
 
+    fn insert_item(
+        conn: &Connection,
+        project_id: &str,
+        kind: &str,
+        title: &str,
+        body: &str,
+    ) -> String {
+        let id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO items (id, project_id, kind, title, body)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, project_id, kind, title, body],
+        )
+        .unwrap();
+        id
+    }
+
     fn merge_task(conn: &Connection, task_id: &str) {
         transition(conn, task_id, TaskStatus::Running).unwrap();
         transition(conn, task_id, TaskStatus::Verifying).unwrap();
@@ -2629,6 +2787,100 @@ mod tests {
 
         // 重复删除是幂等的。
         remove_dependency(conn, &dependent.id, &blocker.id).unwrap();
+    }
+
+    #[test]
+    fn link_and_unlink_roundtrip() {
+        let db = open_db();
+        let project_id = project(&db);
+        let conn = db.conn();
+        let task = create_task(conn, new_task(&project_id, criteria())).unwrap();
+        let task_item = task_item_id(conn, &task.id).unwrap();
+        let note = insert_item(conn, &project_id, "note", "设计笔记", "正文");
+
+        link_item(conn, &task_item, &note, "relates").unwrap();
+        // 同一条边重复写入是幂等的。
+        link_item(conn, &task_item, &note, "relates").unwrap();
+        let edge_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE from_item = ?1 AND to_item = ?2",
+                params![task_item, note],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_count, 1);
+
+        let err = link_item(conn, &task_item, &note, "unknown").unwrap_err();
+        assert!(err.contains("链接类型"), "{err}");
+
+        unlink_item(conn, &task_item, &note, "relates").unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM links", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+
+        // 重复删除同样是幂等的。
+        unlink_item(conn, &task_item, &note, "relates").unwrap();
+    }
+
+    #[test]
+    fn link_rejects_cross_project_and_missing_items() {
+        let db = open_db();
+        let project_id = project(&db);
+        let other_project_id = project(&db);
+        let conn = db.conn();
+        let task = create_task(conn, new_task(&project_id, criteria())).unwrap();
+        let task_item = task_item_id(conn, &task.id).unwrap();
+        let foreign = insert_item(conn, &other_project_id, "doc", "外部文档", "正文");
+
+        let err = link_item(conn, &task_item, &foreign, "relates").unwrap_err();
+        assert!(err.contains("同一项目"), "{err}");
+        assert!(link_item(conn, &task_item, "missing-item", "relates").is_err());
+        assert!(link_item(conn, "missing-item", &foreign, "relates").is_err());
+
+        let edge_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM links", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(edge_count, 0);
+    }
+
+    #[test]
+    fn task_context_returns_only_linked_items_with_bodies() {
+        let db = open_db();
+        let project_id = project(&db);
+        let other_project_id = project(&db);
+        let conn = db.conn();
+        let task = create_task(conn, new_task(&project_id, criteria())).unwrap();
+        let task_item = task_item_id(conn, &task.id).unwrap();
+
+        let note = insert_item(conn, &project_id, "note", "架构笔记", "笔记正文");
+        let doc = insert_item(conn, &project_id, "doc", "设计文档", "文档正文");
+        let unrelated = insert_item(conn, &project_id, "note", "无关笔记", "不应出现");
+        let reverse = insert_item(conn, &project_id, "note", "反向笔记", "不应出现");
+        let foreign = insert_item(conn, &other_project_id, "note", "外部笔记", "不应出现");
+
+        link_item(conn, &task_item, &note, "relates").unwrap();
+        link_item(conn, &task_item, &doc, "relates").unwrap();
+        // 其他关系类型、反向边和外部项目都不进入上下文。
+        link_item(conn, &task_item, &unrelated, "derived_from").unwrap();
+        link_item(conn, &reverse, &task_item, "relates").unwrap();
+
+        let context = task_context(conn, &task.id).unwrap();
+        assert_eq!(context.len(), 2);
+        let ids: HashSet<&str> = context.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, HashSet::from([note.as_str(), doc.as_str()]));
+        let note_item = context.iter().find(|item| item.id == note).unwrap();
+        assert_eq!(note_item.kind, "note");
+        assert_eq!(note_item.title, "架构笔记");
+        assert_eq!(note_item.body, "笔记正文");
+        let doc_item = context.iter().find(|item| item.id == doc).unwrap();
+        assert_eq!(doc_item.kind, "doc");
+        assert_eq!(doc_item.body, "文档正文");
+        assert!(!ids.contains(unrelated.as_str()));
+        assert!(!ids.contains(reverse.as_str()));
+        assert!(!ids.contains(foreign.as_str()));
+
+        assert!(task_context(conn, "missing-task").is_err());
     }
 
     #[test]

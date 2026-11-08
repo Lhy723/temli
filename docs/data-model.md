@@ -14,6 +14,14 @@
 
 文件用 frontmatter `id` 标识而不是路径，重命名不断链；路径仅作索引字段。
 
+知识空间约定：
+
+- 笔记：`.temli/notes/<uuid>.md`，frontmatter 含 `id/title/updated_at`，正文为 Markdown；DB 缓存正文用于检索，文件是权威
+- 文档：仓库 `docs/**/*.md`，只读索引；id 由相对路径稳定哈希得到，标题取首个 `# ` 或文件名
+- 检索：`search_fts(entity_id, project_id, kind, title, body)`，笔记保存、文档扫描时同步索引
+- 上下文：任务条目通过 `links.rel='relates'` 关联笔记/文档；派发任务时把标题+正文（单项 4k、整体 12k 字符上限）注入 prompt
+- 笔记转任务：创建任务后写入 `links.rel='derived_from'`（from=笔记，to=任务）
+
 项目注册时必须校验 `.temli/` 已被忽略（`git check-ignore -q .temli/`）；未忽略则阻止完成注册，并提示一键追加到 `.gitignore`。temli 自身仓库的根 `.gitignore` 同样包含 `.temli/`。
 
 ## 2. 实体

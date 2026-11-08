@@ -245,6 +245,42 @@ impl Db {
             tx.commit().map_err(|e| e.to_string())?;
         }
 
+        if current < 5 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+                    entity_id UNINDEXED,
+                    project_id UNINDEXED,
+                    kind UNINDEXED,
+                    title,
+                    body
+                );",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (5)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
+        if current < 6 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS search_fts;
+                 CREATE VIRTUAL TABLE search_fts USING fts5(
+                    entity_id UNINDEXED,
+                    project_id UNINDEXED,
+                    kind UNINDEXED,
+                    title,
+                    body,
+                    tokenize='trigram'
+                 );",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (6)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
         Ok(())
     }
 

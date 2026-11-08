@@ -8,7 +8,7 @@ use crate::prompts;
 use crate::store::{
     self, NewDecision, NewEvent, NewEvidence, NewReview, NewRun, TaskRow, TaskStatus,
 };
-use rusqlite::params;
+use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -343,10 +343,14 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
     );
 
     let max_minutes = task_max_minutes(ctx, task_id);
+    let prompt = {
+        let guard = lock_db(&ctx.db)?;
+        worker_prompt(guard.conn(), &task)
+    };
     let spec = RunSpec {
         run_id: run_id.clone(),
         cwd: worktree.clone(),
-        prompt: worker_prompt(&task),
+        prompt,
         model: None,
         max_minutes: u64::from(max_minutes),
         max_cost_usd: None,
@@ -1389,11 +1393,54 @@ fn auto_merge_pull_request(
     Ok(pr)
 }
 
-fn worker_prompt(task: &TaskRow) -> String {
-    format!(
+/// 上下文中单项正文的最大字符数。
+const CONTEXT_ITEM_CHARS: usize = 4_000;
+/// 整个上下文段（含标题）的最大字符数。
+const CONTEXT_SECTION_CHARS: usize = 12_000;
+
+/// 把任务关联的知识条目渲染成 `## 项目上下文` 段。
+///
+/// 单项正文截断到 [`CONTEXT_ITEM_CHARS`]，整段截断到
+/// [`CONTEXT_SECTION_CHARS`]；条目顺序即注入顺序。没有条目时返回空串，
+/// 调用方据此保持原始 prompt 不变。
+fn render_context(items: &[store::ContextItem]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+
+    let mut section = String::from("## 项目上下文");
+    let mut used = section.chars().count();
+    for item in items {
+        let body: String = item.body.chars().take(CONTEXT_ITEM_CHARS).collect();
+        let entry = format!("\n\n### {}\n{}", item.title, body);
+        let entry_chars = entry.chars().count();
+        let remaining = CONTEXT_SECTION_CHARS.saturating_sub(used);
+        if remaining == 0 {
+            break;
+        }
+        if entry_chars > remaining {
+            section.extend(entry.chars().take(remaining));
+            break;
+        }
+        used += entry_chars;
+        section.push_str(&entry);
+    }
+    section
+}
+
+fn worker_prompt(conn: &Connection, task: &TaskRow) -> String {
+    let mut prompt = format!(
         "你在隔离的 git worktree 中开发。\n\n任务：{}\n\n{}\n\n要求：\n- 只修改完成任务所需的文件，不要触碰 .temli/。\n- 完成后运行仓库既有测试。\n- 不要执行 force push、删除仓库或修改 CI 密钥等破坏性操作。\n- 保持改动可审查、可回滚。",
         task.title, task.prompt
-    )
+    );
+    // 上下文是增强信息：读取失败不应阻止任务派发。
+    let context = store::task_context(conn, &task.id).unwrap_or_default();
+    let section = render_context(&context);
+    if !section.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&section);
+    }
+    prompt
 }
 
 fn event_sink(
@@ -3302,5 +3349,74 @@ mod tests {
         assert!(ops.merged.lock().unwrap().is_empty());
         assert_ne!(gitops::head_sha(&repo).unwrap(), before);
         assert_eq!(run_pr_fields(&ctx, &task_id), (None, None, None));
+    }
+
+    fn context_item(title: &str, body: &str) -> store::ContextItem {
+        store::ContextItem {
+            id: title.to_string(),
+            kind: "note".into(),
+            title: title.to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn render_context_is_empty_without_items() {
+        assert_eq!(render_context(&[]), "");
+    }
+
+    #[test]
+    fn render_context_truncates_item_bodies_and_section() {
+        let long_body = "长".repeat(CONTEXT_ITEM_CHARS + 1_000);
+        let rendered = render_context(&[context_item("长笔记", &long_body)]);
+        let (_, body) = rendered.split_once("### 长笔记\n").expect("标题与正文");
+        assert_eq!(body.chars().count(), CONTEXT_ITEM_CHARS);
+        assert!(rendered.chars().count() <= CONTEXT_SECTION_CHARS);
+
+        // 多个超长条目也不能让整段超过 12k 字符。
+        let items: Vec<_> = (0..5)
+            .map(|index| context_item(&format!("笔记{index}"), &"x".repeat(CONTEXT_ITEM_CHARS + 1)))
+            .collect();
+        let rendered = render_context(&items);
+        assert!(rendered.chars().count() <= CONTEXT_SECTION_CHARS);
+        assert!(rendered.chars().count() > CONTEXT_ITEM_CHARS);
+    }
+
+    #[test]
+    fn render_context_preserves_item_order() {
+        let rendered = render_context(&[
+            context_item("第一条", "正文一"),
+            context_item("第二条", "正文二"),
+        ]);
+        let first = rendered.find("第一条").expect("第一条");
+        let second = rendered.find("第二条").expect("第二条");
+        assert!(first < second);
+        assert!(rendered.starts_with("## 项目上下文\n\n### 第一条\n正文一"));
+    }
+
+    #[test]
+    fn worker_prompt_injects_linked_note_body() {
+        let (ctx, task_id) = setup("test -f done.txt");
+        let guard = ctx.db.lock().unwrap();
+        let conn = guard.conn();
+        let task = store::get_task(conn, &task_id).unwrap().task;
+        let prompt_without_context = worker_prompt(conn, &task);
+        assert!(!prompt_without_context.contains("## 项目上下文"));
+
+        let note_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO items (id, project_id, kind, title, body)
+             VALUES (?1, ?2, 'note', ?3, ?4)",
+            rusqlite::params![note_id, task.project_id, "架构笔记", "链接笔记的正文"],
+        )
+        .unwrap();
+        let task_item = store::task_item_id(conn, &task.id).unwrap();
+        store::link_item(conn, &task_item, &note_id, "relates").unwrap();
+
+        let prompt = worker_prompt(conn, &task);
+        assert_eq!(
+            prompt,
+            format!("{prompt_without_context}\n\n## 项目上下文\n\n### 架构笔记\n链接笔记的正文")
+        );
     }
 }

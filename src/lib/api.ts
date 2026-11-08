@@ -133,6 +133,69 @@ export type SetRequireChecksInput = {
   enabled: boolean;
 };
 
+export type NoteMeta = {
+  id: string;
+  title: string;
+  file_path: string;
+  updated_at: string;
+};
+
+export type Note = {
+  id: string;
+  title: string;
+  body: string;
+  file_path: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DocMeta = {
+  id: string;
+  title: string;
+  path: string;
+};
+
+export type Doc = DocMeta & {
+  body: string;
+};
+
+export type SearchHit = {
+  id: string;
+  kind: string;
+  title: string;
+  snippet: string;
+};
+
+export type ContextItem = {
+  id: string;
+  kind: string;
+  title: string;
+  body?: string;
+};
+
+export type CreateNoteInput = {
+  project_id: string;
+  title: string;
+  body: string;
+};
+
+export type UpdateNoteInput = {
+  id: string;
+  title: string;
+  body: string;
+};
+
+export type CreateTaskFromNoteInput = {
+  note_id: string;
+  title?: string;
+  prompt?: string;
+};
+
+export type LinkContextInput = {
+  task_id: string;
+  item_id: string;
+};
+
 export function listTasks(projectId: string): Promise<TaskSummary[]> {
   return invoke<TaskSummary[]>("list_tasks", { projectId });
 }
@@ -220,6 +283,63 @@ export function getRequireChecks(projectId: string): Promise<boolean> {
 
 export function setRequireChecks(input: SetRequireChecksInput): Promise<void> {
   return invoke<void>("set_require_checks", { input });
+}
+
+export function listNotes(projectId: string): Promise<NoteMeta[]> {
+  return invoke<NoteMeta[]>("list_notes", { projectId });
+}
+
+export function getNote(noteId: string): Promise<Note> {
+  return invoke<Note>("get_note", { noteId });
+}
+
+export function createNote(input: CreateNoteInput): Promise<Note> {
+  return invoke<Note>("create_note", { input });
+}
+
+export function updateNote(input: UpdateNoteInput): Promise<Note> {
+  return invoke<Note>("update_note", { input });
+}
+
+export function deleteNote(noteId: string): Promise<void> {
+  return invoke<void>("delete_note", { noteId });
+}
+
+export function listDocs(projectId: string): Promise<DocMeta[]> {
+  return invoke<DocMeta[]>("list_docs", { projectId });
+}
+
+export function getDoc(docId: string): Promise<Doc> {
+  return invoke<Doc>("get_doc", { docId });
+}
+
+export function reindexWorkspace(projectId: string): Promise<number> {
+  return invoke<number>("reindex_workspace", { projectId });
+}
+
+export function searchWorkspace(
+  projectId: string,
+  query: string,
+): Promise<SearchHit[]> {
+  return invoke<SearchHit[]>("search_workspace", { projectId, query });
+}
+
+export function createTaskFromNote(
+  input: CreateTaskFromNoteInput,
+): Promise<TaskDetail> {
+  return invoke<TaskDetail>("create_task_from_note", { input });
+}
+
+export function linkContext(input: LinkContextInput): Promise<void> {
+  return invoke<void>("link_context", { input });
+}
+
+export function unlinkContext(input: LinkContextInput): Promise<void> {
+  return invoke<void>("unlink_context", { input });
+}
+
+export function listContext(taskId: string): Promise<ContextItem[]> {
+  return invoke<ContextItem[]>("list_context", { taskId });
 }
 
 const STATUS_LABELS: Record<string, string> = {
