@@ -17,6 +17,7 @@ import {
   CircleStop,
   Clock,
   ExternalLink,
+  FileText,
   GitBranch,
   GitPullRequest,
   Inbox,
@@ -44,10 +45,15 @@ import {
   getProjectIssues,
   getRequireChecks,
   getTask,
+  linkContext,
+  listContext,
   listDependencies,
+  listDocs,
   listEvents,
+  listNotes,
   listTasks,
   publishTask,
+  reindexWorkspace,
   removeDependency,
   resolveDecision,
   setAutoMerge,
@@ -58,13 +64,21 @@ import {
   statusTone,
   syncNow,
   textList,
+  unlinkContext,
   verdictLabel,
+  type ContextItem,
   type EventRow,
   type ProjectIssue,
   type TaskDependencies,
   type TaskDetail,
   type TaskSummary,
 } from "../lib/api";
+
+type ContextOption = {
+  id: string;
+  kind: "note" | "doc";
+  title: string;
+};
 
 const POLL_INTERVAL_MS = 2000;
 // start_task 在后台线程推进，queued 也可能由队列 worker 取走；继续轮询才能看到状态推进。
@@ -102,6 +116,17 @@ export function TasksPanel({ projectId }: { projectId: string }) {
   const [removingDependencyId, setRemovingDependencyId] = useState<
     string | null
   >(null);
+  const [contextItems, setContextItems] = useState<ContextItem[] | null>(null);
+  const [contextError, setContextError] = useState<string | null>(null);
+  const [linkingContext, setLinkingContext] = useState(false);
+  const [removingContextId, setRemovingContextId] = useState<string | null>(
+    null,
+  );
+  const [contextOptions, setContextOptions] = useState<ContextOption[]>([]);
+  const [contextOptionsLoading, setContextOptionsLoading] = useState(true);
+  const [contextOptionsError, setContextOptionsError] = useState<string | null>(
+    null,
+  );
   const [concurrency, setConcurrency] = useState<number | null>(null);
   const [concurrencyInput, setConcurrencyInput] = useState("");
   const [concurrencySaving, setConcurrencySaving] = useState(false);
@@ -143,6 +168,13 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setDependencyError(null);
     setAddingDependency(false);
     setRemovingDependencyId(null);
+    setContextItems(null);
+    setContextError(null);
+    setLinkingContext(false);
+    setRemovingContextId(null);
+    setContextOptions([]);
+    setContextOptionsLoading(true);
+    setContextOptionsError(null);
     setIssues([]);
     setIssuesLoading(true);
     setIssuesError(null);
@@ -158,6 +190,43 @@ export function TasksPanel({ projectId }: { projectId: string }) {
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setContextOptions([]);
+    setContextOptionsLoading(true);
+    setContextOptionsError(null);
+    Promise.all([
+      listNotes(projectId),
+      reindexWorkspace(projectId)
+        .catch(() => null)
+        .then(() => listDocs(projectId)),
+    ])
+      .then(([notes, docs]) => {
+        if (cancelled) return;
+        setContextOptions([
+          ...notes.map((note) => ({
+            id: note.id,
+            kind: "note" as const,
+            title: note.title,
+          })),
+          ...docs.map((doc) => ({
+            id: doc.id,
+            kind: "doc" as const,
+            title: doc.title,
+          })),
+        ]);
+      })
+      .catch((e) => {
+        if (!cancelled) setContextOptionsError(errorText(e));
+      })
+      .finally(() => {
+        if (!cancelled) setContextOptionsLoading(false);
       });
     return () => {
       cancelled = true;
@@ -337,14 +406,20 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     const request = ++detailRequestRef.current;
     try {
       let dependencyFailure: string | null = null;
-      const [nextDetail, nextEvents, nextDependencies] = await Promise.all([
-        getTask(taskId),
-        listEvents(taskId).catch(() => null),
-        listDependencies(taskId).catch((e) => {
-          dependencyFailure = errorText(e);
-          return null;
-        }),
-      ]);
+      let contextFailure: string | null = null;
+      const [nextDetail, nextEvents, nextDependencies, nextContext] =
+        await Promise.all([
+          getTask(taskId),
+          listEvents(taskId).catch(() => null),
+          listDependencies(taskId).catch((e) => {
+            dependencyFailure = errorText(e);
+            return null;
+          }),
+          listContext(taskId).catch((e) => {
+            contextFailure = errorText(e);
+            return null;
+          }),
+        ]);
       if (
         selectedRef.current !== taskId ||
         request !== detailRequestRef.current
@@ -355,6 +430,8 @@ export function TasksPanel({ projectId }: { projectId: string }) {
       setEvents(nextEvents ?? nextDetail.events);
       if (nextDependencies) setDependencies(nextDependencies);
       setDependencyError(dependencyFailure);
+      if (nextContext) setContextItems(nextContext);
+      setContextError(contextFailure);
       if (!silent) setError(null);
     } catch (e) {
       if (
@@ -375,6 +452,10 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setEvents([]);
     setDependencies(null);
     setDependencyError(null);
+    setContextItems(null);
+    setContextError(null);
+    setLinkingContext(false);
+    setRemovingContextId(null);
     setCancelError(null);
     setGithubError(null);
     void loadDetail(taskId, false);
@@ -387,6 +468,10 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setEvents([]);
     setDependencies(null);
     setDependencyError(null);
+    setContextItems(null);
+    setContextError(null);
+    setLinkingContext(false);
+    setRemovingContextId(null);
     setDetailLoading(false);
     setCancelError(null);
     setGithubError(null);
@@ -402,6 +487,10 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setEvents(created.events);
     setDependencies({ blockers: [], blocks: [] });
     setDependencyError(null);
+    setContextItems([]);
+    setContextError(null);
+    setLinkingContext(false);
+    setRemovingContextId(null);
     try {
       await Promise.all([refreshTasks(), refreshIssues()]);
     } catch (e) {
@@ -504,6 +593,55 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setRemovingDependencyId(null);
   }
 
+  async function linkSelectedContext(itemId: string): Promise<boolean> {
+    const taskId = selectedRef.current;
+    if (!taskId) return false;
+    setLinkingContext(true);
+    setContextError(null);
+    let failure: string | null = null;
+    try {
+      await linkContext({ task_id: taskId, item_id: itemId });
+    } catch (e) {
+      failure = errorText(e);
+    }
+    try {
+      if (selectedRef.current === taskId) {
+        await loadDetail(taskId, true);
+      }
+    } catch (e) {
+      setError(errorText(e));
+    }
+    if (failure && selectedRef.current === taskId) {
+      setContextError(failure);
+    }
+    setLinkingContext(false);
+    return failure === null;
+  }
+
+  async function unlinkSelectedContext(itemId: string) {
+    const taskId = selectedRef.current;
+    if (!taskId) return;
+    setRemovingContextId(itemId);
+    setContextError(null);
+    let failure: string | null = null;
+    try {
+      await unlinkContext({ task_id: taskId, item_id: itemId });
+    } catch (e) {
+      failure = errorText(e);
+    }
+    try {
+      if (selectedRef.current === taskId) {
+        await loadDetail(taskId, true);
+      }
+    } catch (e) {
+      setError(errorText(e));
+    }
+    if (failure && selectedRef.current === taskId) {
+      setContextError(failure);
+    }
+    setRemovingContextId(null);
+  }
+
   async function saveConcurrency() {
     const limit = Number(concurrencyInput);
     if (!Number.isInteger(limit) || limit < 1 || limit > 16) {
@@ -566,11 +704,13 @@ export function TasksPanel({ projectId }: { projectId: string }) {
         const taskId = selectedRef.current;
         if (taskId) {
           const request = ++detailRequestRef.current;
-          const [nextDetail, nextEvents, nextDependencies] = await Promise.all([
-            getTask(taskId),
-            listEvents(taskId).catch(() => null),
-            listDependencies(taskId).catch(() => null),
-          ]);
+          const [nextDetail, nextEvents, nextDependencies, nextContext] =
+            await Promise.all([
+              getTask(taskId),
+              listEvents(taskId).catch(() => null),
+              listDependencies(taskId).catch(() => null),
+              listContext(taskId).catch(() => null),
+            ]);
           if (
             cancelled ||
             selectedRef.current !== taskId ||
@@ -581,6 +721,7 @@ export function TasksPanel({ projectId }: { projectId: string }) {
           setDetail(nextDetail);
           setEvents(nextEvents ?? nextDetail.events);
           if (nextDependencies) setDependencies(nextDependencies);
+          if (nextContext) setContextItems(nextContext);
         }
       } catch (e) {
         if (!cancelled) setError(errorText(e));
@@ -766,6 +907,13 @@ export function TasksPanel({ projectId }: { projectId: string }) {
           dependencyError={dependencyError}
           addingDependency={addingDependency}
           removingDependencyId={removingDependencyId}
+          contextItems={contextItems}
+          contextError={contextError}
+          contextOptions={contextOptions}
+          contextOptionsLoading={contextOptionsLoading}
+          contextOptionsError={contextOptionsError}
+          linkingContext={linkingContext}
+          removingContextId={removingContextId}
           issue={selectedIssue}
           issuesLoading={issuesLoading}
           issuesError={issuesError}
@@ -790,6 +938,8 @@ export function TasksPanel({ projectId }: { projectId: string }) {
           onRemoveDependency={(dependsOnTaskId) =>
             void removeSelectedDependency(dependsOnTaskId)
           }
+          onLinkContext={linkSelectedContext}
+          onUnlinkContext={(itemId) => void unlinkSelectedContext(itemId)}
           onSync={() => void syncGithub()}
           onPublish={() => void publishSelected()}
           onStart={() => void startSelected()}
@@ -958,6 +1108,13 @@ function DetailPane({
   dependencyError,
   addingDependency,
   removingDependencyId,
+  contextItems,
+  contextError,
+  contextOptions,
+  contextOptionsLoading,
+  contextOptionsError,
+  linkingContext,
+  removingContextId,
   issue,
   issuesLoading,
   issuesError,
@@ -972,6 +1129,8 @@ function DetailPane({
   onResolveDecision,
   onAddDependency,
   onRemoveDependency,
+  onLinkContext,
+  onUnlinkContext,
   onSync,
   onPublish,
   onStart,
@@ -985,6 +1144,13 @@ function DetailPane({
   dependencyError: string | null;
   addingDependency: boolean;
   removingDependencyId: string | null;
+  contextItems: ContextItem[] | null;
+  contextError: string | null;
+  contextOptions: ContextOption[];
+  contextOptionsLoading: boolean;
+  contextOptionsError: string | null;
+  linkingContext: boolean;
+  removingContextId: string | null;
   issue: ProjectIssue | null;
   issuesLoading: boolean;
   issuesError: string | null;
@@ -999,6 +1165,8 @@ function DetailPane({
   onResolveDecision: (decisionId: string, resolution: "allow" | "deny") => void;
   onAddDependency: (dependsOnTaskId: string) => Promise<boolean>;
   onRemoveDependency: (dependsOnTaskId: string) => void;
+  onLinkContext: (itemId: string) => Promise<boolean>;
+  onUnlinkContext: (itemId: string) => void;
   onSync: () => void;
   onPublish: () => void;
   onStart: () => void;
@@ -1006,10 +1174,12 @@ function DetailPane({
   onClose: () => void;
 }) {
   const [dependsOnKey, setDependsOnKey] = useState<string | null>(null);
+  const [contextKey, setContextKey] = useState<string | null>(null);
   const [prLinkError, setPrLinkError] = useState<string | null>(null);
   const detailTaskId = detail?.task.id ?? null;
   useEffect(() => {
     setDependsOnKey(null);
+    setContextKey(null);
     setPrLinkError(null);
   }, [detailTaskId]);
 
@@ -1026,6 +1196,12 @@ function DetailPane({
         (task) => task.id !== detailTaskId && !linkedIds.has(task.id),
       )
     : [];
+  const linkedContextKeys = new Set(
+    (contextItems ?? []).map((item) => `${item.kind}:${item.id}`),
+  );
+  const availableContextOptions = contextOptions.filter(
+    (option) => !linkedContextKeys.has(`${option.kind}:${option.id}`),
+  );
   const unmetBlockerCount = blockers.filter(
     (task) => task.status !== "merged",
   ).length;
@@ -1043,6 +1219,12 @@ function DetailPane({
     if (!dependsOnKey || addingDependency) return;
     const added = await onAddDependency(dependsOnKey);
     if (added) setDependsOnKey(null);
+  }
+
+  async function submitContext() {
+    if (!contextKey || linkingContext) return;
+    const linked = await onLinkContext(contextKey);
+    if (linked) setContextKey(null);
   }
 
   return (
@@ -1312,6 +1494,137 @@ function DetailPane({
                           ? `${unmetBlockerCount} 个前置任务尚未合并；调度器会在依赖合并后再执行。`
                           : `${unmetBlockerCount} 个前置任务尚未合并；开始执行会先排队，待依赖合并后自动运行。`}
                       </span>
+                    </p>
+                  )}
+                </div>
+              )}
+            </Section>
+
+            <Section
+              title="上下文"
+              icon={<FileText size={14} />}
+              count={contextItems?.length ?? 0}
+            >
+              {contextError && (
+                <p role="alert" className="text-ui-sm text-[var(--danger)]">
+                  {contextError}
+                </p>
+              )}
+              {contextItems === null ? (
+                <Muted>
+                  {contextError ? "无法加载上下文。" : "加载中…"}
+                </Muted>
+              ) : (
+                <div className="grid gap-2">
+                  {contextItems.length === 0 ? (
+                    <Muted>没有关联的笔记或文档。</Muted>
+                  ) : (
+                    <div className="overflow-hidden rounded-md border border-[var(--border)]">
+                      {contextItems.map((item) => (
+                        <div
+                          key={`${item.kind}:${item.id}`}
+                          className="flex items-center gap-2 border-b border-[var(--border)] px-2 py-1.5 last:border-b-0"
+                        >
+                          <Chip
+                            size="sm"
+                            variant="tertiary"
+                            color="default"
+                            className="shrink-0"
+                          >
+                            {item.kind === "doc"
+                              ? "文档"
+                              : item.kind === "note"
+                                ? "笔记"
+                                : item.kind}
+                          </Chip>
+                          <span
+                            className="min-w-0 flex-1 truncate"
+                            title={item.title}
+                          >
+                            {item.title}
+                          </span>
+                          <Button
+                            isIconOnly
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 w-6 shrink-0 text-[var(--muted)]"
+                            aria-label={`取消关联：${item.title}`}
+                            onPress={() => onUnlinkContext(item.id)}
+                            isDisabled={removingContextId !== null}
+                          >
+                            <X size={13} />
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex items-center gap-1.5">
+                    <Select
+                      aria-label="选择要关联的笔记或文档"
+                      className="min-w-0 flex-1"
+                      placeholder={
+                        contextOptionsLoading
+                          ? "加载可选内容…"
+                          : availableContextOptions.length === 0
+                            ? "没有可关联的内容"
+                            : "选择笔记或文档…"
+                      }
+                      selectedKey={contextKey}
+                      onSelectionChange={(key) =>
+                        setContextKey(key == null ? null : String(key))
+                      }
+                      isDisabled={
+                        linkingContext ||
+                        contextOptionsLoading ||
+                        availableContextOptions.length === 0
+                      }
+                    >
+                      <Select.Trigger className="h-7 text-ui">
+                        <Select.Value />
+                        <Select.Indicator />
+                      </Select.Trigger>
+                      <Select.Popover>
+                        <ListBox>
+                          {availableContextOptions.map((option) => (
+                            <ListBox.Item
+                              key={`${option.kind}:${option.id}`}
+                              id={option.id}
+                              textValue={`${
+                                option.kind === "doc" ? "文档" : "笔记"
+                              } · ${option.title}`}
+                            >
+                              <span className="flex min-w-0 flex-1 items-center gap-2">
+                                <Chip
+                                  size="sm"
+                                  variant="tertiary"
+                                  color="default"
+                                  className="shrink-0"
+                                >
+                                  {option.kind === "doc" ? "文档" : "笔记"}
+                                </Chip>
+                                <span className="min-w-0 flex-1 truncate">
+                                  {option.title}
+                                </span>
+                                <ListBox.ItemIndicator />
+                              </span>
+                            </ListBox.Item>
+                          ))}
+                        </ListBox>
+                      </Select.Popover>
+                    </Select>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      className="h-7 shrink-0 px-2.5 text-ui"
+                      onPress={() => void submitContext()}
+                      isDisabled={!contextKey || linkingContext}
+                    >
+                      {linkingContext ? "关联中…" : "关联"}
+                    </Button>
+                  </div>
+                  {contextOptionsError && (
+                    <p role="alert" className="text-ui-sm text-[var(--danger)]">
+                      {contextOptionsError}
                     </p>
                   )}
                 </div>

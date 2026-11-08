@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Button, Card, Chip, Input } from "@heroui/react";
 import { DecisionInbox } from "./components/DecisionInbox";
 import { TasksPanel } from "./components/TasksPanel";
+import { Workspace } from "./components/Workspace";
 import {
   Bot,
   ChevronDown,
@@ -74,10 +75,6 @@ function emptyCopy(view: ViewId) {
       return "Agent 会话、运行日志与审批请求会出现在这里。";
     case "views":
       return "保存的过滤视图会出现在这里。";
-    case "docs":
-      return "仓库 docs/ 下的文档会出现在这里。";
-    case "notes":
-      return "项目内 .temli/notes 的笔记会出现在这里。";
     default:
       return "先注册一个项目，之后任务、证据与决策都在这里汇总。";
   }
@@ -278,7 +275,9 @@ export default function App() {
 
             <div
               className={`min-h-0 flex-1 px-4 pb-4 ${
-                active === "my" ? "overflow-hidden" : "overflow-auto"
+                active === "my" || active === "docs" || active === "notes"
+                  ? "overflow-hidden"
+                  : "overflow-auto"
               }`}
             >
               {error && (
@@ -328,9 +327,29 @@ export default function App() {
                 </>
               )}
 
+              {active === "docs" && (
+                <>
+                  {!current && <EmptyProject onRegister={startRegister} />}
+                  {current && (
+                    <Workspace projectId={current.id} mode="docs" />
+                  )}
+                </>
+              )}
+
+              {active === "notes" && (
+                <>
+                  {!current && <EmptyProject onRegister={startRegister} />}
+                  {current && (
+                    <Workspace projectId={current.id} mode="notes" />
+                  )}
+                </>
+              )}
+
               {active !== "overview" &&
                 active !== "my" &&
-                active !== "projects" && (
+                active !== "projects" &&
+                active !== "docs" &&
+                active !== "notes" && (
                   <div className="flex h-full flex-col items-center justify-center gap-1.5 text-center">
                     <p className="text-ui text-[var(--muted)]">
                       {emptyCopy(active)}

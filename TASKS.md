@@ -1,6 +1,6 @@
 # TASKS
 
-当前里程碑：M4 GitHub 同步与自动合并（已合入，含 require_checks）
+当前里程碑：M5 知识/文档工作空间（已合入 develop）
 
 ## 已完成
 
@@ -86,7 +86,7 @@
 ## M3 冒烟
 
 - 并发 2：gamma / delta 同时 running；delta 先合并，gamma 在合并时 rebase 到新 tip 后成功合并（修复前会 merge_failed）
-- 依赖/并发/串行/环检测由 `cargo test` 覆盖（178 tests）
+- 依赖/并发/串行/环检测由 `cargo test` 覆盖（191 tests）
 
 ## 进行中：M4 GitHub 同步与自动合并
 
@@ -99,3 +99,16 @@
 - [x] 审查修复：分页 ghost、合并 SHA 锁定、轮询取消、合并锁、curl 超时/令牌、发布幂等、pr_state 顺序、前端跨项目刷新
 - [x] `require_checks` 语义：默认无 CI 视为通过，开启后空 checks 阻止自动合并（迁移 v4）
 - [x] 合入（PR #18）
+
+## 进行中：M5 知识/文档工作空间
+
+- [x] 迁移 v5：search_fts 全文索引
+- [x] 笔记 CRUD（`.temli/notes`，frontmatter + 文件权威）
+- [x] 文档扫描与索引（仓库 docs/**/*.md，只读）
+- [x] FTS5 搜索（笔记/文档，项目隔离 + snippet）
+- [x] 笔记转任务（derived_from 关联）
+- [x] 任务上下文关联（relates）与 prompt 注入（4k/12k 截断）
+- [x] 前端：知识/文档双空间、Markdown 编辑与预览、搜索、上下文选择
+- [x] 独立审查（1 P1 / 3 P2 / 多个 P3）
+- [x] 修复：中文短词搜索（trigram + LIKE 回退）、缺失仓库不清索引、笔记转任务空验收拒绝、保存/删除竞态、上下文摘要、稳定 doc id、符号链接/大文件保护
+- [x] 合入 develop（PR #23，Issue #22）

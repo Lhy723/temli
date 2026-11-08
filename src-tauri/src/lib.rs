@@ -8,6 +8,7 @@ mod prompts;
 mod scheduler;
 mod store;
 mod sync;
+mod workspace;
 
 use agent::{
     AdapterRegistry, AgentAdapter, AgentEvent, AgentManifest, Decision, EventSink, RunSpec,
@@ -83,6 +84,38 @@ struct RequireChecksInput {
     enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateNoteInput {
+    project_id: String,
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateNoteInput {
+    #[serde(alias = "note_id")]
+    id: String,
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTaskFromNoteInput {
+    note_id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextLinkInput {
+    task_id: String,
+    item_id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct DependencyList {
     blockers: Vec<TaskSummary>,
@@ -91,6 +124,19 @@ struct DependencyList {
 
 fn db_err(e: rusqlite::Error) -> String {
     e.to_string()
+}
+
+/// 条目（笔记 / 文档 / issue）所属项目；链接与笔记转任务都要先解析项目。
+fn item_project_id(conn: &rusqlite::Connection, item_id: &str) -> Result<String, String> {
+    conn.query_row(
+        "SELECT project_id FROM items WHERE id = ?1",
+        params![item_id],
+        |row| row.get(0),
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => format!("条目不存在：{item_id}"),
+        other => db_err(other),
+    })
 }
 
 fn list_project_decisions(
@@ -435,6 +481,148 @@ fn set_require_checks(state: State<AppState>, input: RequireChecksInput) -> Resu
     store::set_project_require_checks(db.conn(), &input.project_id, input.enabled)
 }
 
+#[tauri::command]
+fn list_notes(
+    state: State<AppState>,
+    project_id: String,
+) -> Result<Vec<workspace::NoteMeta>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    workspace::list_notes(db.conn(), &project_id)
+}
+
+#[tauri::command]
+fn get_note(state: State<AppState>, note_id: String) -> Result<workspace::Note, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    workspace::get_note(db.conn(), &note_id)
+}
+
+#[tauri::command]
+fn create_note(state: State<AppState>, input: CreateNoteInput) -> Result<workspace::Note, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    let project = db
+        .get_project(&input.project_id)?
+        .ok_or_else(|| "项目不存在".to_string())?;
+    workspace::create_note(db.conn(), &project, &input.title, &input.body)
+}
+
+#[tauri::command]
+fn update_note(state: State<AppState>, input: UpdateNoteInput) -> Result<workspace::Note, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    workspace::update_note(db.conn(), &input.id, &input.title, &input.body)
+}
+
+#[tauri::command]
+fn delete_note(state: State<AppState>, note_id: String) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    workspace::delete_note(db.conn(), &note_id)
+}
+
+#[tauri::command]
+fn list_docs(
+    state: State<AppState>,
+    project_id: String,
+) -> Result<Vec<workspace::DocMeta>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    workspace::list_docs(db.conn(), &project_id)
+}
+
+#[tauri::command]
+fn get_doc(state: State<AppState>, doc_id: String) -> Result<workspace::Doc, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    workspace::get_doc(db.conn(), &doc_id)
+}
+
+#[tauri::command]
+fn reindex_workspace(state: State<AppState>, project_id: String) -> Result<usize, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    let project = db
+        .get_project(&project_id)?
+        .ok_or_else(|| "项目不存在".to_string())?;
+    workspace::scan_docs(db.conn(), &project)
+}
+
+#[tauri::command]
+fn search_workspace(
+    state: State<AppState>,
+    project_id: String,
+    query: String,
+) -> Result<Vec<workspace::SearchHit>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    workspace::search(db.conn(), &project_id, &query)
+}
+
+/// 笔记转任务：prompt 默认取笔记正文，随后写入 `derived_from` 链接。
+#[tauri::command]
+fn create_task_from_note(
+    state: State<AppState>,
+    input: CreateTaskFromNoteInput,
+) -> Result<TaskDetail, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    let conn = db.conn();
+    let note = workspace::get_note(conn, &input.note_id)?;
+    let project_id = item_project_id(conn, &input.note_id)?;
+    let project = db
+        .get_project(&project_id)?
+        .ok_or_else(|| "项目不存在".to_string())?;
+
+    let title = input
+        .title
+        .map(|title| title.trim().to_string())
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| note.title.clone());
+    let prompt = input
+        .prompt
+        .filter(|prompt| !prompt.trim().is_empty())
+        .unwrap_or_else(|| note.body.clone());
+    let commands = evidence::discover_commands(Path::new(&project.repo_path));
+    let criteria = evidence::default_acceptance(&commands);
+    if criteria.is_empty() {
+        return Err("未发现可执行的测试/构建命令，请手动提供验收标准".to_string());
+    }
+
+    let task = store::create_task(
+        conn,
+        store::NewTask {
+            project_id,
+            title,
+            prompt,
+            criteria,
+        },
+    )?;
+    let task_item = store::task_item_id(conn, &task.id)?;
+    if let Err(err) = store::link_item(conn, &input.note_id, &task_item, "derived_from") {
+        let _ = conn.execute(
+            "DELETE FROM items WHERE id = ?1",
+            rusqlite::params![task_item],
+        );
+        return Err(format!("创建任务后关联笔记失败：{err}"));
+    }
+    store::get_task(conn, &task.id)
+}
+
+#[tauri::command]
+fn link_context(state: State<AppState>, input: ContextLinkInput) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    let task_item = store::task_item_id(db.conn(), &input.task_id)?;
+    store::link_item(db.conn(), &task_item, &input.item_id, "relates")
+}
+
+#[tauri::command]
+fn unlink_context(state: State<AppState>, input: ContextLinkInput) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    let task_item = store::task_item_id(db.conn(), &input.task_id)?;
+    store::unlink_item(db.conn(), &task_item, &input.item_id, "relates")
+}
+
+#[tauri::command]
+fn list_context(
+    state: State<AppState>,
+    task_id: String,
+) -> Result<Vec<store::ContextMeta>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::task_context_meta(db.conn(), &task_id)
+}
+
 /// 启动时回收 worktree：先让 git 清掉失效登记，再删除项目目录下未被 git 登记的残留目录。
 fn cleanup_worktrees(db: &Db, data_dir: &Path) {
     let projects = match db.list_projects() {
@@ -554,7 +742,20 @@ pub fn run() {
             get_auto_merge,
             set_auto_merge,
             get_require_checks,
-            set_require_checks
+            set_require_checks,
+            list_notes,
+            get_note,
+            create_note,
+            update_note,
+            delete_note,
+            list_docs,
+            get_doc,
+            reindex_workspace,
+            search_workspace,
+            create_task_from_note,
+            link_context,
+            unlink_context,
+            list_context
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
