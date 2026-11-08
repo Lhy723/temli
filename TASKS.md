@@ -1,6 +1,6 @@
 # TASKS
 
-当前里程碑：M3 DAG 调度（已合入）
+当前里程碑：M4 GitHub 同步与自动合并（已合入）
 
 ## 已完成
 
@@ -86,4 +86,15 @@
 ## M3 冒烟
 
 - 并发 2：gamma / delta 同时 running；delta 先合并，gamma 在合并时 rebase 到新 tip 后成功合并（修复前会 merge_failed）
-- 依赖/并发/串行/环检测由 `cargo test` 覆盖（144 tests）
+- 依赖/并发/串行/环检测由 `cargo test` 覆盖（175 tests）
+
+## 进行中：M4 GitHub 同步与自动合并
+
+- [x] 迁移 v3：issue body/state/assignee/ghost、auto_merge、PR 字段
+- [x] GhOps（gh token + curl）、60s ETag 轮询、乐观写回、ghost
+- [x] PR 创建/checks 轮询/条件合并/本地拉取；auto_merge 默认关闭
+- [x] 前端同步/发布/PR 链接/自动合并开关
+- [x] 实时同步冒烟：远端新建 issue 1 分钟内入库；改标题后 1 个周期内本地更新
+- [x] 独立审查（1 P1 / 7 P2 / 2 P3）
+- [x] 审查修复：分页 ghost、合并 SHA 锁定、轮询取消、合并锁、curl 超时/令牌、发布幂等、pr_state 顺序、前端跨项目刷新
+- [x] 合入（PR #18）

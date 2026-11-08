@@ -215,6 +215,25 @@ impl Db {
             tx.commit().map_err(|e| e.to_string())?;
         }
 
+        if current < 3 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "ALTER TABLE items ADD COLUMN body TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE items ADD COLUMN github_state TEXT;
+                 ALTER TABLE items ADD COLUMN github_assignee TEXT;
+                 ALTER TABLE items ADD COLUMN ghost INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE projects ADD COLUMN auto_merge INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE runs ADD COLUMN pr_number INTEGER;
+                 ALTER TABLE runs ADD COLUMN pr_url TEXT;
+                 ALTER TABLE runs ADD COLUMN pr_state TEXT;
+                 CREATE INDEX IF NOT EXISTS idx_items_github ON items(project_id, github_number);",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (3)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
         Ok(())
     }
 

@@ -137,7 +137,10 @@ stateDiagram-v2
 
 - 轮询 60s，使用 `If-None-Match`；仅同步 `kind='issue'` 的条目标题、正文、状态、指派人
 - 本地编辑写回前携带 `github_version`；版本不匹配则放弃写入并提示远端已变更
-- 删除：远端关闭 → 本地 `closed`；远端消失 → 标记 `ghost`，不物理删除（保留 run 与证据）
+- 删除：远端关闭 → `github_state='closed'`（不覆盖任务状态）；远端消失 → `ghost=1`，不物理删除（保留 run 与证据）
+- 本地编辑：先 GET 比对 `updated_at`，不一致直接拒绝并提示先同步；一致才 PATCH 并回写新版本
+- PR：`runs.pr_number/pr_url/pr_state` 记录；自动合并默认关闭（`projects.auto_merge=0`）
+- 自动合并开启时：证据门全绿 → push 分支 → 创建 PR → 轮询 checks（10s/10min）→ 全绿才合并 → fetch + `pull --ff-only` 更新本地默认分支；失败或超时进决策收件箱
 
 ## 7. 事件
 

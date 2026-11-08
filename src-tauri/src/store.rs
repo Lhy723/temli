@@ -110,6 +110,20 @@ pub struct TaskSummary {
     pub created_at: String,
 }
 
+/// 项目下的一条 issue item（GitHub 同步视图）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectIssue {
+    /// item id；本地编辑远端 issue 时使用。
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub github_state: Option<String>,
+    pub github_number: Option<i64>,
+    pub ghost: bool,
+    /// 关联任务 id；纯 issue（非任务）为 None。
+    pub task_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRow {
     pub id: String,
@@ -120,6 +134,12 @@ pub struct RunRow {
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub pr_number: Option<i64>,
+    #[serde(default)]
+    pub pr_url: Option<String>,
+    #[serde(default)]
+    pub pr_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -585,6 +605,65 @@ pub fn set_project_concurrency(
     Ok(())
 }
 
+/// 项目是否启用 GitHub 自动合并；默认关闭。
+pub fn project_auto_merge(conn: &Connection, project_id: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT COALESCE(auto_merge, 0) FROM projects WHERE id = ?1",
+        params![project_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)?
+    .ok_or_else(|| format!("项目不存在：{project_id}"))
+}
+
+pub fn set_project_auto_merge(
+    conn: &Connection,
+    project_id: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE projects SET auto_merge = ?2 WHERE id = ?1",
+            params![project_id, enabled],
+        )
+        .map_err(db_err)?;
+    if changed == 0 {
+        return Err(format!("项目不存在：{project_id}"));
+    }
+    Ok(())
+}
+
+/// 项目下的 issue item 列表（含本地尚未发布的 issue）。
+pub fn list_project_issues(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Vec<ProjectIssue>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT i.id, i.title, i.status, i.github_state, i.github_number, i.ghost, t.id
+             FROM items i LEFT JOIN tasks t ON t.item_id = i.id
+             WHERE i.project_id = ?1 AND i.kind = 'issue'
+             ORDER BY CASE WHEN i.github_number IS NULL THEN 1 ELSE 0 END,
+                      i.github_number ASC, i.created_at ASC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![project_id], |row| {
+            Ok(ProjectIssue {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                status: row.get(2)?,
+                github_state: row.get(3)?,
+                github_number: row.get(4)?,
+                ghost: row.get(5)?,
+                task_id: row.get(6)?,
+            })
+        })
+        .map_err(db_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+}
+
 fn query_task_summaries(
     conn: &Connection,
     project_id: Option<&str>,
@@ -622,7 +701,8 @@ pub fn get_task(conn: &Connection, task_id: &str) -> Result<TaskDetail, String> 
 
     let mut run_stmt = conn
         .prepare(
-            "SELECT id, status, adapter_id, branch, worktree_path, started_at, ended_at, error
+            "SELECT id, status, adapter_id, branch, worktree_path, started_at, ended_at, error,
+                    pr_number, pr_url, pr_state
              FROM runs WHERE task_id = ?1 ORDER BY attempt ASC",
         )
         .map_err(db_err)?;
@@ -894,6 +974,26 @@ pub fn set_run_session(conn: &Connection, run_id: &str, session_id: &str) -> Res
         .execute(
             "UPDATE runs SET session_id = ?2 WHERE id = ?1",
             params![run_id, session_id],
+        )
+        .map_err(db_err)?;
+    if changed == 0 {
+        return Err(format!("运行不存在：{run_id}"));
+    }
+    Ok(())
+}
+
+/// 记录运行关联的 GitHub PR（自动合并路径）。
+pub fn set_run_pr(
+    conn: &Connection,
+    run_id: &str,
+    number: u64,
+    url: &str,
+    state: &str,
+) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE runs SET pr_number = ?2, pr_url = ?3, pr_state = ?4 WHERE id = ?1",
+            params![run_id, number as i64, url, state],
         )
         .map_err(db_err)?;
     if changed == 0 {
@@ -1261,6 +1361,9 @@ fn read_run_row(row: &Row<'_>) -> rusqlite::Result<RunRow> {
         started_at: row.get(5)?,
         ended_at: row.get(6)?,
         error: row.get(7)?,
+        pr_number: row.get(8)?,
+        pr_url: row.get(9)?,
+        pr_state: row.get(10)?,
     })
 }
 
@@ -1397,7 +1500,8 @@ fn ensure_run(conn: &Connection, run_id: &str) -> Result<(), String> {
 
 fn read_run(conn: &Connection, run_id: &str) -> Result<RunRow, String> {
     conn.query_row(
-        "SELECT id, status, adapter_id, branch, worktree_path, started_at, ended_at, error
+        "SELECT id, status, adapter_id, branch, worktree_path, started_at, ended_at, error,
+                pr_number, pr_url, pr_state
          FROM runs WHERE id = ?1",
         params![run_id],
         read_run_row,

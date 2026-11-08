@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Button,
   Card,
@@ -6,6 +7,7 @@ import {
   Input,
   ListBox,
   Select,
+  Switch,
   TextArea,
 } from "@heroui/react";
 import {
@@ -13,15 +15,19 @@ import {
   CircleDot,
   CircleStop,
   Clock,
+  ExternalLink,
   GitBranch,
+  GitPullRequest,
   Inbox,
   Link2,
   ListChecks,
   Play,
   Plus,
+  RefreshCw,
   ShieldCheck,
   Terminal,
   Trash2,
+  Upload,
   X,
 } from "lucide-react";
 import {
@@ -32,20 +38,26 @@ import {
   decisionKindLabel,
   errorText,
   formatDate,
+  getAutoMerge,
   getProjectConcurrency,
+  getProjectIssues,
   getTask,
   listDependencies,
   listEvents,
   listTasks,
+  publishTask,
   removeDependency,
   resolveDecision,
+  setAutoMerge,
   setProjectConcurrency,
   startTask,
   statusLabel,
   statusTone,
+  syncNow,
   textList,
   verdictLabel,
   type EventRow,
+  type ProjectIssue,
   type TaskDependencies,
   type TaskDetail,
   type TaskSummary,
@@ -91,11 +103,22 @@ export function TasksPanel({ projectId }: { projectId: string }) {
   const [concurrencyInput, setConcurrencyInput] = useState("");
   const [concurrencySaving, setConcurrencySaving] = useState(false);
   const [concurrencyError, setConcurrencyError] = useState<string | null>(null);
+  const [issues, setIssues] = useState<ProjectIssue[]>([]);
+  const [issuesLoading, setIssuesLoading] = useState(true);
+  const [issuesError, setIssuesError] = useState<string | null>(null);
+  const [githubError, setGithubError] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [publishing, setPublishing] = useState(false);
+  const [autoMerge, setAutoMergeEnabled] = useState<boolean | null>(null);
+  const [autoMergeSaving, setAutoMergeSaving] = useState(false);
+  const [autoMergeError, setAutoMergeError] = useState<string | null>(null);
   const selectedRef = useRef<string | null>(null);
   const detailRequestRef = useRef(0);
+  const projectRef = useRef(projectId);
 
   useEffect(() => {
     let cancelled = false;
+    projectRef.current = projectId;
     selectedRef.current = null;
     setLoading(true);
     setError(null);
@@ -110,6 +133,12 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setDependencyError(null);
     setAddingDependency(false);
     setRemovingDependencyId(null);
+    setIssues([]);
+    setIssuesLoading(true);
+    setIssuesError(null);
+    setGithubError(null);
+    setSyncing(false);
+    setPublishing(false);
     listTasks(projectId)
       .then((next) => {
         if (!cancelled) setTasks(next);
@@ -144,8 +173,116 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     };
   }, [projectId]);
 
+  useEffect(() => {
+    let cancelled = false;
+    getProjectIssues(projectId)
+      .then((next) => {
+        if (!cancelled) setIssues(next);
+      })
+      .catch((e) => {
+        if (!cancelled) setIssuesError(errorText(e));
+      })
+      .finally(() => {
+        if (!cancelled) setIssuesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setAutoMergeEnabled(null);
+    setAutoMergeSaving(false);
+    setAutoMergeError(null);
+    getAutoMerge(projectId)
+      .then((enabled) => {
+        if (cancelled || projectRef.current !== projectId) return;
+        setAutoMergeEnabled(enabled);
+      })
+      .catch((e) => {
+        if (cancelled || projectRef.current !== projectId) return;
+        setAutoMergeEnabled(false);
+        setAutoMergeError(errorText(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
   async function refreshTasks() {
-    setTasks(await listTasks(projectId));
+    const requestedFor = projectId;
+    const next = await listTasks(requestedFor);
+    if (projectRef.current !== requestedFor) return;
+    setTasks(next);
+  }
+
+  async function refreshIssues() {
+    const requestedFor = projectId;
+    const next = await getProjectIssues(requestedFor);
+    if (projectRef.current !== requestedFor) return;
+    setIssuesError(null);
+    setIssues(next);
+  }
+
+  async function syncGithub() {
+    if (syncing) return;
+    setSyncing(true);
+    setGithubError(null);
+    let failure: string | null = null;
+    try {
+      await syncNow(projectId);
+    } catch (e) {
+      failure = errorText(e);
+    }
+    try {
+      const taskId = selectedRef.current;
+      await Promise.all([
+        refreshTasks(),
+        refreshIssues(),
+        taskId ? loadDetail(taskId, true) : Promise.resolve(),
+      ]);
+    } catch (e) {
+      failure ??= errorText(e);
+    }
+    if (failure) setGithubError(failure);
+    setSyncing(false);
+  }
+
+  async function publishSelected() {
+    const taskId = selectedRef.current;
+    if (!taskId || publishing) return;
+    setPublishing(true);
+    setGithubError(null);
+    try {
+      await publishTask(taskId);
+      await Promise.all([
+        refreshIssues(),
+        loadDetail(taskId, true),
+        refreshTasks(),
+      ]);
+    } catch (e) {
+      setGithubError(errorText(e));
+    } finally {
+      setPublishing(false);
+    }
+  }
+
+  async function saveAutoMerge(enabled: boolean) {
+    if (autoMerge === null || autoMergeSaving) return;
+    const requestedFor = projectId;
+    setAutoMergeSaving(true);
+    setAutoMergeError(null);
+    try {
+      await setAutoMerge({ project_id: requestedFor, enabled });
+      if (projectRef.current !== requestedFor) return;
+      setAutoMergeEnabled(enabled);
+    } catch (e) {
+      if (projectRef.current !== requestedFor) return;
+      setAutoMergeError(errorText(e));
+    } finally {
+      if (projectRef.current === requestedFor) setAutoMergeSaving(false);
+    }
   }
 
   async function loadDetail(taskId: string, silent: boolean) {
@@ -192,6 +329,7 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setDependencies(null);
     setDependencyError(null);
     setCancelError(null);
+    setGithubError(null);
     void loadDetail(taskId, false);
   }
 
@@ -204,6 +342,7 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setDependencyError(null);
     setDetailLoading(false);
     setCancelError(null);
+    setGithubError(null);
   }
 
   async function handleCreated(created: TaskDetail) {
@@ -217,7 +356,7 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setDependencies({ blockers: [], blocks: [] });
     setDependencyError(null);
     try {
-      await refreshTasks();
+      await Promise.all([refreshTasks(), refreshIssues()]);
     } catch (e) {
       setError(errorText(e));
     }
@@ -419,6 +558,11 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     parsedConcurrency <= 16;
   const concurrencyDirty =
     concurrency !== null && parsedConcurrency !== concurrency;
+  const selectedTaskId = detail?.task.id ?? null;
+  const selectedIssue =
+    selectedTaskId === null
+      ? null
+      : (issues.find((item) => item.task_id === selectedTaskId) ?? null);
 
   return (
     <div className="relative flex h-full min-h-0 gap-3">
@@ -429,6 +573,20 @@ export function TasksPanel({ projectId }: { projectId: string }) {
             {tasks.length} 个任务
           </span>
           <div className="flex items-center gap-2">
+            <Switch
+              size="sm"
+              isSelected={autoMerge === true}
+              isDisabled={autoMerge === null || autoMergeSaving}
+              onChange={(enabled) => void saveAutoMerge(enabled)}
+              className="text-ui-sm text-[var(--muted)]"
+            >
+              <Switch.Content>
+                <Switch.Control>
+                  <Switch.Thumb />
+                </Switch.Control>
+                自动合并
+              </Switch.Content>
+            </Switch>
             <div className="flex items-center gap-1 text-ui-sm text-[var(--muted)]">
               <span className="shrink-0">并发</span>
               <Input
@@ -474,6 +632,12 @@ export function TasksPanel({ projectId }: { projectId: string }) {
           (concurrencyDirty && !concurrencyValid)) && (
           <p role="alert" className="mb-2 text-ui-sm text-[var(--danger)]">
             {concurrencyError ?? "并发上限需为 1–16 的整数。"}
+          </p>
+        )}
+
+        {autoMergeError && (
+          <p role="alert" className="mb-2 text-ui-sm text-[var(--danger)]">
+            {autoMergeError}
           </p>
         )}
 
@@ -534,6 +698,12 @@ export function TasksPanel({ projectId }: { projectId: string }) {
           dependencyError={dependencyError}
           addingDependency={addingDependency}
           removingDependencyId={removingDependencyId}
+          issue={selectedIssue}
+          issuesLoading={issuesLoading}
+          issuesError={issuesError}
+          githubError={githubError}
+          syncing={syncing}
+          publishing={publishing}
           loading={detailLoading}
           busy={busy}
           cancelling={
@@ -552,6 +722,8 @@ export function TasksPanel({ projectId }: { projectId: string }) {
           onRemoveDependency={(dependsOnTaskId) =>
             void removeSelectedDependency(dependsOnTaskId)
           }
+          onSync={() => void syncGithub()}
+          onPublish={() => void publishSelected()}
           onStart={() => void startSelected()}
           onCancel={() => {
             if (detail) void cancelForTask(detail.task.id);
@@ -718,6 +890,12 @@ function DetailPane({
   dependencyError,
   addingDependency,
   removingDependencyId,
+  issue,
+  issuesLoading,
+  issuesError,
+  githubError,
+  syncing,
+  publishing,
   loading,
   busy,
   cancelling,
@@ -726,6 +904,8 @@ function DetailPane({
   onResolveDecision,
   onAddDependency,
   onRemoveDependency,
+  onSync,
+  onPublish,
   onStart,
   onCancel,
   onClose,
@@ -737,6 +917,12 @@ function DetailPane({
   dependencyError: string | null;
   addingDependency: boolean;
   removingDependencyId: string | null;
+  issue: ProjectIssue | null;
+  issuesLoading: boolean;
+  issuesError: string | null;
+  githubError: string | null;
+  syncing: boolean;
+  publishing: boolean;
   loading: boolean;
   busy: boolean;
   cancelling: boolean;
@@ -745,14 +931,18 @@ function DetailPane({
   onResolveDecision: (decisionId: string, resolution: "allow" | "deny") => void;
   onAddDependency: (dependsOnTaskId: string) => Promise<boolean>;
   onRemoveDependency: (dependsOnTaskId: string) => void;
+  onSync: () => void;
+  onPublish: () => void;
   onStart: () => void;
   onCancel: () => void;
   onClose: () => void;
 }) {
   const [dependsOnKey, setDependsOnKey] = useState<string | null>(null);
+  const [prLinkError, setPrLinkError] = useState<string | null>(null);
   const detailTaskId = detail?.task.id ?? null;
   useEffect(() => {
     setDependsOnKey(null);
+    setPrLinkError(null);
   }, [detailTaskId]);
 
   const review = detail?.review ?? null;
@@ -868,6 +1058,76 @@ function DetailPane({
                 {detail.task.prompt}
               </p>
             </div>
+
+            <Section title="GitHub" icon={<GitPullRequest size={14} />}>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="h-7 gap-1 px-2.5 text-ui"
+                  onPress={onSync}
+                  isDisabled={syncing}
+                >
+                  <RefreshCw
+                    size={14}
+                    className={syncing ? "animate-spin" : undefined}
+                  />
+                  {syncing ? "同步中…" : "同步"}
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="h-7 gap-1 px-2.5 text-ui"
+                  onPress={onPublish}
+                  isDisabled={
+                    !issue || publishing || issue.github_number != null
+                  }
+                >
+                  <Upload size={14} />
+                  {publishing ? "发布中…" : "发布到 GitHub"}
+                </Button>
+              </div>
+              {(githubError || issuesError) && (
+                <p role="alert" className="text-ui-sm text-[var(--danger)]">
+                  {githubError ?? issuesError}
+                </p>
+              )}
+              {issuesLoading && !issue ? (
+                <Muted>正在加载 GitHub 关联…</Muted>
+              ) : issue && issue.github_number != null ? (
+                <div className="grid gap-1 rounded-md border border-[var(--border)] px-2 py-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="font-mono text-ui-sm">
+                      #{issue.github_number}
+                    </span>
+                    <Chip
+                      size="sm"
+                      variant="soft"
+                      color={statusTone(issue.github_state ?? "")}
+                    >
+                      {issue.github_state
+                        ? statusLabel(issue.github_state)
+                        : "未知状态"}
+                    </Chip>
+                    {issue.ghost && (
+                      <Chip size="sm" variant="soft" color="warning">
+                        远端已删除
+                      </Chip>
+                    )}
+                  </div>
+                  <p
+                    className="truncate text-ui-sm text-[var(--muted)]"
+                    title={issue.title}
+                  >
+                    {issue.title}
+                  </p>
+                </div>
+              ) : issue ? (
+                <Muted>尚未发布到 GitHub。</Muted>
+              ) : (
+                <Muted>未找到关联的 Issue 条目。</Muted>
+              )}
+            </Section>
 
             <Section
               title="依赖"
@@ -1136,6 +1396,46 @@ function DetailPane({
                           {run.worktree_path}
                         </p>
                       )}
+                      {(run.pr_number != null ||
+                        run.pr_url ||
+                        run.pr_state) && (
+                        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                          <GitPullRequest
+                            size={12}
+                            className="shrink-0 text-[var(--muted)]"
+                          />
+                          {run.pr_number != null && (
+                            <span className="font-mono text-label text-[var(--muted)]">
+                              PR #{run.pr_number}
+                            </span>
+                          )}
+                          {run.pr_state && (
+                            <Chip
+                              size="sm"
+                              variant="soft"
+                              color={statusTone(run.pr_state ?? "")}
+                            >
+                              {statusLabel(run.pr_state ?? "")}
+                            </Chip>
+                          )}
+                          {run.pr_url && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-6 gap-1 px-1.5 text-label"
+                              onPress={() => {
+                                setPrLinkError(null);
+                                void openUrl(run.pr_url!).catch((e) =>
+                                  setPrLinkError(errorText(e)),
+                                );
+                              }}
+                            >
+                              <ExternalLink size={12} />
+                              打开 PR
+                            </Button>
+                          )}
+                        </div>
+                      )}
                       {run.error && (
                         <p className="mt-1 whitespace-pre-wrap break-words text-ui-sm text-[var(--danger)]">
                           {run.error}
@@ -1144,6 +1444,11 @@ function DetailPane({
                     </div>
                   ))}
                 </div>
+              )}
+              {prLinkError && (
+                <p role="alert" className="text-ui-sm text-[var(--danger)]">
+                  {prLinkError}
+                </p>
               )}
             </Section>
 

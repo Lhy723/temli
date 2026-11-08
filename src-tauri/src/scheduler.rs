@@ -777,6 +777,7 @@ mod tests {
                 cancels: orchestrator::CancelRegistry::new(),
                 merge_lock: Arc::new(Mutex::new(())),
                 cancelled: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                github: None,
             };
             (ctx, project.id)
         }

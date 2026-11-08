@@ -302,7 +302,9 @@ export default function App() {
               {active === "my" && (
                 <>
                   {!current && <EmptyProject onRegister={startRegister} />}
-                  {current && <TasksPanel projectId={current.id} />}
+                  {current && (
+                    <TasksPanel key={current.id} projectId={current.id} />
+                  )}
                 </>
               )}
 
