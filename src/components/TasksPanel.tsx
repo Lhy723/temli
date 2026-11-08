@@ -3,6 +3,7 @@ import { Button, Card, Chip, Input, TextArea } from "@heroui/react";
 import {
   AlertTriangle,
   CircleDot,
+  CircleStop,
   Clock,
   GitBranch,
   Inbox,
@@ -14,8 +15,10 @@ import {
   X,
 } from "lucide-react";
 import {
+  cancelTask,
   compactJson,
   createTask,
+  decisionKindLabel,
   errorText,
   formatDate,
   getTask,
@@ -33,7 +36,7 @@ import {
 } from "../lib/api";
 
 const POLL_INTERVAL_MS = 2000;
-// start_task 在后台线程推进，queued 是进入 running 前的瞬态；继续轮询才能看到状态推进。
+// start_task 在后台线程推进，queued 也可能由队列 worker 取走；继续轮询才能看到状态推进。
 const POLLING_STATUSES: Record<string, true> = {
   queued: true,
   running: true,
@@ -53,6 +56,13 @@ export function TasksPanel({ projectId }: { projectId: string }) {
   const [resolvingDecisionId, setResolvingDecisionId] = useState<string | null>(
     null,
   );
+  const [cancellingTasks, setCancellingTasks] = useState<Record<string, true>>(
+    {},
+  );
+  const [cancelError, setCancelError] = useState<{
+    taskId: string;
+    message: string;
+  } | null>(null);
   const selectedRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -65,6 +75,8 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setDetail(null);
     setEvents([]);
     setResolvingDecisionId(null);
+    setCancellingTasks({});
+    setCancelError(null);
     listTasks(projectId)
       .then((next) => {
         if (!cancelled) setTasks(next);
@@ -107,6 +119,7 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setSelectedId(taskId);
     setDetail(null);
     setEvents([]);
+    setCancelError(null);
     void loadDetail(taskId, false);
   }
 
@@ -116,6 +129,7 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     setDetail(null);
     setEvents([]);
     setDetailLoading(false);
+    setCancelError(null);
   }
 
   async function handleCreated(created: TaskDetail) {
@@ -145,6 +159,33 @@ export function TasksPanel({ projectId }: { projectId: string }) {
       setError(errorText(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function cancelForTask(taskId: string) {
+    if (cancellingTasks[taskId]) return;
+    setCancellingTasks((prev) => ({ ...prev, [taskId]: true }));
+    setCancelError(null);
+    try {
+      await cancelTask(taskId);
+    } catch (e) {
+      setCancelError({ taskId, message: errorText(e) });
+    } finally {
+      const reloads: Promise<void>[] = [refreshTasks()];
+      if (selectedRef.current === taskId) {
+        reloads.push(loadDetail(taskId, true));
+      }
+      try {
+        await Promise.all(reloads);
+      } catch (e) {
+        setCancelError({ taskId, message: errorText(e) });
+      }
+      setCancellingTasks((prev) => {
+        if (!prev[taskId]) return prev;
+        const next = { ...prev };
+        delete next[taskId];
+        return next;
+      });
     }
   }
 
@@ -287,11 +328,22 @@ export function TasksPanel({ projectId }: { projectId: string }) {
           events={events}
           loading={detailLoading}
           busy={busy}
+          cancelling={
+            detail ? cancellingTasks[detail.task.id] === true : false
+          }
+          cancelError={
+            cancelError && cancelError.taskId === detail?.task.id
+              ? cancelError.message
+              : null
+          }
           resolvingDecisionId={resolvingDecisionId}
           onResolveDecision={(decisionId, resolution) =>
             void resolveTaskDecision(decisionId, resolution)
           }
           onStart={() => void startSelected()}
+          onCancel={() => {
+            if (detail) void cancelForTask(detail.task.id);
+          }}
           onClose={closeDetail}
         />
       )}
@@ -451,18 +503,24 @@ function DetailPane({
   events,
   loading,
   busy,
+  cancelling,
+  cancelError,
   resolvingDecisionId,
   onResolveDecision,
   onStart,
+  onCancel,
   onClose,
 }: {
   detail: TaskDetail | null;
   events: EventRow[];
   loading: boolean;
   busy: boolean;
+  cancelling: boolean;
+  cancelError: string | null;
   resolvingDecisionId: string | null;
   onResolveDecision: (decisionId: string, resolution: "allow" | "deny") => void;
   onStart: () => void;
+  onCancel: () => void;
   onClose: () => void;
 }) {
   const review = detail?.review ?? null;
@@ -470,8 +528,11 @@ function DetailPane({
   const testDiffs = review ? textList(review.test_diff) : [];
   const openDecisions =
     detail?.decisions.filter((decision) => decision.status === "open") ?? [];
+  const status = detail?.task.status;
+  const canCancel = status === "queued" || status === "running";
   const startDisabled =
     busy ||
+    cancelling ||
     !detail ||
     detail.task.status === "running" ||
     detail.task.status === "verifying" ||
@@ -498,6 +559,18 @@ function DetailPane({
             </div>
           )}
         </div>
+        {detail && canCancel && (
+          <Button
+            variant="danger-soft"
+            size="sm"
+            className="h-7 shrink-0 gap-1 px-2.5 text-ui"
+            onPress={onCancel}
+            isDisabled={cancelling}
+          >
+            <CircleStop size={14} />
+            {cancelling ? "取消中…" : "取消"}
+          </Button>
+        )}
         {detail && (
           <Button
             variant="primary"
@@ -521,6 +594,15 @@ function DetailPane({
           <X size={14} />
         </Button>
       </header>
+
+      {cancelError && (
+        <p
+          role="alert"
+          className="shrink-0 border-b border-[var(--border)] px-3 py-1.5 text-ui-sm text-[var(--danger)]"
+        >
+          {cancelError}
+        </p>
+      )}
 
       {!detail ? (
         <p className="p-3 text-ui-sm text-[var(--muted)]">
@@ -560,7 +642,7 @@ function DetailPane({
                             variant="tertiary"
                             color="warning"
                           >
-                            {decision.kind}
+                            {decisionKindLabel(decision.kind)}
                           </Chip>
                           <span>{formatDate(decision.created_at)}</span>
                         </div>

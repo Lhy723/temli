@@ -4,6 +4,7 @@ mod evidence;
 mod gitops;
 mod orchestrator;
 mod prompts;
+mod scheduler;
 mod store;
 
 use agent::{
@@ -12,6 +13,7 @@ use agent::{
 use db::{Db, Project, RegisterProjectInput, canonical_repo};
 use evidence::DiscoveredCommand;
 use rusqlite::params;
+use scheduler::Scheduler;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -24,9 +26,8 @@ use tauri::{Manager, State};
 struct AppState {
     db: Arc<Mutex<Db>>,
     adapters: Arc<AdapterRegistry>,
-    data_dir: PathBuf,
-    /// 本进程内已启动、尚未结束的任务 id；`start_task` 的重复启动闸门。
-    running: Arc<Mutex<HashSet<String>>>,
+    /// 任务队列的唯一入口；所有执行都在调度线程内串行进行。
+    scheduler: Arc<Scheduler>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,73 +256,14 @@ fn get_task(state: State<AppState>, task_id: String) -> Result<TaskDetail, Strin
     store::get_task(db.conn(), &task_id)
 }
 
-/// 校验任务当前状态是否允许启动，并把可恢复状态（failed / interrupted）推回 queued。
-fn prepare_start(state: &AppState, task_id: &str) -> Result<(), String> {
-    let (status, attempts) = {
-        let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-        let detail = store::get_task(db.conn(), task_id)?;
-        (detail.task.status, detail.task.attempts)
-    };
-
-    match status {
-        store::TaskStatus::Draft | store::TaskStatus::Ready | store::TaskStatus::Queued => Ok(()),
-        store::TaskStatus::Running | store::TaskStatus::Verifying => {
-            Err("任务正在执行".to_string())
-        }
-        store::TaskStatus::NeedsHuman => Err("请先在决策收件箱处理".to_string()),
-        store::TaskStatus::Merged => Err("任务已合并，不能重新执行".to_string()),
-        store::TaskStatus::Failed => {
-            if attempts >= store::MAX_ATTEMPTS {
-                return Err("已达重试上限".to_string());
-            }
-            let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-            store::transition(db.conn(), task_id, store::TaskStatus::Queued)?;
-            Ok(())
-        }
-        store::TaskStatus::Interrupted => {
-            let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-            store::transition(db.conn(), task_id, store::TaskStatus::Queued)?;
-            Ok(())
-        }
-    }
-}
-
-fn start_task_inner(state: &AppState, task_id: &str) -> Result<(), String> {
-    let adapter_id = std::env::var("TEMLI_AGENT").unwrap_or_else(|_| "omp".to_string());
-    let adapter = state
-        .adapters
-        .get(&adapter_id)
-        .ok_or_else(|| format!("适配器未注册：{adapter_id}"))?;
-    prepare_start(state, task_id)?;
-    orchestrator::spawn_run(
-        orchestrator::RunContext {
-            db: state.db.clone(),
-            adapter,
-            data_dir: state.data_dir.clone(),
-            running: state.running.clone(),
-        },
-        task_id.to_string(),
-    )
+#[tauri::command]
+fn start_task(state: State<AppState>, task_id: String) -> Result<(), String> {
+    state.scheduler.enqueue(&task_id)
 }
 
 #[tauri::command]
-fn start_task(state: State<AppState>, task_id: String) -> Result<(), String> {
-    {
-        let mut running = state
-            .running
-            .lock()
-            .map_err(|_| "运行状态锁被占用".to_string())?;
-        if !running.insert(task_id.clone()) {
-            return Err("任务已在执行".to_string());
-        }
-    }
-    if let Err(err) = start_task_inner(state.inner(), &task_id) {
-        if let Ok(mut running) = state.running.lock() {
-            running.remove(&task_id);
-        }
-        return Err(err);
-    }
-    Ok(())
+fn cancel_task(state: State<AppState>, task_id: String) -> Result<(), String> {
+    state.scheduler.cancel(&task_id)
 }
 
 #[tauri::command]
@@ -366,6 +308,52 @@ fn list_adapters(state: State<AppState>) -> Vec<AgentManifest> {
     state.adapters.manifests()
 }
 
+/// 启动时回收 worktree：先让 git 清掉失效登记，再删除项目目录下未被 git 登记的残留目录。
+fn cleanup_worktrees(db: &Db, data_dir: &Path) {
+    let projects = match db.list_projects() {
+        Ok(projects) => projects,
+        Err(err) => {
+            eprintln!("读取项目列表失败，跳过 worktree 清理：{err}");
+            return;
+        }
+    };
+    for project in projects {
+        let repo = Path::new(&project.repo_path);
+        if let Err(err) = gitops::prune_worktrees(repo) {
+            eprintln!("清理项目 {} 的 worktree 登记失败：{err}", project.id);
+        }
+        let registered = match gitops::list_worktrees(repo) {
+            Ok(paths) => paths
+                .into_iter()
+                .map(|path| path.canonicalize().unwrap_or(path))
+                .collect::<HashSet<_>>(),
+            Err(err) => {
+                eprintln!("列出项目 {} 的 worktree 失败：{err}", project.id);
+                continue;
+            }
+        };
+        let root = data_dir.join("worktrees").join(&project.id);
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            // 项目还没有产生过 worktree。
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if registered.contains(&canonical) {
+                continue;
+            }
+            if let Err(err) = std::fs::remove_dir_all(&path) {
+                eprintln!("删除残留 worktree {} 失败：{err}", path.display());
+            }
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -378,16 +366,34 @@ pub fn run() {
                 let _ = guard;
             }
             let _ = store::interrupt_running(db.conn());
+            cleanup_worktrees(&db, &dir);
 
             let mut adapters = AdapterRegistry::new();
             adapters.register(Arc::new(agent::omp::OmpAdapter::new()));
             adapters.register(Arc::new(agent::fake::FakeAdapter::new()));
+            let adapters = Arc::new(adapters);
 
-            app.manage(AppState {
-                db: Arc::new(Mutex::new(db)),
-                adapters: Arc::new(adapters),
+            let adapter_id = std::env::var("TEMLI_AGENT").unwrap_or_else(|_| "omp".to_string());
+            let adapter = adapters
+                .get(&adapter_id)
+                .ok_or_else(|| std::io::Error::other(format!("适配器未注册：{adapter_id}")))?;
+
+            let db = Arc::new(Mutex::new(db));
+            let scheduler = Scheduler::new(orchestrator::RunContext {
+                db: Arc::clone(&db),
+                adapter,
                 data_dir: dir,
                 running: Arc::new(Mutex::new(HashSet::new())),
+                cancels: orchestrator::CancelRegistry::new(),
+                merge_lock: Arc::new(Mutex::new(())),
+                cancelled: Arc::new(Mutex::new(HashSet::new())),
+            });
+            scheduler.start().map_err(std::io::Error::other)?;
+
+            app.manage(AppState {
+                db,
+                adapters,
+                scheduler,
             });
             Ok(())
         })
@@ -398,6 +404,7 @@ pub fn run() {
             create_task,
             get_task,
             start_task,
+            cancel_task,
             list_decisions,
             resolve_decision,
             list_events,
@@ -630,5 +637,117 @@ mod tests {
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].cmd, commands[0].cmd);
         assert_ne!(planned, defaults);
+    }
+
+    /// 清理用例夹具：真实 git 仓库 + 独立数据目录 + 已打开数据库，随 Drop 清理。
+    struct WorktreeFixture {
+        root: PathBuf,
+        repo: PathBuf,
+        data_dir: PathBuf,
+        db: Db,
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .expect("执行 git");
+        assert!(status.success(), "git {:?} 失败", args);
+    }
+
+    impl WorktreeFixture {
+        fn new(label: &str) -> Self {
+            let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "temli-cleanup-{}-{unique}-{label}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            let repo = root.join("repo");
+            fs::create_dir_all(&repo).expect("创建临时仓库目录");
+            git(&repo, &["init", "-q", "-b", "main"]);
+            fs::write(repo.join(".gitignore"), ".temli/\n").expect("写入 .gitignore");
+            fs::write(repo.join("README.md"), "demo\n").expect("写入 README");
+            git(&repo, &["add", "-A"]);
+            git(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "init",
+                ],
+            );
+            let data_dir = root.join("data");
+            fs::create_dir_all(&data_dir).expect("创建数据目录");
+            let db = Db::open(&root.join("temli.db")).expect("打开临时数据库");
+            Self {
+                root,
+                repo,
+                data_dir,
+                db,
+            }
+        }
+    }
+
+    impl Drop for WorktreeFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn cleanup_worktrees_removes_stale_registration_and_orphans() {
+        let fixture = WorktreeFixture::new("orphan");
+        let repo = fixture.repo.canonicalize().expect("规范化仓库路径");
+        let project = fixture
+            .db
+            .insert_project(
+                RegisterProjectInput {
+                    repo_path: repo.to_string_lossy().into_owned(),
+                    name: Some("demo".to_string()),
+                    github_owner: None,
+                    github_repo: None,
+                    default_branch: Some("main".to_string()),
+                },
+                repo.clone(),
+            )
+            .expect("登记项目");
+
+        let base = gitops::rev_parse(&repo, "main").expect("读取初始提交");
+        let project_root = fixture.data_dir.join("worktrees").join(&project.id);
+        fs::create_dir_all(&project_root).expect("创建 worktree 根目录");
+        let worktree = project_root.join("run-1");
+        gitops::create_worktree(&repo, &worktree, "temli/cleanup-run-1", &base)
+            .expect("创建 worktree");
+        assert!(
+            worktree.join("README.md").exists(),
+            "worktree 应包含仓库内容"
+        );
+
+        // 模拟崩溃后残留：worktree 目录被手动删除，git 仍保留登记。
+        fs::remove_dir_all(&worktree).expect("删除 worktree 目录");
+        // 另一个从未登记过的孤儿目录（例如数据库被重置后遗留）。
+        let orphan = project_root.join("run-orphan");
+        fs::create_dir_all(&orphan).expect("创建孤儿目录");
+        fs::write(orphan.join("leftover.txt"), "stale\n").expect("写入残留文件");
+
+        cleanup_worktrees(&fixture.db, &fixture.data_dir);
+
+        assert!(!orphan.exists(), "未登记的孤儿目录应被删除");
+        assert!(!worktree.exists(), "残留 worktree 目录应被删除");
+        let registered = gitops::list_worktrees(&repo).expect("列出 worktree");
+        assert_eq!(
+            registered.len(),
+            1,
+            "清理后只应保留主 worktree：{registered:?}"
+        );
+        assert!(registered.iter().all(|path| path != &worktree));
     }
 }

@@ -96,6 +96,7 @@ pub struct TaskRow {
     pub status: TaskStatus,
     pub prompt: String,
     pub attempts: u32,
+    pub max_minutes: i64,
     pub created_at: String,
 }
 
@@ -296,7 +297,8 @@ pub fn create_task(conn: &Connection, input: NewTask) -> Result<TaskRow, String>
     tx.commit().map_err(db_err)?;
 
     conn.query_row(
-        "SELECT t.id, i.project_id, i.title, i.status, t.prompt, t.attempts, t.created_at
+        "SELECT t.id, i.project_id, i.title, i.status, t.prompt, t.attempts, t.max_minutes,
+                t.created_at
          FROM tasks t JOIN items i ON i.id = t.item_id
          WHERE t.id = ?1",
         params![task_id],
@@ -314,6 +316,37 @@ pub fn list_tasks_for_project(
     project_id: &str,
 ) -> Result<Vec<TaskSummary>, String> {
     query_task_summaries(conn, Some(project_id))
+}
+
+/// 取最旧的排队任务：`items.status='queued'`，按创建时间、任务 id 升序。
+///
+/// 排序键与调度器的 FIFO 语义一致；同一毫秒创建时用 `t.id` 兜底，保证结果稳定。
+pub fn next_queued_task(conn: &Connection) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT t.id
+         FROM tasks t JOIN items i ON i.id = t.item_id
+         WHERE i.status = 'queued'
+         ORDER BY i.created_at ASC, t.id ASC
+         LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+/// 读取任务当前状态，供调度器做轻量轮询（避免拉取完整 [`TaskDetail`]）。
+pub fn task_status(conn: &Connection, task_id: &str) -> Result<TaskStatus, String> {
+    let raw = conn
+        .query_row(
+            "SELECT i.status FROM tasks t JOIN items i ON i.id = t.item_id WHERE t.id = ?1",
+            params![task_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(db_err)?
+        .ok_or_else(|| format!("任务不存在：{task_id}"))?;
+    TaskStatus::parse(&raw)
 }
 
 fn query_task_summaries(
@@ -350,12 +383,12 @@ fn query_task_summaries(
 pub fn get_task(conn: &Connection, task_id: &str) -> Result<TaskDetail, String> {
     let (task, acceptance_json) = conn
         .query_row(
-            "SELECT t.id, i.project_id, i.title, i.status, t.prompt, t.attempts, t.created_at,
-                    t.acceptance_json
+            "SELECT t.id, i.project_id, i.title, i.status, t.prompt, t.attempts, t.max_minutes,
+                    t.created_at, t.acceptance_json
              FROM tasks t JOIN items i ON i.id = t.item_id
              WHERE t.id = ?1",
             params![task_id],
-            |row| Ok((read_task_row(row)?, row.get::<_, String>(7)?)),
+            |row| Ok((read_task_row(row)?, row.get::<_, String>(8)?)),
         )
         .optional()
         .map_err(db_err)?
@@ -445,9 +478,9 @@ pub fn get_task(conn: &Connection, task_id: &str) -> Result<TaskDetail, String> 
 /// 任务状态迁移，唯一写入口；非法迁移返回 `Err`。
 ///
 /// 边集合即 `docs/data-model.md` §3：`merged` 无出边；`needs_human` / `interrupted`
-/// 只能迁回 `queued` / `draft`（由人工触发，但走同一函数）。进入 `queued` 必须已有
-/// 验收标准；`failed -> queued` 要求尝试次数未用尽。`merged` 的证据门由
-/// [`merge_ready`] 负责，调用方须先确认再迁移。
+/// 只能迁回 `queued` / `draft`，`queued` 可取消回 `draft`（由人工触发，但走同一函数）。
+/// 进入 `queued` 必须已有验收标准；`failed -> queued` 要求尝试次数未用尽。`merged`
+/// 的证据门由 [`merge_ready`] 负责，调用方须先确认再迁移。
 pub fn transition(conn: &Connection, task_id: &str, to: TaskStatus) -> Result<TaskStatus, String> {
     let (item_id, raw_status, attempts, acceptance_json) = conn
         .query_row(
@@ -509,6 +542,7 @@ fn allowed_transition(from: TaskStatus, to: TaskStatus) -> bool {
         (Draft, Ready)
             | (Ready, Queued)
             | (Queued, Running)
+            | (Queued, Draft)
             | (Running, Verifying)
             | (Running, Failed)
             | (Running, Interrupted)
@@ -974,7 +1008,8 @@ fn read_task_row(row: &Row<'_>) -> rusqlite::Result<TaskRow> {
         status: read_status(row, 3)?,
         prompt: row.get(4)?,
         attempts: row.get(5)?,
-        created_at: row.get(6)?,
+        max_minutes: row.get::<_, i64>(6)?,
+        created_at: row.get(7)?,
     })
 }
 
@@ -1273,6 +1308,7 @@ mod tests {
         let task = create_task(conn, new_task(&project_id, criteria())).unwrap();
         assert_eq!(task.status, TaskStatus::Draft);
         assert_eq!(task.attempts, 0);
+        assert_eq!(task.max_minutes, 30);
         assert_eq!(task.project_id, project_id);
         assert_eq!(task.prompt, "实现证据门并跑通验收");
 
@@ -1352,6 +1388,142 @@ mod tests {
     }
 
     #[test]
+    fn queued_can_cancel_to_draft_but_merged_stays_terminal() {
+        let db = open_db();
+        let project_id = project(&db);
+        let conn = db.conn();
+
+        let task = create_task(conn, new_task(&project_id, criteria())).unwrap();
+        let id = task.id.as_str();
+        transition(conn, id, TaskStatus::Ready).unwrap();
+        transition(conn, id, TaskStatus::Queued).unwrap();
+        assert_eq!(
+            transition(conn, id, TaskStatus::Draft).unwrap(),
+            TaskStatus::Draft
+        );
+        assert_eq!(get_task(conn, id).unwrap().task.status, TaskStatus::Draft);
+        assert_eq!(next_queued_task(conn).unwrap(), None);
+
+        // 取消后可重新入队并走到终态
+        ready_to_running(conn, id);
+        transition(conn, id, TaskStatus::Verifying).unwrap();
+        transition(conn, id, TaskStatus::Merged).unwrap();
+        let err = transition(conn, id, TaskStatus::Queued).unwrap_err();
+        assert!(err.contains("非法状态迁移"), "{err}");
+        assert!(transition(conn, id, TaskStatus::Draft).is_err());
+    }
+
+    #[test]
+    fn transition_edges_match_documented_state_machine() {
+        use TaskStatus::*;
+        const ALL: [TaskStatus; 9] = [
+            Draft,
+            Ready,
+            Queued,
+            Running,
+            Verifying,
+            Merged,
+            Failed,
+            NeedsHuman,
+            Interrupted,
+        ];
+        let allowed = [
+            (Draft, Ready),
+            (Ready, Queued),
+            (Queued, Running),
+            (Queued, Draft),
+            (Running, Verifying),
+            (Running, Failed),
+            (Running, Interrupted),
+            (Verifying, Merged),
+            (Verifying, NeedsHuman),
+            (Verifying, Failed),
+            (Verifying, Interrupted),
+            (Failed, Queued),
+            (Failed, NeedsHuman),
+            (Interrupted, Queued),
+            (Interrupted, Draft),
+            (NeedsHuman, Queued),
+            (NeedsHuman, Draft),
+        ];
+        for from in ALL {
+            for to in ALL {
+                assert_eq!(
+                    allowed_transition(from, to),
+                    allowed.contains(&(from, to)),
+                    "{from} -> {to}"
+                );
+            }
+        }
+        // merged 是终态：没有任何出边
+        assert!(ALL.iter().all(|to| !allowed_transition(Merged, *to)));
+    }
+
+    #[test]
+    fn next_queued_task_returns_oldest_queued_task() {
+        let db = open_db();
+        let project_id = project(&db);
+        let conn = db.conn();
+
+        assert_eq!(next_queued_task(conn).unwrap(), None);
+
+        let older = create_task(conn, new_task(&project_id, criteria())).unwrap();
+        let newer = create_task(conn, new_task(&project_id, criteria())).unwrap();
+
+        // draft 不参与调度
+        assert_eq!(next_queued_task(conn).unwrap(), None);
+
+        for id in [&older.id, &newer.id] {
+            transition(conn, id, TaskStatus::Ready).unwrap();
+            transition(conn, id, TaskStatus::Queued).unwrap();
+        }
+        // 固定创建时间，避免毫秒级抖动影响断言
+        conn.execute(
+            "UPDATE items SET created_at = '2026-01-02T00:00:00.000Z'
+             WHERE id = (SELECT item_id FROM tasks WHERE id = ?1)",
+            [newer.id.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE items SET created_at = '2026-01-01T00:00:00.000Z'
+             WHERE id = (SELECT item_id FROM tasks WHERE id = ?1)",
+            [older.id.as_str()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            next_queued_task(conn).unwrap().as_deref(),
+            Some(older.id.as_str())
+        );
+        assert_eq!(task_status(conn, &older.id).unwrap(), TaskStatus::Queued);
+        assert_eq!(task_status(conn, &newer.id).unwrap(), TaskStatus::Queued);
+        assert!(task_status(conn, "missing-task").is_err());
+
+        // 同一时刻按任务 id 升序兜底
+        conn.execute(
+            "UPDATE items SET created_at = '2026-01-01T00:00:00.000Z'",
+            [],
+        )
+        .unwrap();
+        let (first, second) = if older.id < newer.id {
+            (&older, &newer)
+        } else {
+            (&newer, &older)
+        };
+        assert_eq!(
+            next_queued_task(conn).unwrap().as_deref(),
+            Some(first.id.as_str())
+        );
+
+        // 取消首个任务后调度下一个
+        transition(conn, &first.id, TaskStatus::Draft).unwrap();
+        assert_eq!(
+            next_queued_task(conn).unwrap().as_deref(),
+            Some(second.id.as_str())
+        );
+    }
+
+    #[test]
     fn valid_transitions_pass_and_merged_is_terminal() {
         let db = open_db();
         let project_id = project(&db);
@@ -1414,6 +1586,7 @@ mod tests {
 
     #[test]
     fn failed_retry_is_limited_to_three_attempts() {
+        assert_eq!(MAX_ATTEMPTS, 3);
         let db = open_db();
         let project_id = project(&db);
         let conn = db.conn();

@@ -91,6 +91,7 @@ stateDiagram-v2
   draft --> ready: 验收标准已生成/确认
   ready --> queued: 依赖满足
   queued --> running: 分配 worktree
+  queued --> draft: 人工取消
   running --> verifying: Agent 结束
   running --> failed: 进程异常/超时
   verifying --> merged: 证据全绿 + 审查 pass
@@ -125,7 +126,10 @@ stateDiagram-v2
 
 - 每个 run：`git worktree add <worktree> -b <branch> <base_sha>`
 - Agent 的 cwd 为 worktree；OMP 会话结束后收集：退出码、stdout/stderr、diff（`git diff base..head`）、未提交改动
-- 合并队列持有目标分支写锁；rebase 冲突 > 3 个文件或涉及高风险路径时直接升级人工
+- 合并前若目标分支已前移，先在 worktree 内 rebase 到目标 tip；冲突立即 `rebase --abort` 并转人工
+- 合并队列持有目标分支写锁（进程内单一 worker + 合并锁）；合并后立即在目标仓库重跑全部验收命令，失败则 `reset --hard` 回滚并转 `needs_human`
+- 任务取消：`queued → draft`；运行中取消通过适配器 `cancel`，随后按失败路径处理
+- worktree 生命周期：合并成功后删除；失败保留待调试；启动时 `git worktree prune` 并清理未在 `worktree list` 中的孤儿目录
 
 ## 6. 同步
 

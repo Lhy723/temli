@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Button, Chip } from "@heroui/react";
 import { Inbox, RefreshCw } from "lucide-react";
 import {
+  decisionKindLabel,
   errorText,
   formatDate,
   listDecisions,
@@ -152,7 +153,7 @@ export function DecisionInbox({ projectId }: { projectId: string }) {
               </p>
               <div className="mt-1 flex flex-wrap items-center gap-1.5 text-label text-[var(--muted)]">
                 <Chip size="sm" variant="tertiary" color="warning">
-                  {decision.kind}
+                  {decisionKindLabel(decision.kind)}
                 </Chip>
                 {decision.task_id && (
                   <span className="font-mono">

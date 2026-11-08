@@ -105,6 +105,10 @@ export function startTask(taskId: string): Promise<void> {
   return invoke<void>("start_task", { taskId });
 }
 
+export function cancelTask(taskId: string): Promise<void> {
+  return invoke<void>("cancel_task", { taskId });
+}
+
 export function listDecisions(projectId: string): Promise<DecisionRow[]> {
   return invoke<DecisionRow[]>("list_decisions", { projectId });
 }
@@ -128,7 +132,7 @@ const STATUS_LABELS: Record<string, string> = {
   verifying: "验证中",
   merged: "已合并",
   failed: "失败",
-  needs_human: "待人工",
+  needs_human: "待决策",
   interrupted: "已中断",
   prepared: "已准备",
   completed: "完成",
@@ -178,6 +182,22 @@ export function verdictLabel(verdict: string): string {
     default:
       return verdict;
   }
+}
+
+const DECISION_KIND_LABELS: Record<string, string> = {
+  timeout: "执行超时",
+  retry_exhausted: "重试耗尽",
+  post_merge_failed: "合并后验证失败",
+  rebase_failed: "变基失败",
+  evidence_gate: "证据门未通过",
+  merge_failed: "合并失败",
+  review_failed: "审查失败",
+  test_changes_unreviewed: "测试改动未审查",
+  agent_approval: "等待授权",
+};
+
+export function decisionKindLabel(kind: string): string {
+  return DECISION_KIND_LABELS[kind] ?? kind;
 }
 
 /** 把后端可能为数组 / 字符串 / 对象的字段归一成可展示的字符串数组。 */
