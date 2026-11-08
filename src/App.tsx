@@ -117,6 +117,11 @@ export default function App() {
     });
   }
 
+  function startRegister() {
+    open("projects");
+    setShowRegister(true);
+  }
+
   return (
     <div className="flex h-full overflow-hidden bg-[var(--background-secondary)] text-[var(--foreground)]">
       <aside className="flex w-60 shrink-0 flex-col px-2 pb-2 pt-10">
@@ -219,10 +224,7 @@ export default function App() {
                 variant="primary"
                 size="sm"
                 className="gap-1"
-                onPress={() => {
-                  open("projects");
-                  setShowRegister(true);
-                }}
+                onPress={startRegister}
               >
                 <Plus size={15} />
                 注册项目
@@ -252,7 +254,7 @@ export default function App() {
 
               {active === "overview" && (
                 <>
-                  {projects.length === 0 && <EmptyProject onRegister={() => setShowRegister(true)} />}
+                  {projects.length === 0 && <EmptyProject onRegister={startRegister} />}
                   {projects.length > 0 && <ProjectList projects={projects} />}
                 </>
               )}
@@ -272,7 +274,7 @@ export default function App() {
                   )}
                   {projects.length > 0 && <ProjectList projects={projects} />}
                   {projects.length === 0 && !showRegister && (
-                    <EmptyProject onRegister={() => setShowRegister(true)} />
+                    <EmptyProject onRegister={startRegister} />
                   )}
                 </>
               )}
