@@ -634,6 +634,35 @@ pub fn set_project_auto_merge(
     Ok(())
 }
 
+/// 项目是否强制要求 PR 检查全部通过；默认关闭，此时空检查列表视为通过。
+pub fn project_require_checks(conn: &Connection, project_id: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT COALESCE(require_checks, 0) FROM projects WHERE id = ?1",
+        params![project_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)?
+    .ok_or_else(|| format!("项目不存在：{project_id}"))
+}
+
+pub fn set_project_require_checks(
+    conn: &Connection,
+    project_id: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE projects SET require_checks = ?2 WHERE id = ?1",
+            params![project_id, enabled],
+        )
+        .map_err(db_err)?;
+    if changed == 0 {
+        return Err(format!("项目不存在：{project_id}"));
+    }
+    Ok(())
+}
+
 /// 项目下的 issue item 列表（含本地尚未发布的 issue）。
 pub fn list_project_issues(
     conn: &Connection,
@@ -2626,5 +2655,23 @@ mod tests {
 
         assert!(set_project_concurrency(conn, "missing-project", 2).is_err());
         assert!(project_concurrency(conn, "missing-project").is_err());
+    }
+
+    #[test]
+    fn require_checks_defaults_false_and_roundtrips() {
+        let db = open_db();
+        let project_id = project(&db);
+        let conn = db.conn();
+
+        assert!(!project_require_checks(conn, &project_id).unwrap());
+
+        set_project_require_checks(conn, &project_id, true).unwrap();
+        assert!(project_require_checks(conn, &project_id).unwrap());
+
+        set_project_require_checks(conn, &project_id, false).unwrap();
+        assert!(!project_require_checks(conn, &project_id).unwrap());
+
+        assert!(set_project_require_checks(conn, "missing-project", true).is_err());
+        assert!(project_require_checks(conn, "missing-project").is_err());
     }
 }

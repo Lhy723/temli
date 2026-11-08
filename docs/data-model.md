@@ -141,6 +141,7 @@ stateDiagram-v2
 - 本地编辑：先 GET 比对 `updated_at`，不一致直接拒绝并提示先同步；一致才 PATCH 并回写新版本
 - PR：`runs.pr_number/pr_url/pr_state` 记录；自动合并默认关闭（`projects.auto_merge=0`）
 - 自动合并开启时：证据门全绿 → push 分支 → 创建 PR → 轮询 checks（10s/10min）→ 全绿才合并 → fetch + `pull --ff-only` 更新本地默认分支；失败或超时进决策收件箱
+- `projects.require_checks` 控制空 checks 的语义：默认 0，仓库没有 CI 时视为通过（证据门仍是主判据）；置 1 时无 checks 直接阻止自动合并并转人工
 
 ## 7. 事件
 

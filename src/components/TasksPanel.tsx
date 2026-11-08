@@ -4,6 +4,7 @@ import {
   Button,
   Card,
   Chip,
+  Description,
   Input,
   ListBox,
   Select,
@@ -41,6 +42,7 @@ import {
   getAutoMerge,
   getProjectConcurrency,
   getProjectIssues,
+  getRequireChecks,
   getTask,
   listDependencies,
   listEvents,
@@ -50,6 +52,7 @@ import {
   resolveDecision,
   setAutoMerge,
   setProjectConcurrency,
+  setRequireChecks,
   startTask,
   statusLabel,
   statusTone,
@@ -112,6 +115,13 @@ export function TasksPanel({ projectId }: { projectId: string }) {
   const [autoMerge, setAutoMergeEnabled] = useState<boolean | null>(null);
   const [autoMergeSaving, setAutoMergeSaving] = useState(false);
   const [autoMergeError, setAutoMergeError] = useState<string | null>(null);
+  const [requireChecks, setRequireChecksEnabled] = useState<boolean | null>(
+    null,
+  );
+  const [requireChecksSaving, setRequireChecksSaving] = useState(false);
+  const [requireChecksError, setRequireChecksError] = useState<string | null>(
+    null,
+  );
   const selectedRef = useRef<string | null>(null);
   const detailRequestRef = useRef(0);
   const projectRef = useRef(projectId);
@@ -210,6 +220,26 @@ export function TasksPanel({ projectId }: { projectId: string }) {
     };
   }, [projectId]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setRequireChecksEnabled(null);
+    setRequireChecksSaving(false);
+    setRequireChecksError(null);
+    getRequireChecks(projectId)
+      .then((enabled) => {
+        if (cancelled || projectRef.current !== projectId) return;
+        setRequireChecksEnabled(enabled);
+      })
+      .catch((e) => {
+        if (cancelled || projectRef.current !== projectId) return;
+        setRequireChecksEnabled(false);
+        setRequireChecksError(errorText(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
   async function refreshTasks() {
     const requestedFor = projectId;
     const next = await listTasks(requestedFor);
@@ -282,6 +312,23 @@ export function TasksPanel({ projectId }: { projectId: string }) {
       setAutoMergeError(errorText(e));
     } finally {
       if (projectRef.current === requestedFor) setAutoMergeSaving(false);
+    }
+  }
+
+  async function saveRequireChecks(enabled: boolean) {
+    if (requireChecks === null || requireChecksSaving) return;
+    const requestedFor = projectId;
+    setRequireChecksSaving(true);
+    setRequireChecksError(null);
+    try {
+      await setRequireChecks({ project_id: requestedFor, enabled });
+      if (projectRef.current !== requestedFor) return;
+      setRequireChecksEnabled(enabled);
+    } catch (e) {
+      if (projectRef.current !== requestedFor) return;
+      setRequireChecksError(errorText(e));
+    } finally {
+      if (projectRef.current === requestedFor) setRequireChecksSaving(false);
     }
   }
 
@@ -587,6 +634,21 @@ export function TasksPanel({ projectId }: { projectId: string }) {
                 自动合并
               </Switch.Content>
             </Switch>
+            <Switch
+              size="sm"
+              isSelected={requireChecks === true}
+              isDisabled={requireChecks === null || requireChecksSaving}
+              onChange={(enabled) => void saveRequireChecks(enabled)}
+              className="text-ui-sm text-[var(--muted)]"
+            >
+              <Switch.Content>
+                <Switch.Control>
+                  <Switch.Thumb />
+                </Switch.Control>
+                要求 CI checks
+              </Switch.Content>
+              <Description>无 checks 时阻止自动合并</Description>
+            </Switch>
             <div className="flex items-center gap-1 text-ui-sm text-[var(--muted)]">
               <span className="shrink-0">并发</span>
               <Input
@@ -638,6 +700,12 @@ export function TasksPanel({ projectId }: { projectId: string }) {
         {autoMergeError && (
           <p role="alert" className="mb-2 text-ui-sm text-[var(--danger)]">
             {autoMergeError}
+          </p>
+        )}
+
+        {requireChecksError && (
+          <p role="alert" className="mb-2 text-ui-sm text-[var(--danger)]">
+            {requireChecksError}
           </p>
         )}
 

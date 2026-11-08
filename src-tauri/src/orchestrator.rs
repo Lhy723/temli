@@ -156,6 +156,15 @@ fn project_auto_merge(ctx: &RunContext, project_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 读取项目是否强制要求 PR 检查；读取失败回退到 `false`（空检查列表可以通过），
+/// 保持升级前的旧行为，避免一次数据库抖动改变合并判定。
+fn project_require_checks(ctx: &RunContext, project_id: &str) -> bool {
+    let Ok(guard) = ctx.db.lock() else {
+        return false;
+    };
+    store::project_require_checks(guard.conn(), project_id).unwrap_or(false)
+}
+
 /// 自动合并所需的 GitHub 上下文：开关为真、项目配置了 `owner/repo`、且本次运行
 /// 注入了 `GitHubOps`。任一条件不满足都回退到本地快进合并路径。
 #[derive(Clone)]
@@ -163,6 +172,8 @@ struct AutoMergeConfig {
     ops: Arc<dyn crate::github::GitHubOps>,
     /// GitHub API 的 `owner/repo` 形式。
     repo: String,
+    /// 项目是否要求 PR 必须带有通过的检查；为 false 时空检查列表视为通过。
+    require_checks: bool,
 }
 
 fn auto_merge_config(ctx: &RunContext, project: &crate::db::Project) -> Option<AutoMergeConfig> {
@@ -178,6 +189,7 @@ fn auto_merge_config(ctx: &RunContext, project: &crate::db::Project) -> Option<A
     Some(AutoMergeConfig {
         ops,
         repo: format!("{owner}/{repo}"),
+        require_checks: project_require_checks(ctx, &project.id),
     })
 }
 
@@ -195,12 +207,15 @@ const FAILED_CHECK_BUCKETS: &[&str] = &[
     "stale",
 ];
 
-/// 空检查列表不算通过：没有任何检查信息的 PR 不能自动合并。
-fn checks_passed(checks: &[crate::github::CheckRun]) -> bool {
-    !checks.is_empty()
-        && checks
-            .iter()
-            .all(|check| matches!(check.bucket.as_str(), "success" | "skipped" | "neutral"))
+/// 检查是否已全部通过。空检查列表只有在项目未强制要求检查（`require_checks`
+/// 为 false）时才算通过；要求检查的项目绝不能让无 CI 的 PR 自动合并。
+fn checks_passed(checks: &[crate::github::CheckRun], require_checks: bool) -> bool {
+    if checks.is_empty() {
+        return !require_checks;
+    }
+    checks
+        .iter()
+        .all(|check| matches!(check.bucket.as_str(), "success" | "skipped" | "neutral"))
 }
 
 fn checks_failed_terminally(checks: &[crate::github::CheckRun]) -> bool {
@@ -1260,7 +1275,16 @@ fn auto_merge_pull_request(
             url: pr.url.clone(),
             message: format!("读取 PR 检查失败：{err}"),
         })?;
-        if checks_passed(&checks) {
+        if checks.is_empty() && cfg.require_checks {
+            // 要求检查的项目不接受空检查列表，直接交给人工处理，而不是轮询到超时。
+            return Err(AutoMergeFailure::PullRequest {
+                url: pr.url.clone(),
+                message:
+                    "项目要求 PR 必须有通过的 CI 检查，但该 PR 没有任何检查结果，拒绝自动合并。"
+                        .to_string(),
+            });
+        }
+        if checks_passed(&checks, cfg.require_checks) {
             break;
         }
         if checks_failed_terminally(&checks) {
@@ -2313,6 +2337,18 @@ mod tests {
         store::get_task(guard.conn(), task_id).unwrap().task.status
     }
 
+    fn set_require_checks(ctx: &RunContext, task_id: &str, enabled: bool) {
+        let project_id = {
+            let guard = ctx.db.lock().unwrap();
+            store::get_task(guard.conn(), task_id)
+                .unwrap()
+                .task
+                .project_id
+        };
+        let guard = ctx.db.lock().unwrap();
+        store::set_project_require_checks(guard.conn(), &project_id, enabled).unwrap();
+    }
+
     #[test]
     fn merges_when_evidence_and_review_pass() {
         let (ctx, task_id) = setup("test -f done.txt");
@@ -2889,21 +2925,36 @@ mod tests {
     }
 
     #[test]
-    fn checks_passed_requires_nonempty_green_list() {
-        assert!(!checks_passed(&[]), "空检查列表不能视为通过");
-        assert!(checks_passed(&[
-            green_check("ci", "success"),
-            green_check("lint", "skipped"),
-            green_check("optional", "neutral"),
-        ]));
-        assert!(!checks_passed(&[
-            green_check("ci", "success"),
-            green_check("deploy", "pending"),
-        ]));
-        assert!(!checks_passed(&[
-            green_check("ci", "success"),
-            green_check("test", "failure"),
-        ]));
+    fn checks_passed_respects_require_checks() {
+        assert!(
+            checks_passed(&[], false),
+            "未要求检查时空检查列表应视为通过"
+        );
+        assert!(
+            !checks_passed(&[], true),
+            "要求检查时空检查列表不能视为通过"
+        );
+        for require_checks in [false, true] {
+            assert!(checks_passed(
+                &[
+                    green_check("ci", "success"),
+                    green_check("lint", "skipped"),
+                    green_check("optional", "neutral"),
+                ],
+                require_checks
+            ));
+            assert!(!checks_passed(
+                &[
+                    green_check("ci", "success"),
+                    green_check("deploy", "pending"),
+                ],
+                require_checks
+            ));
+            assert!(!checks_passed(
+                &[green_check("ci", "success"), green_check("test", "failure"),],
+                require_checks
+            ));
+        }
         assert!(checks_failed_terminally(&[green_check("test", "failure")]));
         assert!(!checks_failed_terminally(&[green_check(
             "deploy", "pending"
@@ -2966,6 +3017,103 @@ mod tests {
         let detail = store::get_task(guard.conn(), &task_id).unwrap();
         assert!(detail.decisions.is_empty());
         assert_eq!(detail.runs[0].status, "completed");
+    }
+
+    /// 项目未要求检查时空检查列表直接通过：不轮询、不等超时，正常走合并。
+    #[test]
+    fn auto_merge_without_checks_merges_when_checks_not_required() {
+        let ops = Arc::new(FakeGitHubOps::new(Vec::new()));
+        let (ctx, task_id) = setup_full(
+            "test -f done.txt",
+            |_| Arc::new(ScriptedAdapter),
+            Some(ops.clone()),
+            true,
+        );
+        let repo = repo_of(&ctx, &task_id);
+        ops.simulate_merge_in(repo.clone());
+        let before = gitops::head_sha(&repo).unwrap();
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::Merged);
+        assert_eq!(
+            ops.calls()
+                .iter()
+                .filter(|call| **call == "pull_request_checks")
+                .count(),
+            1,
+            "空检查列表必须在首次轮询就通过，不能等待：{:?}",
+            ops.calls()
+        );
+        assert_eq!(ops.merged.lock().unwrap().len(), 1, "PR 必须合并一次");
+        assert_ne!(gitops::head_sha(&repo).unwrap(), before);
+        let (_, url, state) = run_pr_fields(&ctx, &task_id);
+        assert_eq!(url.as_deref(), Some("https://github.com/acme/demo/pull/42"));
+        assert_eq!(state.as_deref(), Some("merged"));
+
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        assert!(detail.decisions.is_empty());
+        assert_eq!(detail.runs[0].status, "completed");
+    }
+
+    /// 项目要求检查时空检查列表立即进入 checks_failed 人工决策，绝不能合并。
+    #[test]
+    fn auto_merge_blocks_empty_checks_when_checks_required() {
+        let ops = Arc::new(FakeGitHubOps::new(Vec::new()));
+        let (ctx, task_id) = setup_full(
+            "test -f done.txt",
+            |_| Arc::new(ScriptedAdapter),
+            Some(ops.clone()),
+            true,
+        );
+        set_require_checks(&ctx, &task_id, true);
+        let repo = repo_of(&ctx, &task_id);
+        ops.simulate_merge_in(repo.clone());
+        let before = gitops::head_sha(&repo).unwrap();
+
+        run_task_blocking(&ctx, &task_id).unwrap();
+
+        assert_eq!(status(&ctx, &task_id), TaskStatus::NeedsHuman);
+        assert!(
+            ops.merged.lock().unwrap().is_empty(),
+            "要求检查时无检查结果的 PR 绝不能合并"
+        );
+        assert_eq!(
+            ops.calls()
+                .iter()
+                .filter(|call| **call == "pull_request_checks")
+                .count(),
+            1,
+            "空检查列表应立即失败，不能轮询到超时：{:?}",
+            ops.calls()
+        );
+        assert_eq!(gitops::head_sha(&repo).unwrap(), before);
+        let (number, url, state) = run_pr_fields(&ctx, &task_id);
+        assert_eq!(number, Some(42));
+        assert_eq!(url.as_deref(), Some("https://github.com/acme/demo/pull/42"));
+        assert_eq!(state.as_deref(), Some("open"));
+
+        let guard = ctx.db.lock().unwrap();
+        let detail = store::get_task(guard.conn(), &task_id).unwrap();
+        let decision = detail
+            .decisions
+            .iter()
+            .find(|row| row.kind == "checks_failed")
+            .expect("checks_failed decision");
+        assert!(
+            decision.prompt.contains("CI 检查"),
+            "prompt 必须说明要求 CI 检查: {}",
+            decision.prompt
+        );
+        assert!(
+            decision
+                .prompt
+                .contains("https://github.com/acme/demo/pull/42"),
+            "prompt 必须带 PR 链接: {}",
+            decision.prompt
+        );
+        assert_eq!(detail.runs[0].status, "failed");
     }
 
     /// 取消发生在检查轮询期间：PR 已创建但绝不能合并，运行按取消收尾。

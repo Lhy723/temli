@@ -128,6 +128,11 @@ export type SetAutoMergeInput = {
   enabled: boolean;
 };
 
+export type SetRequireChecksInput = {
+  project_id: string;
+  enabled: boolean;
+};
+
 export function listTasks(projectId: string): Promise<TaskSummary[]> {
   return invoke<TaskSummary[]>("list_tasks", { projectId });
 }
@@ -207,6 +212,14 @@ export function getAutoMerge(projectId: string): Promise<boolean> {
 
 export function setAutoMerge(input: SetAutoMergeInput): Promise<void> {
   return invoke<void>("set_auto_merge", { input });
+}
+
+export function getRequireChecks(projectId: string): Promise<boolean> {
+  return invoke<boolean>("get_require_checks", { projectId });
+}
+
+export function setRequireChecks(input: SetRequireChecksInput): Promise<void> {
+  return invoke<void>("set_require_checks", { input });
 }
 
 const STATUS_LABELS: Record<string, string> = {

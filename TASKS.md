@@ -1,6 +1,6 @@
 # TASKS
 
-当前里程碑：M4 GitHub 同步与自动合并（已合入）
+当前里程碑：M4 GitHub 同步与自动合并（已合入，含 require_checks）
 
 ## 已完成
 
@@ -86,7 +86,7 @@
 ## M3 冒烟
 
 - 并发 2：gamma / delta 同时 running；delta 先合并，gamma 在合并时 rebase 到新 tip 后成功合并（修复前会 merge_failed）
-- 依赖/并发/串行/环检测由 `cargo test` 覆盖（175 tests）
+- 依赖/并发/串行/环检测由 `cargo test` 覆盖（178 tests）
 
 ## 进行中：M4 GitHub 同步与自动合并
 
@@ -97,4 +97,5 @@
 - [x] 实时同步冒烟：远端新建 issue 1 分钟内入库；改标题后 1 个周期内本地更新
 - [x] 独立审查（1 P1 / 7 P2 / 2 P3）
 - [x] 审查修复：分页 ghost、合并 SHA 锁定、轮询取消、合并锁、curl 超时/令牌、发布幂等、pr_state 顺序、前端跨项目刷新
+- [x] `require_checks` 语义：默认无 CI 视为通过，开启后空 checks 阻止自动合并（迁移 v4）
 - [x] 合入（PR #18）
