@@ -12,9 +12,11 @@ use std::thread;
 use std::time::Duration;
 
 use super::{
-    AgentAdapter, AgentEvent, AgentManifest, AgentState, AuthState, Capabilities, Decision,
-    DetectResult, EventSink, RiskLevel, RunSpec, RunStatus, SessionHandle,
+    AgentAdapter, AgentEvent, AgentManifest, AgentState, Capabilities, Decision, EventSink,
+    RiskLevel, RunSpec, RunStatus, SessionHandle,
 };
+#[cfg(test)]
+use super::{AuthState, DetectResult};
 
 const APPROVAL_REQUEST_ID: &str = "approval-1";
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -32,6 +34,8 @@ static NEXT_SESSION_ID: AtomicUsize = AtomicUsize::new(1);
 enum Script {
     Success,
     Approval,
+    /// 仅测试使用：由 [`FakeAdapter::with_failure`] 构造。
+    #[cfg(test)]
     Failure,
 }
 
@@ -54,11 +58,17 @@ impl FakeAdapter {
     }
 
     /// 审批脚本：发出一次审批请求并阻塞等待 `respond`，允许则完成，拒绝则取消。
+    ///
+    /// 仅测试使用。
+    #[cfg(test)]
     pub fn with_approval() -> Self {
         Self::with_script(Script::Approval)
     }
 
     /// 失败脚本：发出可重试错误并以 Ended(Failed) 结束。
+    ///
+    /// 仅测试使用。
+    #[cfg(test)]
     pub fn with_failure() -> Self {
         Self::with_script(Script::Failure)
     }
@@ -90,9 +100,12 @@ impl AgentAdapter for FakeAdapter {
                 usage: false,
                 ..Capabilities::default()
             },
+            roles: super::AgentRole::all(),
         }
     }
 
+    /// 探测内置适配器；仅测试使用，生产代码不调用。
+    #[cfg(test)]
     fn detect(&self) -> DetectResult {
         DetectResult {
             available: true,
@@ -289,6 +302,7 @@ fn run_script(script: Script, runtime: Arc<Runtime>, approval: Option<Receiver<D
     }
     match script {
         Script::Success => run_success(&runtime),
+        #[cfg(test)]
         Script::Failure => run_failure(&runtime),
         Script::Approval => match approval {
             Some(receiver) => run_approval(&runtime, receiver),
@@ -327,6 +341,8 @@ fn run_success(runtime: &Runtime) {
     runtime.finish(RunStatus::Completed);
 }
 
+/// 仅测试使用：回放 [`Script::Failure`]。
+#[cfg(test)]
 fn run_failure(runtime: &Runtime) {
     if !emit_status(runtime, AgentState::Running) {
         return;
@@ -402,12 +418,10 @@ mod tests {
 
     fn run_spec() -> RunSpec {
         RunSpec {
-            run_id: "run-1".to_string(),
             cwd: std::env::temp_dir(),
             prompt: "hello".to_string(),
             model: None,
             max_minutes: 1,
-            max_cost_usd: None,
             env_allowlist: Vec::new(),
         }
     }

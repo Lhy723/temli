@@ -1,12 +1,15 @@
 //! OMP 适配器：以 RPC 模式通过 stdio（JSONL）驱动 `omp` CLI。
 //!
-//! 帧映射被抽成纯函数 [`map_frame`]，审批回复编码抽成
-//! [`approval_response_frame`]，便于在不启动子进程的前提下测试。
+//! 帧映射被抽成纯函数 [`map_frame_with_state`]（无状态入口 `map_frame` 仅测试
+//! 使用），审批回复编码抽成 [`approval_response_frame`]，便于在不启动子进程的
+//! 前提下测试。
 
 use super::{
-    AgentAdapter, AgentEvent, AgentManifest, AgentState, AuthState, Capabilities, Decision,
-    DetectResult, EventSink, RiskLevel, RunSpec, RunStatus, SessionHandle,
+    AgentAdapter, AgentEvent, AgentManifest, AgentState, Capabilities, Decision, EventSink,
+    RiskLevel, RunSpec, RunStatus, SessionHandle,
 };
+#[cfg(test)]
+use super::{AuthState, DetectResult};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -20,6 +23,9 @@ use std::time::Duration;
 /// `omp` RPC 协议版本。
 const PROTOCOL_VERSION: u32 = 2;
 /// `omp --version` 探测超时。
+///
+/// 仅测试使用。
+#[cfg(test)]
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 /// abort 之后强制杀进程前的等待时间。
 const KILL_DELAY: Duration = Duration::from_secs(2);
@@ -82,9 +88,12 @@ impl AgentAdapter for OmpAdapter {
                 cost_cap: false,
                 resume: false,
             },
+            roles: super::AgentRole::all(),
         }
     }
 
+    /// 探测 `omp` 是否可用；仅测试使用，生产代码不调用。
+    #[cfg(test)]
     fn detect(&self) -> DetectResult {
         match probe_version() {
             Ok(version) => {
@@ -117,8 +126,6 @@ impl AgentAdapter for OmpAdapter {
     /// - `model`：`provider/modelId` 形式时在 prompt 之前发送 `set_model` 帧；
     /// - `max_minutes`：限制等待 `ready` 帧的秒数（1–30 秒）；
     /// - `env_allowlist`：非空时清空环境，只注入白名单中实际存在的变量。
-    ///
-    /// `run_id` 与 `max_cost_usd` 由编排层负责记录与预算控制，此处不参与 RPC。
     fn start(&self, spec: RunSpec, sink: EventSink) -> Result<SessionHandle, String> {
         let handle_id = format!("omp-{}", uuid::Uuid::new_v4());
         let mut command = Command::new("omp");
@@ -651,6 +658,9 @@ struct RunState {
 }
 
 /// 把 omp 的一帧映射为 UI 事件；纯函数，测试无需启动子进程。
+///
+/// 仅测试使用：生产路径直接调用 [`map_frame_with_state`] 以跨帧维护终态。
+#[cfg(test)]
 pub fn map_frame(frame: &Value) -> Vec<AgentEvent> {
     map_frame_with_state(frame, &mut RunState::default())
 }
@@ -1380,6 +1390,9 @@ fn reap_child(child: &Mutex<Child>) {
 }
 
 /// 在独立线程中执行 `omp --version`，主线程最多等待 5 秒。
+///
+/// 仅测试使用：生产代码不调用 [`AgentAdapter::detect`]。
+#[cfg(test)]
 fn probe_version() -> Result<Option<String>, String> {
     let (tx, rx) = mpsc::channel::<std::io::Result<std::process::Output>>();
     let _ = thread::spawn(move || {

@@ -7,12 +7,20 @@
 | 内容 | 位置 | 权威 |
 |---|---|---|
 | 交付文档正文 | 仓库 `docs/*.md`（frontmatter 带稳定 `id`） | 文件是正文权威，DB 只存索引与关系 |
-| 笔记 / 灵感 / 研究 | 项目内 `.temli/notes/*.md`（gitignored） | 文件 |
+| 笔记 / 灵感 / 研究 | 独立笔记库（vault）目录下的 Markdown，可含文件夹 | 文件 |
 | 元数据、状态、链接、证据 | `~/Library/Application Support/temli/temli.db`（SQLite + FTS5） | DB |
 | Agent 会话 | `~/.omp/agent/sessions/`（OMP 管理），DB 存 session id 与摘要 | OMP |
 | worktree | `~/Library/Application Support/temli/worktrees/<project>/<run>/` | 临时，合并后删除 |
 
 文件用 frontmatter `id` 标识而不是路径，重命名不断链；路径仅作索引字段。
+
+知识空间与开发空间已解耦：
+
+- 笔记库（vault）：独立目录，可注册多个；`vault_notes` 索引 `<vault>/**/*.md`（任意文件夹结构），文件是权威，DB 缓存正文
+- 双链：`[[标题]]` / `[[标题|别名]]` 写入 `vault_links`，按标题或路径 stem 解析；提供反向链接与图谱（nodes/edges）
+- 笔记检索：`notes_fts(note_id, vault_id, title, body, tokenize='trigram')`，2 字查询走 LIKE
+- 笔记不参与项目上下文：任务上下文只允许 `kind='doc'`；派发时注入文档标题+正文（单项 4k、整体 12k）
+- 文档：仓库 `docs/**/*.md` 仍属项目，只读索引，`search_fts` 维护
 
 项目注册时必须校验 `.temli/` 已被忽略（`git check-ignore -q .temli/`）；未忽略则阻止完成注册，并提示一键追加到 `.gitignore`。temli 自身仓库的根 `.gitignore` 同样包含 `.temli/`。
 
@@ -33,9 +41,11 @@ links(id, from_item, to_item, rel CHECK(rel IN ('derived_from','implements','blo
 -- blocks：from_item 阻塞 to_item，即 to_item 依赖 from_item（方向见 §2.1）
 
 tasks(id, item_id UNIQUE, acceptance_json, priority,
-      max_minutes DEFAULT 30, attempts DEFAULT 0, created_at)
+      max_minutes DEFAULT 30, attempts DEFAULT 0, created_at,
+      developer_adapter TEXT, reviewer_adapter TEXT)
 -- 一任务对应一个 issue；acceptance_json 为 [{id, cmd, expect_exit, expect_match}]
 -- 依赖不存本表：唯一事实源是 links.rel='blocks'（见 §2.1）
+-- 适配器按任务覆盖；为空时使用项目默认与开发者默认
 
 runs(id, task_id, attempt, adapter_id, adapter_version, model, worktree_path, branch, base_sha,
      head_sha, status, started_at, ended_at, session_id, error)

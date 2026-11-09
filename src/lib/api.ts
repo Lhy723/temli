@@ -7,6 +7,10 @@ export type TaskSummary = {
   attempts: number;
   criterion_count: number;
   created_at: string;
+  developer_adapter: string | null;
+  reviewer_adapter: string | null;
+  model?: string | null;
+  auto_docs?: boolean;
 };
 
 export type Criterion = {
@@ -24,6 +28,9 @@ export type TaskRow = {
   prompt: string;
   attempts: number;
   created_at: string;
+  developer_adapter: string | null;
+  reviewer_adapter: string | null;
+  model?: string | null;
 };
 
 export type RunRow = {
@@ -121,6 +128,35 @@ export type UpdateIssueInput = {
   item_id: string;
   title?: string;
   body?: string;
+  assignee?: string;
+  state?: "open" | "closed";
+};
+
+export type CreateTaskFromIssueInput = {
+  item_id: string;
+  title?: string;
+  prompt?: string;
+};
+
+export type PlanIssue = {
+  title: string;
+  prompt: string;
+  acceptance: Criterion[];
+  depends_on: number[];
+};
+
+export type PlanDraft = {
+  issues: PlanIssue[];
+};
+
+export type PlanProjectInput = {
+  project_id: string;
+  idea: string;
+};
+
+export type CreateTasksFromPlanInput = {
+  project_id: string;
+  draft: PlanDraft;
 };
 
 export type SetAutoMergeInput = {
@@ -131,6 +167,198 @@ export type SetAutoMergeInput = {
 export type SetRequireChecksInput = {
   project_id: string;
   enabled: boolean;
+};
+
+export type SetAutoDocsInput = {
+  project_id: string;
+  enabled: boolean;
+};
+
+export type NoteMeta = {
+  id: string;
+  title: string;
+  file_path: string;
+  updated_at: string;
+};
+
+export type Note = {
+  id: string;
+  title: string;
+  body: string;
+  file_path: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DocMeta = {
+  id: string;
+  title: string;
+  path: string;
+};
+
+export type Doc = DocMeta & {
+  body: string;
+};
+
+export type SearchHit = {
+  id: string;
+  kind: string;
+  title: string;
+  snippet: string;
+};
+
+export type GlobalHit = {
+  kind: "task" | "doc" | "note";
+  id: string;
+  title: string;
+  snippet: string;
+  project_id: string | null;
+  vault_id: string | null;
+};
+
+export type GlobalSearchInput = {
+  query: string;
+  project_id?: string;
+  limit?: number;
+};
+
+export type AgentCapabilities = {
+  streaming: boolean;
+  approvals: boolean;
+  cancel: boolean;
+  usage: boolean;
+  cost_cap: boolean;
+  resume: boolean;
+};
+
+export type AgentRole = "developer" | "reviewer";
+
+export type AgentManifest = {
+  id: string;
+  name: string;
+  version: string;
+  capabilities: AgentCapabilities;
+  roles: AgentRole[];
+};
+
+export type SetTaskAgentsInput = {
+  task_id: string;
+  developer_adapter: string | null;
+  reviewer_adapter: string | null;
+};
+
+export type SetTaskModelInput = {
+  task_id: string;
+  model: string | null;
+};
+
+export type Vault = {
+  id: string;
+  name: string;
+  root_path: string;
+  created_at: string;
+};
+
+/** 笔记库内的一条树项；目录项 is_dir=true（id/updated_at 可能为空）。 */
+export type VaultEntry = {
+  id?: string | null;
+  path: string;
+  title: string;
+  is_dir: boolean;
+  updated_at?: string | null;
+};
+
+export type VaultNote = {
+  id: string;
+  vault_id: string;
+  path: string;
+  title: string;
+  body: string;
+  updated_at: string;
+};
+
+export type VaultHit = {
+  id: string;
+  vault_id: string;
+  path: string;
+  title: string;
+  snippet: string;
+};
+
+export type Backlink = {
+  id: string;
+  path: string;
+  title: string;
+  /** 反向链接里书写的原始目标，例如 `[[目标|别名]]` 中的「目标」。 */
+  target: string;
+};
+
+export type VaultGraphNode = {
+  id: string;
+  path: string;
+  title: string;
+};
+
+export type VaultGraphEdge = {
+  /** 来源笔记 id。 */
+  from: string;
+  /** 已解析的目标笔记 id。 */
+  to: string;
+};
+
+export type VaultGraph = {
+  nodes: VaultGraphNode[];
+  edges: VaultGraphEdge[];
+};
+
+export type AddVaultInput = {
+  name: string;
+  root_path: string;
+  /** true 时目录不存在会自动创建；默认要求目录已存在。 */
+  create?: boolean;
+};
+
+export type CreateVaultNoteInput = {
+  vault_id: string;
+  path: string;
+  title: string;
+  body?: string;
+};
+
+export type SaveVaultNoteInput = {
+  note_id: string;
+  title: string;
+  body: string;
+};
+
+export type ContextItem = {
+  id: string;
+  kind: string;
+  title: string;
+  body?: string;
+};
+
+export type CreateNoteInput = {
+  project_id: string;
+  title: string;
+  body: string;
+};
+
+export type UpdateNoteInput = {
+  id: string;
+  title: string;
+  body: string;
+};
+
+export type CreateTaskFromNoteInput = {
+  note_id: string;
+  title?: string;
+  prompt?: string;
+};
+
+export type LinkContextInput = {
+  task_id: string;
+  item_id: string;
 };
 
 export function listTasks(projectId: string): Promise<TaskSummary[]> {
@@ -220,6 +448,156 @@ export function getRequireChecks(projectId: string): Promise<boolean> {
 
 export function setRequireChecks(input: SetRequireChecksInput): Promise<void> {
   return invoke<void>("set_require_checks", { input });
+}
+
+export function getAutoDocs(projectId: string): Promise<boolean> {
+  return invoke<boolean>("get_auto_docs", { projectId });
+}
+
+export function setAutoDocs(input: SetAutoDocsInput): Promise<void> {
+  return invoke<void>("set_auto_docs", { input });
+}
+
+export function listNotes(projectId: string): Promise<NoteMeta[]> {
+  return invoke<NoteMeta[]>("list_notes", { projectId });
+}
+
+export function getNote(noteId: string): Promise<Note> {
+  return invoke<Note>("get_note", { noteId });
+}
+
+export function createNote(input: CreateNoteInput): Promise<Note> {
+  return invoke<Note>("create_note", { input });
+}
+
+export function updateNote(input: UpdateNoteInput): Promise<Note> {
+  return invoke<Note>("update_note", { input });
+}
+
+export function deleteNote(noteId: string): Promise<void> {
+  return invoke<void>("delete_note", { noteId });
+}
+
+export function listDocs(projectId: string): Promise<DocMeta[]> {
+  return invoke<DocMeta[]>("list_docs", { projectId });
+}
+
+export function getDoc(docId: string): Promise<Doc> {
+  return invoke<Doc>("get_doc", { docId });
+}
+
+export function reindexWorkspace(projectId: string): Promise<number> {
+  return invoke<number>("reindex_workspace", { projectId });
+}
+
+export function searchWorkspace(
+  projectId: string,
+  query: string,
+): Promise<SearchHit[]> {
+  return invoke<SearchHit[]>("search_workspace", { projectId, query });
+}
+
+export function globalSearch(input: GlobalSearchInput): Promise<GlobalHit[]> {
+  return invoke<GlobalHit[]>("global_search", { input });
+}
+
+export function createTaskFromNote(
+  input: CreateTaskFromNoteInput,
+): Promise<TaskDetail> {
+  return invoke<TaskDetail>("create_task_from_note", { input });
+}
+
+export function createTaskFromIssue(
+  input: CreateTaskFromIssueInput,
+): Promise<TaskDetail> {
+  return invoke<TaskDetail>("create_task_from_issue", { input });
+}
+
+export function planProject(input: PlanProjectInput): Promise<PlanDraft> {
+  return invoke<PlanDraft>("plan_project", { input });
+}
+
+export function createTasksFromPlan(
+  input: CreateTasksFromPlanInput,
+): Promise<TaskDetail[]> {
+  return invoke<TaskDetail[]>("create_tasks_from_plan", { input });
+}
+
+export function linkContext(input: LinkContextInput): Promise<void> {
+  return invoke<void>("link_context", { input });
+}
+
+export function unlinkContext(input: LinkContextInput): Promise<void> {
+  return invoke<void>("unlink_context", { input });
+}
+
+export function listContext(taskId: string): Promise<ContextItem[]> {
+  return invoke<ContextItem[]>("list_context", { taskId });
+}
+
+export function listAdapters(): Promise<AgentManifest[]> {
+  return invoke<AgentManifest[]>("list_adapters");
+}
+
+export function setTaskAgents(input: SetTaskAgentsInput): Promise<void> {
+  return invoke<void>("set_task_agents", { input });
+}
+
+export function setTaskModel(input: SetTaskModelInput): Promise<void> {
+  return invoke<void>("set_task_model", { input });
+}
+
+export function addVault(input: AddVaultInput): Promise<Vault> {
+  return invoke<Vault>("add_vault", { input });
+}
+
+export function listVaults(): Promise<Vault[]> {
+  return invoke<Vault[]>("list_vaults");
+}
+
+export function removeVault(vaultId: string): Promise<void> {
+  return invoke<void>("remove_vault", { vaultId });
+}
+
+export function indexVault(vaultId: string): Promise<number> {
+  return invoke<number>("index_vault", { vaultId });
+}
+
+export function vaultTree(vaultId: string): Promise<VaultEntry[]> {
+  return invoke<VaultEntry[]>("vault_tree", { vaultId });
+}
+
+export function getVaultNote(noteId: string): Promise<VaultNote> {
+  return invoke<VaultNote>("get_vault_note", { noteId });
+}
+
+export function createVaultNote(
+  input: CreateVaultNoteInput,
+): Promise<VaultNote> {
+  return invoke<VaultNote>("create_vault_note", { input });
+}
+
+export function saveVaultNote(input: SaveVaultNoteInput): Promise<VaultNote> {
+  return invoke<VaultNote>("save_vault_note", { input });
+}
+
+export function deleteVaultNote(noteId: string): Promise<void> {
+  return invoke<void>("delete_vault_note", { noteId });
+}
+
+export function searchVault(
+  vaultId: string,
+  query: string,
+): Promise<VaultHit[]> {
+  return invoke<VaultHit[]>("search_vault", { vaultId, query });
+}
+
+export function noteBacklinks(noteId: string): Promise<Backlink[]> {
+  return invoke<Backlink[]>("note_backlinks", { noteId });
+}
+
+export function vaultGraph(vaultId: string): Promise<VaultGraph> {
+  return invoke<VaultGraph>("vault_graph", { vaultId });
 }
 
 const STATUS_LABELS: Record<string, string> = {

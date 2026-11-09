@@ -245,6 +245,105 @@ impl Db {
             tx.commit().map_err(|e| e.to_string())?;
         }
 
+        if current < 5 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+                    entity_id UNINDEXED,
+                    project_id UNINDEXED,
+                    kind UNINDEXED,
+                    title,
+                    body
+                );",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (5)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
+        if current < 6 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS search_fts;
+                 CREATE VIRTUAL TABLE search_fts USING fts5(
+                    entity_id UNINDEXED,
+                    project_id UNINDEXED,
+                    kind UNINDEXED,
+                    title,
+                    body,
+                    tokenize='trigram'
+                 );",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (6)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
+        if current < 7 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS vaults (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    root_path TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                 );
+                 CREATE TABLE IF NOT EXISTS vault_notes (
+                    id TEXT PRIMARY KEY,
+                    vault_id TEXT NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+                    path TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    UNIQUE (vault_id, path)
+                 );
+                 CREATE TABLE IF NOT EXISTS vault_links (
+                    id TEXT PRIMARY KEY,
+                    vault_id TEXT NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+                    from_note TEXT NOT NULL REFERENCES vault_notes(id) ON DELETE CASCADE,
+                    target TEXT NOT NULL,
+                    resolved_note TEXT REFERENCES vault_notes(id) ON DELETE SET NULL,
+                    UNIQUE (vault_id, from_note, target)
+                 );
+                 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+                    note_id UNINDEXED,
+                    vault_id UNINDEXED,
+                    title,
+                    body,
+                    tokenize='trigram'
+                 );
+                 ALTER TABLE tasks ADD COLUMN developer_adapter TEXT;
+                 ALTER TABLE tasks ADD COLUMN reviewer_adapter TEXT;",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (7)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
+        if current < 8 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch("ALTER TABLE tasks ADD COLUMN model TEXT;")
+                .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (8)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
+        if current < 9 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "ALTER TABLE projects ADD COLUMN auto_docs INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE tasks ADD COLUMN auto_docs INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (9)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
         Ok(())
     }
 

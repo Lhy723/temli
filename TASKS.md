@@ -1,101 +1,59 @@
 # TASKS
 
-当前里程碑：M4 GitHub 同步与自动合并（已合入，含 require_checks）
+更新时间：2026-11-08　当前状态：M0–M12 全部合入 `develop`
 
-## 已完成
+## 里程碑
 
 - [x] M0 应用骨架：Tauri 2 + React 19 + Tailwind v4 + HeroUI v3；Linear 式布局；SQLite 迁移；项目注册与 `.temli/` 校验（#4）
-- [x] 产品规格：PRD、数据模型、UI 规范、Agent 适配器契约（`docs/`）
-- [x] 验收目标仓库：`Lhy723/temli-demo`（6 个测试）
+- [x] M1 证据门：适配器契约（OMP RPC / fake）、任务状态机、证据执行器、worktree、审查、决策收件箱、规划 prompt
+- [x] M2 队列与 worktree：串行队列、取消、超时、失败重试（3 次）、合并锁、合并后复验与回滚（PR #16）
+- [x] M3 DAG 调度：依赖校验、就绪递归、按项目并发池、rebase 冲突阈值（PR #17）
+- [x] M4 GitHub 同步与自动合并：迁移 v3、ETag 轮询、ghost、乐观写回、PR/checks/条件合并、`require_checks`（迁移 v4，PR #18）
+- [x] M5 文档与知识空间：FTS5、笔记 CRUD、`docs/` 只读索引、搜索、任务上下文注入（PR #23，Issue #22）
+- [x] M6 笔记库解耦 + 任务级 Agent：迁移 v7 vaults / notes_fts / 适配器字段、双链反链图谱、看板转任务（PR #26/#28，Issue #25/#27）
+- [x] M7 多项目 + 全局搜索：`global_search`、项目切换持久化、⌘K 深链（PR #31/#32，Issue #30）
+- [x] M8 多 Agent 后端：Codex、Claude Code 适配器真实 CLI 冒烟；roles + 任务级 model（PR #35，Issue #34）
+- [x] M9 想法 → 多 Issue 计划：规划、校验、批量落库、依赖与 UI 预览；真实 OMP 冒烟（PR #38，Issue #37）
+- [x] M10 真实 PR + CI + 自动合并：temli-demo PR #3 checks 全绿自动合并；checks 瞬时失败重试
+- [x] M11 合并后自动文档：迁移 v9、受限文档任务、防递归、统一证据门；真实闭环 PR #4 → 文档任务 → PR #5（PR #43，Issue #42）
+- [x] M12 菜单栏常驻 + 通知：关窗隐藏、托盘显示/退出、任务终态与待决策通知（PR #45，Issue #44）
+- [x] M13 GitHub 写回闭环 + 文档任务结构化：issue 标题/正文/指派人/关闭重开写回（乐观并发）、远端关闭同步、auto_docs 字段驱动 chip、merged 即时刷新、通知点击深链、孤儿 worktree 时间窗回收、死代码清零
 
-## 进行中：M1 证据门
+## 关键验证
 
-- [x] Agent 适配器契约与注册表（`src-tauri/src/agent/mod.rs`）
-- [x] `fake` 适配器与契约测试
-- [x] OMP RPC 适配器（协议 v2、事件归一化、审批、取消）
-- [x] 存储层与任务状态机（items/tasks/runs/evidence/reviews/decisions/events）
-- [x] 证据执行器（命令发现、执行、diff、高风险与测试改动识别）
-- [x] 编排器：worktree、单任务执行、证据门、审查、决策
-- [x] 规划/审查 prompt 与 JSON 解析
-- [x] 前端：任务列表/详情、决策收件箱
-- [ ] 独立代码审查与修复
-
-## 待办：M2–M4
-
-- [ ] M2 队列与 worktree 生命周期、合并队列（#6）
-- [ ] M3 DAG 调度与受控并发（#7）
-- [ ] M4 GitHub 同步与自动合并（#8）
-
-## 已知限制
-
-- 自动合并默认关闭；证据门全绿前不得开启
-- OMP 适配器 `cost_cap` 能力暂为 false（协议未暴露运行时费用上限命令）
-
-## 审查修复（M1）
-
-- [x] 测试/CI 改动必须由审查逐项确认（test_diff 覆盖，否则 needs_human）
-- [x] reviewer 只接受 Completed 终态
-- [x] 同一任务并发 start 的原子守卫
-- [x] failed / interrupted 的重新入队路径
-- [x] 合并前校验分支 SHA 与受审 commit 一致
-- [x] rpc_chunk 重组、response.success=false 失败处理、session_settled 终态
-- [x] 验收标准 expect_exit / expect_match 真实求值
-- [x] 命令超时杀进程组
-- [x] 决策收件箱轮询与刷新
-- [x] 会话关闭与 sessionId 落库
-
-## 冒烟结果
-
-- 2026-11-08：OMP 真实任务（temli-demo 创建 hello.txt）→ npm test 证据 exit 0 → 审查 pass → 本地 fast-forward 合并成功；发现并修复 `setWidget` 被误判为审批的缺陷。
-
-## 验证
-
-- `cargo test --lib`：102 passed
+- `cargo test --lib`：271 passed，1 ignored（需真实 OMP 的 live 规划测试）
 - `npm run build`：通过
-- 原生冒烟 2 次（OMP 真实执行，temli-demo）：均以 evidence exit 0 + 审查 pass 自动合并；第二次确认 `setWidget` 不再产生审批决策
-- 审计完整性：artifact（diff.patch + files.json）与 review（review.json）均已作为 evidence 落库
-- 规划路径测试：grounded 成功、解析失败回退、命令未发现回退、空命令跳过（5 个测试）
+- `npm run tauri build`：通过，产物 `temli.app`（7.05 MiB）与 `temli_0.1.0_aarch64.dmg`（3.54 MiB）
+- `cargo build`：0 warning（M13 死代码清零）
+- M13 写回载荷：以与 `issue_patch_payload` 相同的 JSON（`title` + `assignees` 数组 + `state`）对真实 GitHub issue 执行 PATCH，验证 title/assignees/state 均生效，随后已还原
+- M13 独立审查：16 文件 +761/−102，P0–P2 全 0；通知 `extra()` 取回、乐观并发冲突路径、SELECT 列序、孤儿 worktree 命名、轮询快照、前后端契约均源码级核对通过
+- M10 真实链路：OMP 任务新增 `greet` + 测试 → PR #3 → CI `npm test` 通过 → 自动合并
+- M11 真实链路：父任务合并（PR #4）→ 自动生成 `文档：add farewell` → PR #5 合并 → `docs/guide.md` 更新；仅 1 条文档任务，无递归
+- M12 运行时（release bundle + fake 适配器）：托盘左键恢复窗口、右键菜单「显示 temli / 退出 temli」；关闭窗口后进程存活；通知授权后横幅显示「需要决策 / 任务标题 / 状态：等待人工决策」
 
-## 进行中：M2 队列与 worktree
+## 已知遗留
 
-- [x] 单 worker 串行队列与入队/取消 IPC
-- [x] 合并前 rebase、合并锁、合并后重验与回滚
-- [x] 超时决策、失败自动重试（3 次上限）
-- [x] worktree 生命周期与启动清理
-- [x] 前端排队状态与取消按钮
-- [x] 调度串行/重试/取消、回滚、超时集成测试
-- [x] 独立审查（2 P1 / 2 P2）
-- [x] 审查修复：回滚外部提交保护、排队取消竞态、启动期取消意图、重试上限死路
-- [x] 合入（PR #16）
+- M13 按验证范围：写回按钮的屏上点击（编辑/关闭/重开）与通知点击深链未做手工冒烟——验证期间用户占用机器、应用窗口位于其他 Space；后端载荷已验证真实 GitHub，通知链路经单测 + 插件源码核对。空闲时补一次点击冒烟
+- `tauri dev` 下偶发窗口不在当前 Space（直接运行 `target/debug/temli` 正常）；疑与全屏 Space 切换有关，未定位到代码回归
+- 通知在 `tauri dev` 下由插件回退为 Terminal 名义发送；release bundle 使用 `com.lhy.temli`，首次发送会请求系统授权
+- 文档工作区只读；GitHub Projects V2 未接入；assignee 移除仅后端支持（`Some(None)→[]`），UI 只做设置
+- Vault 附件、标签、模板未做；团队抽象、预算/成本上限未做
+- 无真实 E2E 前端测试；`release/*` 分支、签名与公证流程尚未跑过（当前按开源分发：ad-hoc + `xattr` 提示）
+- 前端看板窄窗口已改横向滚动（M13），仍需 E2E 回归覆盖
 
-## M2 冒烟
+## 下一步
 
-- 队列串行：两个 queued 任务，一个在运行中被强制重启 → `interrupted`，另一个自动执行并以 evidence + 审查通过合并
-- 回滚/超时/重试/取消/串行队列用例由 `cargo test` 覆盖（121 tests）
+- [ ] 发布 0.1.0：`release/0.1.0` → PR 到 `main` → tag v0.1.0 → GitHub Release 挂 DMG（ad-hoc 签名 + README 放行说明）
+- [ ] CI：`.github/workflows/ci.yml`（macOS：`npm run build` + `cargo test --lib`）
+- [ ] 空闲时补 M13 屏上冒烟：issue 编辑/关闭/重开、通知点击深链
+- [ ] 文档工作区可编辑；Projects V2；Vault 附件/标签/模板
+- [ ] 前端 E2E（Tauri WebDriver 或 mock IPC 全流程）；通知/托盘自动化回归
 
-## 进行中：M3 DAG 调度
+## 验证命令
 
-- [x] 依赖边校验（同项目/自环/环）、就绪递归查询、并发配置 IPC
-- [x] 并发 worker 池（按项目 limit、默认 1）
-- [x] rebase 冲突阈值策略（≤3 文件且非高风险自动重排）
-- [x] 前端依赖展示与并发设置
-- [x] 独立审查（1 P1 / 2 P2 / 2 P3）
-- [x] 审查修复：spawn 失败热循环、claimed 任务饿死、取消后重排、认领后依赖、空冲突误重试
-- [x] 合入（PR #17）
-
-## M3 冒烟
-
-- 并发 2：gamma / delta 同时 running；delta 先合并，gamma 在合并时 rebase 到新 tip 后成功合并（修复前会 merge_failed）
-- 依赖/并发/串行/环检测由 `cargo test` 覆盖（178 tests）
-
-## 进行中：M4 GitHub 同步与自动合并
-
-- [x] 迁移 v3：issue body/state/assignee/ghost、auto_merge、PR 字段
-- [x] GhOps（gh token + curl）、60s ETag 轮询、乐观写回、ghost
-- [x] PR 创建/checks 轮询/条件合并/本地拉取；auto_merge 默认关闭
-- [x] 前端同步/发布/PR 链接/自动合并开关
-- [x] 实时同步冒烟：远端新建 issue 1 分钟内入库；改标题后 1 个周期内本地更新
-- [x] 独立审查（1 P1 / 7 P2 / 2 P3）
-- [x] 审查修复：分页 ghost、合并 SHA 锁定、轮询取消、合并锁、curl 超时/令牌、发布幂等、pr_state 顺序、前端跨项目刷新
-- [x] `require_checks` 语义：默认无 CI 视为通过，开启后空 checks 阻止自动合并（迁移 v4）
-- [x] 合入（PR #18）
+```bash
+cd src-tauri && cargo test --lib          # 261 passed, 1 ignored
+npm run build                             # 前端类型检查 + 构建
+npm run tauri build                       # release .app + .dmg
+cargo test --lib live_plan_generation_with_omp -- --ignored --nocapture
+```

@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  macos:
+    # 主要目标平台：macOS arm64（见 PRD）。Linux/Windows 依赖矩阵后续再补。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Frontend type-check + build
+        run: |
+          npm ci
+          npm run build
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib

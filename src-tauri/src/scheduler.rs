@@ -5,6 +5,7 @@
 //! 每个被认领的任务在独立线程里运行，单个运行失败（包括 panic）不会阻塞其它任务。
 //! 任务结束后由本模块决定自动重试还是转人工处理。
 
+use crate::notify;
 use crate::orchestrator::{self, RunContext};
 use crate::store::{self, NewDecision, NewEvent, TaskStatus};
 use std::collections::{HashMap, HashSet};
@@ -402,6 +403,8 @@ impl Scheduler {
     fn settle(&self, task_id: &str, run_failed: bool) {
         // 运行结束（无论成败）都清除取消意图：本次运行已经消费掉它。
         let cancelled = self.take_cancelled(task_id);
+        // 收尾迁移完成后再通知；自动重排回 queued 的任务不提醒。
+        let mut finished: Option<(String, TaskStatus)> = None;
 
         let result = (|| -> Result<(), String> {
             let guard = self
@@ -445,10 +448,17 @@ impl Scheduler {
                 }
                 _ => {}
             }
+            let status = store::task_status(guard.conn(), task_id)?;
+            if is_terminal(status) {
+                finished = Some((detail.task.title.clone(), status));
+            }
             Ok(())
         })();
         if let Err(err) = result {
             eprintln!("调度器收尾任务 {task_id} 失败：{err}");
+        }
+        if let Some((title, status)) = finished {
+            notify::task_finished(&title, status.as_str(), task_id);
         }
     }
 
@@ -491,6 +501,14 @@ fn short_id(task_id: &str) -> &str {
     task_id.get(..8).unwrap_or(task_id)
 }
 
+/// 是否已进入不再自动推进的终态；只有这些状态才发送系统通知。
+fn is_terminal(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Merged | TaskStatus::NeedsHuman | TaskStatus::Failed | TaskStatus::Interrupted
+    )
+}
+
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -505,8 +523,8 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
     use crate::agent::{
-        AgentAdapter, AgentEvent, AgentManifest, AuthState, Capabilities, Decision, DetectResult,
-        EventSink, RunSpec, RunStatus, SessionHandle,
+        AdapterRegistry, AgentAdapter, AgentEvent, AgentManifest, AgentRole, AuthState,
+        Capabilities, Decision, DetectResult, EventSink, RunSpec, RunStatus, SessionHandle,
     };
     use crate::db::{Db, RegisterProjectInput};
     use crate::store::{Criterion, NewTask};
@@ -611,6 +629,7 @@ mod tests {
                 id: "scripted".to_string(),
                 name: "Scripted".to_string(),
                 version: "0.0.0".to_string(),
+                roles: vec![AgentRole::Developer, AgentRole::Reviewer],
                 capabilities: Capabilities {
                     streaming: true,
                     approvals: true,
@@ -769,9 +788,13 @@ mod tests {
                     repo.canonicalize().expect("规范化仓库路径"),
                 )
                 .expect("登记临时项目");
+            let default_agent = adapter.manifest().id;
+            let mut adapters = AdapterRegistry::new();
+            adapters.register(adapter);
             let ctx = RunContext {
                 db: Arc::new(Mutex::new(db)),
-                adapter,
+                adapters: Arc::new(adapters),
+                default_agent,
                 data_dir: self.root.join("data"),
                 running: Arc::new(Mutex::new(HashSet::new())),
                 cancels: orchestrator::CancelRegistry::new(),
@@ -806,7 +829,7 @@ mod tests {
             },
         )
         .expect("创建任务");
-        // `next_ready_task` 按 `items.created_at` 排序；序号单调递增即可确定 FIFO 顺序。
+        // `next_ready_tasks` 按 `items.created_at` 排序；序号单调递增即可确定 FIFO 顺序。
         let order = TASK_ORDER.fetch_add(1, Ordering::Relaxed);
         guard
             .conn()
