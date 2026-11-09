@@ -2,6 +2,17 @@
 
 本文件记录 temli 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.1] - 2026-11-09
+
+### Added
+
+- 附件支持**拖入**编辑器（与选择/粘贴同一保存与插入路径，多文件按序处理）。
+- `[[别名]]`：frontmatter `aliases` / `alias`（flow、逗号、块列表）参与链接解析与反链。
+
+### Fixed
+
+- `docs/vault-alignment.md` 与实现对齐：状态更新为实际完成项；`![[嵌入]]`、Callouts、数学、Mermaid 如实标记为后续，Canvas/插件/同步/移动端为非目标；脚注确认为 GFM 已支持。
+
 ## [0.4.0] - 2026-11-09
 
 ### Added
