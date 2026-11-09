@@ -359,6 +359,22 @@ impl Db {
             tx.commit().map_err(|e| e.to_string())?;
         }
 
+        if current < 11 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS vault_note_tags (
+                    note_id TEXT NOT NULL REFERENCES vault_notes(id) ON DELETE CASCADE,
+                    tag TEXT NOT NULL,
+                    PRIMARY KEY (note_id, tag)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_vault_note_tags_tag ON vault_note_tags(tag);",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (11)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
         Ok(())
     }
 
@@ -611,11 +627,12 @@ mod tests {
 
         {
             let db = Db::open(&db_path).unwrap();
-            // 模拟停在 schema v9 的用户库：v10 的表与迁移记录都不存在。
+            // 模拟停在 schema v9 的用户库：v10/v11 的表与迁移记录都不存在。
             db.conn()
                 .execute_batch(
                     "DROP TABLE app_settings;
-                     DELETE FROM schema_migrations WHERE version = 10;",
+                     DROP TABLE vault_note_tags;
+                     DELETE FROM schema_migrations WHERE version >= 10;",
                 )
                 .unwrap();
         }
@@ -648,5 +665,61 @@ mod tests {
             .unwrap();
         assert_eq!(value, "v");
         assert!(!updated_at.is_empty(), "updated_at 应有默认值");
+    }
+
+    #[test]
+    fn migration_v11_adds_vault_note_tags_for_v10_database() {
+        let db_path = temp_dir().join("temli.db");
+
+        {
+            let db = Db::open(&db_path).unwrap();
+            // 模拟停在 schema v10 的用户库。
+            db.conn()
+                .execute_batch(
+                    "DROP TABLE vault_note_tags;
+                     DELETE FROM schema_migrations WHERE version = 11;",
+                )
+                .unwrap();
+        }
+
+        let reopened = Db::open(&db_path).unwrap();
+        let table: i64 = reopened
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'vault_note_tags'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "v10 库升级后应存在 vault_note_tags 表");
+
+        reopened
+            .conn()
+            .execute_batch(
+                "INSERT INTO vaults (id, name, root_path) VALUES ('v', 'v', '/tmp/temli-v11');
+                 INSERT INTO vault_notes (id, vault_id, path, title) VALUES ('n', 'v', 'a.md', 'A');
+                 INSERT INTO vault_note_tags (note_id, tag) VALUES ('n', 'rust');",
+            )
+            .unwrap();
+        let tag: String = reopened
+            .conn()
+            .query_row(
+                "SELECT tag FROM vault_note_tags WHERE note_id = 'n'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag, "rust");
+
+        reopened
+            .conn()
+            .execute("DELETE FROM vault_notes WHERE id = 'n'", [])
+            .unwrap();
+        let remaining: i64 = reopened
+            .conn()
+            .query_row("SELECT COUNT(*) FROM vault_note_tags", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "删除笔记应级联删除标签");
     }
 }
