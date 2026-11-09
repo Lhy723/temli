@@ -17,6 +17,8 @@ import { DecisionInbox } from "./components/DecisionInbox";
 import { TasksPanel } from "./components/TasksPanel";
 import { Vaults } from "./components/Vaults";
 import { Workspace } from "./components/Workspace";
+import { ReviewsPanel } from "./components/ReviewsPanel";
+import { AgentsPanel } from "./components/AgentsPanel";
 import { getTask, type GlobalHit } from "./lib/api";
 import {
   Bot,
@@ -30,7 +32,6 @@ import {
   NotebookPen,
   Plus,
   Search,
-  SlidersHorizontal,
   X,
 } from "lucide-react";
 
@@ -81,12 +82,6 @@ const TITLES: Record<ViewId, string> = {
 
 function emptyCopy(view: ViewId) {
   switch (view) {
-    case "my":
-      return "需要你审批或验收的任务会出现在这里。";
-    case "reviews":
-      return "任务完成后的证据与审查报告会出现在这里。";
-    case "agent":
-      return "Agent 会话、运行日志与审批请求会出现在这里。";
     case "views":
       return "保存的过滤视图会出现在这里。";
     default:
@@ -270,14 +265,14 @@ export default function App() {
   }
 
   return (
-    <div className="text-ui flex h-full overflow-hidden bg-[var(--background-secondary)] text-[var(--foreground)]">
+    <div className="text-ui flex h-full overflow-hidden bg-[var(--shell-bg)] text-[var(--foreground)]">
       <aside className="flex w-[232px] shrink-0 flex-col px-2 pb-2 pt-9">
         <div className="flex items-center gap-0.5">
           <Dropdown>
             <Button
               variant="ghost"
               size="sm"
-              className="h-8 min-w-0 flex-1 justify-start gap-1.5 px-1.5 text-ui font-medium"
+              className="anim-fast h-8 min-w-0 flex-1 justify-start gap-1.5 rounded-lg px-1.5 text-ui font-medium"
               aria-label={`切换项目：${current?.name ?? "temli"}`}
             >
               <FolderKanban size={15} className="shrink-0 opacity-70" />
@@ -335,7 +330,7 @@ export default function App() {
             isIconOnly
             variant="ghost"
             size="sm"
-            className="h-8 w-8"
+            className="anim-fast h-8 w-8 rounded-lg"
             aria-label="全局搜索（⌘K）"
             onPress={() => setPaletteOpen(true)}
           >
@@ -347,9 +342,13 @@ export default function App() {
           {NAV.map((item) => (
             <Button
               key={item.id}
-              variant={active === item.id ? "tertiary" : "ghost"}
+              variant="ghost"
               size="sm"
-              className="h-7 justify-start gap-2 px-2 text-ui font-normal"
+              className={`anim-fast h-8 justify-start gap-2 rounded-lg px-2 text-ui font-normal ${
+                active === item.id
+                  ? "bg-[var(--surface)] text-[var(--foreground)]"
+                  : "text-[var(--muted)] hover:bg-[var(--background-tertiary)] hover:text-[var(--foreground)]"
+              }`}
               onPress={() => open(item.id)}
             >
               <item.icon size={16} className="opacity-70" />
@@ -358,16 +357,20 @@ export default function App() {
           ))}
         </nav>
 
-        <p className="text-label px-2 pb-1.5 pt-4 font-medium uppercase tracking-wide text-[var(--muted)]">
+        <p className="text-label px-2 pb-1.5 pt-4 font-medium uppercase tracking-[0.06em] text-[var(--muted)]">
           空间
         </p>
         <nav className="flex flex-col gap-0.5">
           {SPACE.map((item) => (
             <Button
               key={item.id}
-              variant={active === item.id ? "tertiary" : "ghost"}
+              variant="ghost"
               size="sm"
-              className="h-7 justify-start gap-2 px-2 text-ui font-normal"
+              className={`anim-fast h-8 justify-start gap-2 rounded-lg px-2 text-ui font-normal ${
+                active === item.id
+                  ? "bg-[var(--surface)] text-[var(--foreground)]"
+                  : "text-[var(--muted)] hover:bg-[var(--background-tertiary)] hover:text-[var(--foreground)]"
+              }`}
               onPress={() => open(item.id)}
             >
               <item.icon size={16} className="opacity-70" />
@@ -387,25 +390,25 @@ export default function App() {
       <div className="flex min-w-0 flex-1 flex-col">
         <div
           data-tauri-drag-region
-          className="flex h-10 shrink-0 items-end gap-0.5 px-2 pb-1"
+          className="flex h-11 shrink-0 items-center gap-1 px-3"
         >
           {tabs.map((tab) => {
             const isActive = active === tab.id;
             return (
               <div
                 key={tab.id}
-                className={`anim-fast group flex h-7 items-center rounded-md border ${
+                className={`anim-fast group flex h-8 items-center rounded-lg border ${
                   isActive
-                    ? "border-[var(--border)] bg-[var(--background)] shadow-[0_1px_2px_rgba(0,0,0,0.06)]"
+                    ? "border-[var(--border)] bg-[var(--surface)] shadow-[0_1px_2px_rgba(0,0,0,0.06)]"
                     : "border-transparent hover:bg-[var(--background-tertiary)]"
                 }`}
               >
                 <button
                   type="button"
-                  className={`tab-btn h-full pl-2.5 text-ui ${
+                  className={`tab-btn h-full rounded-lg pl-2.5 pr-2 text-ui ${
                     isActive
-                      ? "pr-2.5 text-[var(--foreground)]"
-                      : "pr-2.5 text-[var(--muted)]"
+                      ? "text-[var(--foreground)]"
+                      : "text-[var(--muted)] hover:text-[var(--foreground)]"
                   }`}
                   onClick={() => setActive(tab.id)}
                 >
@@ -414,7 +417,7 @@ export default function App() {
                 <button
                   type="button"
                   aria-label={`关闭 ${tab.label}`}
-                  className={`icon-btn mr-1 flex size-5 items-center justify-center rounded opacity-0 transition-opacity duration-150 group-hover:opacity-60 hover:bg-[var(--surface-secondary)] ${
+                  className={`icon-btn mr-1 flex size-5 items-center justify-center rounded-lg opacity-0 transition-opacity duration-150 motion-reduce:transition-none group-hover:opacity-60 hover:bg-[var(--surface-secondary)] hover:opacity-100 ${
                     isActive ? "" : "text-[var(--muted)]"
                   }`}
                   onClick={() => close(tab.id)}
@@ -428,32 +431,36 @@ export default function App() {
             isIconOnly
             variant="ghost"
             size="sm"
-            className="h-7 w-7"
+            className="h-8 w-8 rounded-lg"
             aria-label="新建标签"
           >
             <Plus size={14} />
           </Button>
         </div>
 
-        <main className="min-h-0 flex-1 overflow-hidden p-2 pt-0">
-          <section className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--background)] shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
-            <header className="flex h-12 shrink-0 items-center justify-between border-b border-[var(--border)] px-4">
-              <h1 className="text-ui font-medium">{TITLES[active]}</h1>
-              <div className="flex items-center gap-1">
+        <main className="min-h-0 flex-1 overflow-hidden px-3 pb-3 pt-1">
+          <section className="mx-auto flex h-full min-h-0 w-full max-w-[1360px] flex-col overflow-hidden rounded-[14px] border border-[var(--border)] bg-[var(--background)] shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+            <header className="flex h-12 shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] px-6">
+              <div className="flex items-center gap-2">
+                <span className="text-ui-sm text-[var(--muted)]">
+                  {current ? current.name : "未选择项目"}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
                 <Button
                   isIconOnly
                   variant="ghost"
                   size="sm"
-                  className="h-7 w-7"
+                  className="h-8 w-8 rounded-lg"
                   aria-label="全局搜索（⌘K）"
                   onPress={() => setPaletteOpen(true)}
                 >
-                  <Search size={14} />
+                  <Search size={15} />
                 </Button>
                 <Button
                   variant="primary"
                   size="sm"
-                  className="h-7 gap-1 px-2.5 text-ui"
+                  className="h-8 gap-1 px-3 text-ui"
                   onPress={startRegister}
                 >
                   <Plus size={14} />
@@ -462,28 +469,9 @@ export default function App() {
               </div>
             </header>
 
-            <div className="flex h-9 shrink-0 items-center justify-between px-4">
-              <div className="flex items-center gap-1">
-                <Chip variant="soft" color="default" size="sm">
-                  全部
-                </Chip>
-                <Chip variant="tertiary" color="default" size="sm">
-                  进行中
-                </Chip>
-              </div>
-              <Button
-                isIconOnly
-                variant="ghost"
-                size="sm"
-                className="h-6 w-6"
-                aria-label="视图设置"
-              >
-                <SlidersHorizontal size={14} />
-              </Button>
-            </div>
-
             <div
-              className={`min-h-0 flex-1 px-4 pb-4 ${
+              key={active}
+              className={`page-fade min-h-0 flex-1 px-6 pb-6 pt-4 ${
                 active === "my" || active === "docs" || active === "notes"
                   ? "overflow-hidden"
                   : "overflow-auto"
@@ -569,20 +557,24 @@ export default function App() {
                 />
               )}
 
-              {active !== "overview" &&
-                active !== "my" &&
-                active !== "projects" &&
-                active !== "docs" &&
-                active !== "notes" && (
-                  <div className="flex h-full flex-col items-center justify-center gap-1.5 text-center">
-                    <p className="text-ui text-[var(--muted)]">
-                      {emptyCopy(active)}
-                    </p>
-                    <p className="text-ui-sm text-[var(--muted)] opacity-70">
-                      M0 骨架，功能在后续里程碑实现。
-                    </p>
-                  </div>
-                )}
+              {active === "reviews" &&
+                (current ? (
+                  <ReviewsPanel projectId={current.id} />
+                ) : (
+                  <EmptyProject onRegister={startRegister} />
+                ))}
+
+              {active === "agent" && (
+                <AgentsPanel projectId={current?.id ?? ""} />
+              )}
+
+              {active === "views" && (
+                <EmptyState
+                  icon={LayoutList}
+                  title="暂无视图"
+                  hint={emptyCopy("views")}
+                />
+              )}
             </div>
           </section>
         </main>
@@ -599,15 +591,47 @@ export default function App() {
   );
 }
 
+function EmptyState({
+  icon: Icon,
+  title,
+  hint,
+  actionLabel,
+  onAction,
+}: {
+  icon: typeof Inbox;
+  title: string;
+  hint: string;
+  actionLabel?: string;
+  onAction?: () => void;
+}) {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
+      <Icon size={20} className="text-[var(--muted)] opacity-70" />
+      <p className="text-ui font-medium">{title}</p>
+      <p className="max-w-[320px] text-ui-sm text-[var(--muted)]">{hint}</p>
+      {actionLabel && onAction && (
+        <Button
+          variant="primary"
+          size="sm"
+          className="mt-1 h-8 px-3 text-ui"
+          onPress={onAction}
+        >
+          {actionLabel}
+        </Button>
+      )}
+    </div>
+  );
+}
+
 function EmptyProject({ onRegister }: { onRegister: () => void }) {
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-2.5 text-center">
-      <Inbox size={20} className="text-[var(--muted)] opacity-70" />
-      <p className="text-ui text-[var(--muted)]">{emptyCopy("overview")}</p>
-      <Button variant="primary" size="sm" className="h-7 px-3 text-ui" onPress={onRegister}>
-        注册项目
-      </Button>
-    </div>
+    <EmptyState
+      icon={Inbox}
+      title="还没有项目"
+      hint={emptyCopy("overview")}
+      actionLabel="注册项目"
+      onAction={onRegister}
+    />
   );
 }
 
@@ -619,8 +643,8 @@ function ProjectList({
   selectedId?: string | null;
 }) {
   return (
-    <div className="overflow-hidden rounded-md border border-[var(--border)]">
-      <div className="text-ui-sm grid grid-cols-[1.2fr_1.8fr_100px_88px] gap-3 border-b border-[var(--border)] bg-[var(--background-secondary)] px-3 py-1.5 text-[var(--muted)]">
+    <div className="overflow-hidden rounded-[10px] border border-[var(--border)]">
+      <div className="text-label grid grid-cols-[1.2fr_1.8fr_100px_88px] gap-3 border-b border-[var(--border)] bg-[var(--shell-bg)] px-3 py-2 font-medium uppercase tracking-[0.06em] text-[var(--muted)]">
         <span>名称</span>
         <span>仓库</span>
         <span>分支</span>
@@ -631,8 +655,8 @@ function ProjectList({
         return (
           <div
             key={project.id}
-            className={`anim-fast text-ui grid h-9 grid-cols-[1.2fr_1.8fr_100px_88px] items-center gap-3 border-b border-[var(--border)] px-3 last:border-b-0 hover:bg-[var(--background-secondary)] ${
-              isSelected ? "bg-[var(--background-secondary)]" : ""
+            className={`anim-fast text-ui grid h-10 grid-cols-[1.2fr_1.8fr_100px_88px] items-center gap-3 border-b border-[var(--border)] px-3 last:border-b-0 hover:bg-[var(--shell-bg)] ${
+              isSelected ? "bg-[var(--shell-bg)]" : ""
             }`}
           >
             <span className="flex items-center gap-2">
@@ -703,9 +727,11 @@ function RegisterProject({
   }
 
   return (
-    <Card className="mb-4 max-w-[680px]">
+    <Card className="mb-4 max-w-[680px] rounded-[10px] p-3.5">
       <Card.Header>
-        <Card.Title className="text-ui font-medium">注册项目</Card.Title>
+        <Card.Title className="text-[15px] font-medium leading-[1.4]">
+          注册项目
+        </Card.Title>
         <Card.Description className="text-ui-sm">
           本地仓库必须是 git 仓库，且 `.temli/` 已在 `.gitignore` 中忽略。
         </Card.Description>
@@ -718,6 +744,7 @@ function RegisterProject({
             placeholder="/Users/lhy/Project/Client/temli-demo"
             value={repoPath}
             onChange={(e) => setRepoPath(e.target.value)}
+            className="h-8 text-ui"
           />
         </label>
         <label className="text-ui-sm grid gap-1 text-[var(--muted)]">
@@ -727,6 +754,7 @@ function RegisterProject({
             placeholder="temli-demo"
             value={name}
             onChange={(e) => setName(e.target.value)}
+            className="h-8 text-ui"
           />
         </label>
         <div className="grid grid-cols-2 gap-3">
@@ -737,6 +765,7 @@ function RegisterProject({
               placeholder="Lhy723"
               value={owner}
               onChange={(e) => setOwner(e.target.value)}
+              className="h-8 text-ui"
             />
           </label>
           <label className="text-ui-sm grid gap-1 text-[var(--muted)]">
@@ -746,6 +775,7 @@ function RegisterProject({
               placeholder="temli-demo"
               value={repo}
               onChange={(e) => setRepo(e.target.value)}
+              className="h-8 text-ui"
             />
           </label>
         </div>
@@ -755,16 +785,24 @@ function RegisterProject({
             aria-label="默认分支"
             value={branch}
             onChange={(e) => setBranch(e.target.value)}
+            className="h-8 text-ui"
           />
         </label>
       </Card.Content>
       <Card.Footer className="flex justify-end gap-1.5">
-        <Button variant="ghost" size="sm" onPress={onCancel} isDisabled={busy}>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-8 px-3 text-ui"
+          onPress={onCancel}
+          isDisabled={busy}
+        >
           取消
         </Button>
         <Button
           variant="primary"
           size="sm"
+          className="h-8 px-3 text-ui"
           onPress={submit}
           isDisabled={busy || !repoPath}
         >

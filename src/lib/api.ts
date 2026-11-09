@@ -65,6 +65,20 @@ export type ReviewRow = {
   test_diff: unknown;
 };
 
+export type ReviewListItem = {
+  run_id: string;
+  task_id: string;
+  task_title: string;
+  verdict: string;
+  summary: string | null;
+  risk_flags: string[];
+  test_diff: string[];
+  created_at: string;
+  evidence_total: number;
+  evidence_passed: number;
+  pr_url: string | null;
+};
+
 export type DecisionRow = {
   id: string;
   task_id: string | null;
@@ -383,6 +397,10 @@ export function cancelTask(taskId: string): Promise<void> {
 
 export function listDecisions(projectId: string): Promise<DecisionRow[]> {
   return invoke<DecisionRow[]>("list_decisions", { projectId });
+}
+
+export function listReviews(projectId: string): Promise<ReviewListItem[]> {
+  return invoke<ReviewListItem[]>("list_reviews", { projectId });
 }
 
 export function resolveDecision(

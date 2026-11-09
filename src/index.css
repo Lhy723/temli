@@ -19,10 +19,19 @@ html,
 body,
 #root {
   height: 100%;
+  background-color: #f1f1f3;
+}
+
+/* 输入/选择等字段统一 8px 圆角，与按钮一致；卡片由工具类指定 10px。 */
+:root {
+  --field-radius: var(--radius);
+  /* 外壳底色用不透明字面色：窗口背景透明时也能保证层次稳定。 */
+  --shell-bg: #f1f1f3;
 }
 
 body {
   margin: 0;
+  background-color: var(--shell-bg);
   font-family: var(--font-sans);
   font-size: var(--text-ui);
   line-height: var(--text-ui--line-height);
@@ -44,14 +53,61 @@ body {
   transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .anim-fast {
-    transition: none;
+/* 页面级标题：20px / 紧行高，仅在页面确实需要独立标题时使用。 */
+.page-title {
+  font-size: 1.25rem;
+  line-height: 1.35;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+/* 页面切换只做 opacity/transform，避免布局抖动。 */
+.page-fade {
+  animation: page-fade-in 120ms ease-out;
+}
+
+@keyframes page-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 
+/* 卡片 hover：轻微上浮 + 轻阴影，克制的反馈。 */
+.lift-hover {
+  transition-property: transform, box-shadow, border-color, background-color;
+  transition-duration: 120ms;
+  transition-timing-function: ease-out;
+}
+
+.lift-hover:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
+}
+
 .tab-btn:focus-visible,
-.icon-btn:focus-visible {
+.icon-btn:focus-visible,
+.lift-hover:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .anim-fast,
+  .lift-hover {
+    transition: none;
+  }
+
+  .page-fade {
+    animation: none;
+  }
+
+  .lift-hover:hover {
+    transform: none;
+    box-shadow: none;
+  }
 }

@@ -98,22 +98,22 @@ export function DecisionInbox({ projectId }: { projectId: string }) {
   const open = decisions.filter((decision) => decision.status === "open");
 
   return (
-    <section className="overflow-hidden rounded-md border border-[var(--border)]">
-      <header className="flex h-9 items-center justify-between gap-2 border-b border-[var(--border)] px-3">
+    <section className="overflow-hidden rounded-[10px] border border-[var(--border)]">
+      <header className="flex h-10 items-center justify-between gap-2 border-b border-[var(--border)] px-3">
         <span className="flex items-center gap-1.5 text-ui font-medium">
           <Inbox size={14} className="text-[var(--muted)]" />
           决策收件箱
           {open.length > 0 && (
-            <Chip size="sm" variant="soft" color="warning">
+            <span className="rounded-full bg-[var(--background-tertiary)] px-1.5 py-0.5 text-label leading-none tabular-nums text-[var(--muted)]">
               {open.length}
-            </Chip>
+            </span>
           )}
         </span>
         <Button
           isIconOnly
           variant="ghost"
           size="sm"
-          className="h-6 w-6"
+          className="h-7 w-7 rounded-lg"
           aria-label="刷新决策"
           onPress={() => void load(true)}
           isDisabled={loading}
@@ -129,12 +129,12 @@ export function DecisionInbox({ projectId }: { projectId: string }) {
       )}
 
       {loading && (
-        <p className="px-3 py-2 text-ui-sm text-[var(--muted)]">加载中…</p>
+        <p className="px-3 py-3 text-ui-sm text-[var(--muted)]">加载中…</p>
       )}
 
       {!loading && !error && open.length === 0 && (
         <div className="flex items-center gap-2 px-3 py-3">
-          <Inbox size={14} className="text-[var(--muted)] opacity-70" />
+          <Inbox size={16} className="text-[var(--muted)] opacity-70" />
           <p className="text-ui-sm text-[var(--muted)]">
             没有待决策事项。高风险变更与审批请求会出现在这里。
           </p>
@@ -145,13 +145,13 @@ export function DecisionInbox({ projectId }: { projectId: string }) {
         open.map((decision) => (
           <div
             key={decision.id}
-            className="flex items-start gap-3 border-b border-[var(--border)] px-3 py-2 last:border-b-0"
+            className="flex items-start gap-3 border-b border-[var(--border)] px-3 py-2.5 last:border-b-0"
           >
             <div className="min-w-0 flex-1">
-              <p className="whitespace-pre-wrap break-words text-ui">
+              <p className="whitespace-pre-wrap break-words text-ui leading-[1.45]">
                 {decision.prompt}
               </p>
-              <div className="mt-1 flex flex-wrap items-center gap-1.5 text-label text-[var(--muted)]">
+              <div className="mt-1.5 flex flex-wrap items-center gap-2 text-label text-[var(--muted)]">
                 <Chip size="sm" variant="tertiary" color="warning">
                   {decisionKindLabel(decision.kind)}
                 </Chip>
@@ -163,11 +163,11 @@ export function DecisionInbox({ projectId }: { projectId: string }) {
                 <span>{formatDate(decision.created_at)}</span>
               </div>
             </div>
-            <div className="flex shrink-0 items-center gap-1">
+            <div className="flex shrink-0 items-center gap-1.5">
               <Button
                 variant="primary"
                 size="sm"
-                className="h-7 px-2.5 text-ui"
+                className="h-8 px-3 text-ui"
                 onPress={() => void resolve(decision.id, "allow")}
                 isDisabled={busyId !== null}
               >
@@ -176,7 +176,7 @@ export function DecisionInbox({ projectId }: { projectId: string }) {
               <Button
                 variant="danger-soft"
                 size="sm"
-                className="h-7 px-2.5 text-ui"
+                className="h-8 px-3 text-ui"
                 onPress={() => void resolve(decision.id, "deny")}
                 isDisabled={busyId !== null}
               >
