@@ -19,6 +19,7 @@ import { Vaults } from "./components/Vaults";
 import { Workspace } from "./components/Workspace";
 import { ReviewsPanel } from "./components/ReviewsPanel";
 import { AgentsPanel } from "./components/AgentsPanel";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { getTask, type GlobalHit } from "./lib/api";
 import {
   Bot,
@@ -32,6 +33,7 @@ import {
   NotebookPen,
   Plus,
   Search,
+  Settings2,
   X,
 } from "lucide-react";
 
@@ -53,7 +55,8 @@ type ViewId =
   | "projects"
   | "views"
   | "docs"
-  | "notes";
+  | "notes"
+  | "settings";
 
 const NAV: { id: ViewId; label: string; icon: typeof Inbox }[] = [
   { id: "overview", label: "概览", icon: Inbox },
@@ -78,6 +81,7 @@ const TITLES: Record<ViewId, string> = {
   views: "视图",
   docs: "文档",
   notes: "知识",
+  settings: "设置",
 };
 
 function emptyCopy(view: ViewId) {
@@ -379,11 +383,26 @@ export default function App() {
           ))}
         </nav>
 
-        <div className="mt-auto flex items-center gap-2 px-2 pt-3">
-          <div className="flex size-5 items-center justify-center rounded-full bg-[var(--surface-secondary)] text-label font-medium text-[var(--muted)]">
-            L
+        <div className="mt-auto flex flex-col gap-0.5 pt-3">
+          <Button
+            variant="ghost"
+            size="sm"
+            className={`anim-fast h-8 justify-start gap-2 rounded-lg px-2 text-ui font-normal ${
+              active === "settings"
+                ? "bg-[var(--surface)] text-[var(--foreground)]"
+                : "text-[var(--muted)] hover:bg-[var(--background-tertiary)] hover:text-[var(--foreground)]"
+            }`}
+            onPress={() => open("settings")}
+          >
+            <Settings2 size={16} className="opacity-70" />
+            设置
+          </Button>
+          <div className="flex items-center gap-2 px-2 pt-2">
+            <div className="flex size-5 items-center justify-center rounded-full bg-[var(--surface-secondary)] text-label font-medium text-[var(--muted)]">
+              L
+            </div>
+            <span className="text-ui-sm text-[var(--muted)]">本地工作区</span>
           </div>
-          <span className="text-ui-sm text-[var(--muted)]">本地工作区</span>
         </div>
       </aside>
 
@@ -574,6 +593,10 @@ export default function App() {
                   title="暂无视图"
                   hint={emptyCopy("views")}
                 />
+              )}
+
+              {active === "settings" && (
+                <SettingsPanel projectId={current?.id ?? null} />
               )}
             </div>
           </section>

@@ -14,6 +14,15 @@ use uuid::Uuid;
 /// 单个任务允许的最大尝试次数（`failed -> queued` 的上限，用尽后转人工）。
 pub const MAX_ATTEMPTS: u32 = 3;
 
+/// 全局设置键：未在任务上单独指定时使用的默认适配器 id。
+pub const SETTING_DEFAULT_AGENT: &str = "default_agent";
+
+/// 全局设置键：孤儿 worktree 的保留天数。
+pub const SETTING_WORKTREE_RETENTION_DAYS: &str = "worktree_retention_days";
+
+/// 保留天数缺失或非法时的回退值。
+pub const DEFAULT_WORKTREE_RETENTION_DAYS: u32 = 7;
+
 // ---------------------------------------------------------------------------
 // 公开类型
 // ---------------------------------------------------------------------------
@@ -980,6 +989,47 @@ pub fn next_ready_tasks(conn: &Connection, project_id: &str) -> Result<Vec<Strin
 /// `false`。
 pub fn task_ready(conn: &Connection, task_id: &str) -> Result<bool, String> {
     Ok(!query_ready_tasks(conn, None, Some(task_id))?.is_empty())
+}
+
+/// 读取全局设置；键不存在时返回 `None`。
+pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+/// 写入全局设置（存在则覆盖并刷新 `updated_at`）。
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET
+             value = excluded.value,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        params![key, value],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// 删除全局设置；键不存在时视为成功。
+pub fn delete_setting(conn: &Connection, key: &str) -> Result<(), String> {
+    conn.execute("DELETE FROM app_settings WHERE key = ?1", params![key])
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// 孤儿 worktree 的保留天数：读不到或非法时回退 7 天，并收敛到 `1..=90`。
+pub fn worktree_retention_days(conn: &Connection) -> u32 {
+    get_setting(conn, SETTING_WORKTREE_RETENTION_DAYS)
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_WORKTREE_RETENTION_DAYS)
+        .clamp(1, 90)
 }
 
 /// 项目的并发上限；列为 NULL 时回落为 1。
@@ -3611,6 +3661,67 @@ mod tests {
 
         assert!(set_project_require_checks(conn, "missing-project", true).is_err());
         assert!(project_require_checks(conn, "missing-project").is_err());
+    }
+
+    #[test]
+    fn settings_roundtrip_overwrite_and_delete() {
+        let db = open_db();
+        let conn = db.conn();
+
+        assert_eq!(get_setting(conn, SETTING_DEFAULT_AGENT).unwrap(), None);
+
+        set_setting(conn, SETTING_DEFAULT_AGENT, "omp").unwrap();
+        assert_eq!(
+            get_setting(conn, SETTING_DEFAULT_AGENT).unwrap().as_deref(),
+            Some("omp")
+        );
+
+        // 覆盖写入并刷新 updated_at（先伪造一个旧时间戳，避免同毫秒竞争）。
+        conn.execute(
+            "UPDATE app_settings SET updated_at = '2000-01-01T00:00:00.000Z' WHERE key = ?1",
+            params![SETTING_DEFAULT_AGENT],
+        )
+        .unwrap();
+        set_setting(conn, SETTING_DEFAULT_AGENT, "codex").unwrap();
+        assert_eq!(
+            get_setting(conn, SETTING_DEFAULT_AGENT).unwrap().as_deref(),
+            Some("codex")
+        );
+        let updated_at: String = conn
+            .query_row(
+                "SELECT updated_at FROM app_settings WHERE key = ?1",
+                params![SETTING_DEFAULT_AGENT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(updated_at, "2000-01-01T00:00:00.000Z");
+
+        delete_setting(conn, SETTING_DEFAULT_AGENT).unwrap();
+        assert_eq!(get_setting(conn, SETTING_DEFAULT_AGENT).unwrap(), None);
+        // 重复删除不报错。
+        delete_setting(conn, SETTING_DEFAULT_AGENT).unwrap();
+    }
+
+    #[test]
+    fn worktree_retention_days_defaults_and_clamps() {
+        let db = open_db();
+        let conn = db.conn();
+
+        assert_eq!(worktree_retention_days(conn), 7, "未设置时回退 7 天");
+
+        for raw in ["", "abc", "1.5", "-3"] {
+            set_setting(conn, SETTING_WORKTREE_RETENTION_DAYS, raw).unwrap();
+            assert_eq!(worktree_retention_days(conn), 7, "非法值回退 7 天：{raw}");
+        }
+
+        set_setting(conn, SETTING_WORKTREE_RETENTION_DAYS, "0").unwrap();
+        assert_eq!(worktree_retention_days(conn), 1, "下界收敛到 1");
+
+        set_setting(conn, SETTING_WORKTREE_RETENTION_DAYS, "365").unwrap();
+        assert_eq!(worktree_retention_days(conn), 90, "上界收敛到 90");
+
+        set_setting(conn, SETTING_WORKTREE_RETENTION_DAYS, "30").unwrap();
+        assert_eq!(worktree_retention_days(conn), 30);
     }
 
     #[test]
