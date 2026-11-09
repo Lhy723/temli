@@ -14,6 +14,8 @@ use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 const MAX_NOTE_BYTES: u64 = 1024 * 1024;
+/// 附件上限：25 MiB（解码后的字节数）。
+const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 const SEARCH_LIMIT: i64 = 50;
 /// 体积大且几乎不含 Markdown 笔记的目录，直接跳过。
 const SKIP_DIRS: &[&str] = &["node_modules"];
@@ -57,6 +59,13 @@ pub struct VaultHit {
     pub path: String,
     pub title: String,
     pub snippet: String,
+}
+
+/// 标签及其笔记数（按数量降序）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultTag {
+    pub tag: String,
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +278,7 @@ pub fn index_vault(conn: &Connection, vault: &Vault) -> Result<usize, String> {
             &at,
         )?;
         index_note_fts(&tx, &note.id, &vault.id, &note.title, &note.body)?;
+        rebuild_note_tags(&tx, &note.id, &note.body)?;
     }
     rebuild_links(&tx, &vault.id)?;
     tx.commit().map_err(db_err)?;
@@ -332,12 +342,22 @@ pub fn create_vault_note(
     title: Option<&str>,
     body: Option<&str>,
 ) -> Result<VaultNote, String> {
-    let relative = normalize_note_path(path)?;
     let title = title.map(clean_title).filter(|title| !title.is_empty());
     let content = match title.as_deref() {
         Some(title) => set_heading(body.unwrap_or(""), title),
         None => body.unwrap_or("").to_string(),
     };
+    create_vault_note_with_content(conn, vault, path, &content)
+}
+
+/// 用现成正文新建笔记（模板落地也走这里）：不注入标题，正文原样写入。
+pub fn create_vault_note_with_content(
+    conn: &Connection,
+    vault: &Vault,
+    path: &str,
+    content: &str,
+) -> Result<VaultNote, String> {
+    let relative = normalize_note_path(path)?;
 
     let absolute = Path::new(&vault.root_path).join(&relative);
     if absolute.exists() {
@@ -360,15 +380,16 @@ pub fn create_vault_note(
         fs::create_dir_all(parent).map_err(|err| format!("创建笔记目录失败：{err}"))?;
         ensure_inside_vault(&vault.root_path, parent)?;
     }
-    write_atomic(&absolute, &content)?;
+    write_atomic(&absolute, content)?;
 
     let id = note_id(&vault.id, &relative);
-    let title = markdown_title(Path::new(&relative), &content);
+    let title = markdown_title(Path::new(&relative), content);
     let at = now(conn)?;
     let written = (|| -> Result<(), String> {
         let tx = conn.unchecked_transaction().map_err(db_err)?;
-        upsert_note(&tx, &id, &vault.id, &relative, &title, &content, &at)?;
-        index_note_fts(&tx, &id, &vault.id, &title, &content)?;
+        upsert_note(&tx, &id, &vault.id, &relative, &title, content, &at)?;
+        index_note_fts(&tx, &id, &vault.id, &title, content)?;
+        rebuild_note_tags(&tx, &id, content)?;
         rebuild_links(&tx, &vault.id)?;
         tx.commit().map_err(db_err)
     })();
@@ -465,6 +486,7 @@ pub fn save_vault_note(
             &at,
         )?;
         index_note_fts(&tx, &new_id, &note.vault_id, &derived_title, &content)?;
+        rebuild_note_tags(&tx, &new_id, &content)?;
         rebuild_links(&tx, &note.vault_id)?;
         tx.commit().map_err(db_err)?;
         return get_vault_note(conn, &new_id);
@@ -478,6 +500,7 @@ pub fn save_vault_note(
     )
     .map_err(db_err)?;
     index_note_fts(&tx, &note.id, &note.vault_id, &derived_title, &content)?;
+    rebuild_note_tags(&tx, &note.id, &content)?;
     rebuild_links(&tx, &note.vault_id)?;
     tx.commit().map_err(db_err)?;
     get_vault_note(conn, &note.id)
@@ -510,6 +533,325 @@ pub fn get_vault_note(conn: &Connection, note_id_value: &str) -> Result<VaultNot
         note.body = body;
     }
     Ok(note)
+}
+
+// ---------------------------------------------------------------------------
+// 标签
+// ---------------------------------------------------------------------------
+
+/// 标签列表：按笔记数降序，同数量按标签名升序。
+pub fn vault_tags(conn: &Connection, vault_id: &str) -> Result<Vec<VaultTag>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT t.tag, COUNT(*) AS note_count
+             FROM vault_note_tags t
+             JOIN vault_notes n ON n.id = t.note_id
+             WHERE n.vault_id = ?1
+             GROUP BY t.tag
+             ORDER BY note_count DESC, t.tag ASC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![vault_id], |row| {
+            Ok(VaultTag {
+                tag: row.get(0)?,
+                count: row.get(1)?,
+            })
+        })
+        .map_err(db_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+}
+
+/// 标签下的笔记：按标题升序（大小写不敏感）。
+pub fn notes_by_tag(
+    conn: &Connection,
+    vault_id: &str,
+    tag: &str,
+) -> Result<Vec<VaultEntry>, String> {
+    let tag = normalize_tag(tag).ok_or_else(|| format!("标签无效：{tag}"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT n.id, n.path, n.title, n.updated_at
+             FROM vault_notes n
+             JOIN vault_note_tags t ON t.note_id = n.id
+             WHERE n.vault_id = ?1 AND t.tag = ?2
+             ORDER BY n.title COLLATE NOCASE ASC, n.path ASC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![vault_id, tag], |row| {
+            Ok(VaultEntry {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                title: row.get(2)?,
+                is_dir: false,
+                updated_at: row.get(3)?,
+            })
+        })
+        .map_err(db_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+}
+
+// ---------------------------------------------------------------------------
+// 附件
+// ---------------------------------------------------------------------------
+
+/// 保存附件：base64 解码后写入 `attachments/<笔记名>-<uuid8>.<ext>`，返回相对路径。
+pub fn save_vault_attachment(
+    conn: &Connection,
+    vault_id: &str,
+    note_id_value: &str,
+    file_name: &str,
+    data_base64: &str,
+) -> Result<String, String> {
+    let (note, root) = load_note_and_root(conn, note_id_value)?;
+    if note.vault_id != vault_id {
+        return Err("笔记不属于该笔记库".to_string());
+    }
+    if data_base64.trim().is_empty() {
+        return Err("附件内容为空".to_string());
+    }
+    let bytes = base64_decode(data_base64)?;
+    if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
+        return Err("附件超过 25 MB".to_string());
+    }
+
+    let extension = attachment_extension(file_name);
+    let note_stem = Path::new(&note.path)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let note_stem = {
+        let cleaned = sanitize_name_part(&note_stem, 40);
+        if cleaned.is_empty() {
+            "note".to_string()
+        } else {
+            cleaned
+        }
+    };
+
+    let directory = Path::new(&root).join("attachments");
+    fs::create_dir_all(&directory).map_err(|err| format!("创建附件目录失败：{err}"))?;
+    ensure_inside_vault(&root, &directory)?;
+
+    let mut chosen = String::new();
+    for _ in 0..8 {
+        let unique = Uuid::new_v4().simple().to_string();
+        let candidate = format!("attachments/{note_stem}-{}.{extension}", &unique[..8]);
+        if !Path::new(&root).join(&candidate).exists() {
+            chosen = candidate;
+            break;
+        }
+    }
+    if chosen.is_empty() {
+        return Err("生成附件文件名失败，请重试".to_string());
+    }
+
+    let target = Path::new(&root).join(&chosen);
+    let temp = target.with_extension("temli-attachment-tmp");
+    fs::write(&temp, &bytes).map_err(|err| format!("写入附件失败：{err}"))?;
+    if let Err(err) = fs::rename(&temp, &target) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("保存附件失败：{err}"));
+    }
+    Ok(chosen)
+}
+
+/// 读取附件：只允许笔记库内 `attachments/` 下的路径，base64 返回（≤25 MB）。
+pub fn read_vault_attachment(
+    conn: &Connection,
+    vault_id: &str,
+    relative_path: &str,
+) -> Result<String, String> {
+    let vault = get_vault(conn, vault_id)?;
+    let root = Path::new(&vault.root_path);
+    let relative = normalize_attachment_path(relative_path)?;
+    let attachments = root.join("attachments");
+    let real_directory = attachments
+        .canonicalize()
+        .map_err(|err| format!("附件目录不存在：{err}"))?;
+    let target = root.join(&relative);
+    let real_target = target
+        .canonicalize()
+        .map_err(|err| format!("附件不存在：{err}"))?;
+    if !real_target.starts_with(&real_directory) {
+        return Err("附件路径超出 attachments 目录".to_string());
+    }
+    let meta = fs::metadata(&real_target).map_err(|err| format!("读取附件失败：{err}"))?;
+    if !meta.is_file() {
+        return Err("附件路径不是文件".to_string());
+    }
+    if meta.len() > MAX_ATTACHMENT_BYTES {
+        return Err("附件超过 25 MB".to_string());
+    }
+    let bytes = fs::read(&real_target).map_err(|err| format!("读取附件失败：{err}"))?;
+    Ok(base64_encode(&bytes))
+}
+
+// ---------------------------------------------------------------------------
+// 模板 / 属性 / 重命名
+// ---------------------------------------------------------------------------
+
+/// 列出 `<vault>/templates/*.md`（只扫描一级目录），按标题升序。
+pub fn list_vault_templates(conn: &Connection, vault_id: &str) -> Result<Vec<VaultEntry>, String> {
+    let vault = get_vault(conn, vault_id)?;
+    let root = Path::new(&vault.root_path);
+    let directory = root.join("templates");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("读取模板目录失败：{err}")),
+    };
+
+    let mut templates = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("读取模板目录失败：{err}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("读取模板类型失败：{err}"))?;
+        if !file_type.is_file() || !is_markdown(&entry.path()) {
+            continue;
+        }
+        let path = relative_path(root, &entry.path());
+        let body = match fs::read_to_string(entry.path()) {
+            Ok(body) => body,
+            Err(err) => {
+                eprintln!("读取模板 {} 失败，跳过：{err}", entry.path().display());
+                continue;
+            }
+        };
+        let indexed: Option<(String, String)> = conn
+            .query_row(
+                "SELECT id, updated_at FROM vault_notes WHERE vault_id = ?1 AND path = ?2",
+                params![vault_id, path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(db_err)?;
+        let (id, updated_at) = indexed.unwrap_or_else(|| (note_id(vault_id, &path), String::new()));
+        templates.push(VaultEntry {
+            id,
+            title: markdown_title(Path::new(&path), &body),
+            path,
+            is_dir: false,
+            updated_at,
+        });
+    }
+    templates.sort_by(|left, right| {
+        left.title
+            .to_lowercase()
+            .cmp(&right.title.to_lowercase())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(templates)
+}
+
+/// 设置 frontmatter 属性：保留其它键与正文，空值删除键；`tags` 会触发标签重建。
+pub fn set_note_properties(
+    conn: &Connection,
+    note_id_value: &str,
+    properties: &BTreeMap<String, String>,
+) -> Result<VaultNote, String> {
+    for key in properties.keys() {
+        if !is_property_key(key) {
+            return Err(format!("属性名不合法：{key}"));
+        }
+    }
+    let (note, root) = load_note_and_root(conn, note_id_value)?;
+    let absolute = Path::new(&root).join(&note.path);
+    let content = fs::read_to_string(&absolute).unwrap_or_else(|_| note.body.clone());
+    let updated = set_frontmatter_properties(&content, properties);
+    if updated == content {
+        return get_vault_note(conn, note_id_value);
+    }
+    save_vault_note(conn, note_id_value, None, Some(updated.as_str()), None)
+}
+
+/// 重命名笔记（按新路径重算 id）：移动文件、迁移索引并改写全库指向旧标题/文件名的 wikilink。
+pub fn rename_vault_note(
+    conn: &Connection,
+    note_id_value: &str,
+    new_path: &str,
+) -> Result<VaultNote, String> {
+    let (note, root) = load_note_and_root(conn, note_id_value)?;
+    let target_path = normalize_note_path(new_path)?;
+    if target_path == note.path {
+        return get_vault_note(conn, note_id_value);
+    }
+
+    let disk_path = Path::new(&root).join(&note.path);
+    let target_absolute = Path::new(&root).join(&target_path);
+    let content = fs::read_to_string(&disk_path).unwrap_or_else(|_| note.body.clone());
+
+    let duplicate: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM vault_notes
+                 WHERE vault_id = ?1 AND path = ?2 AND id <> ?3
+             )",
+            params![note.vault_id, target_path, note.id],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if duplicate {
+        return Err(format!("笔记路径已被占用：{target_path}"));
+    }
+    let same_file = target_absolute
+        .canonicalize()
+        .ok()
+        .zip(disk_path.canonicalize().ok())
+        .is_some_and(|(target, source)| target == source);
+    if target_absolute.exists() && !same_file {
+        return Err(format!("笔记文件已存在：{target_path}"));
+    }
+
+    let at = now(conn)?;
+    if let Some(parent) = target_absolute.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("创建笔记目录失败：{err}"))?;
+        ensure_inside_vault(&root, parent)?;
+    }
+    write_atomic(&target_absolute, &content)?;
+    if !same_file && disk_path.exists() {
+        let _ = fs::remove_file(&disk_path);
+    }
+
+    let old_title = markdown_title(Path::new(&note.path), &content);
+    let new_title = markdown_title(Path::new(&target_path), &content);
+    let new_id = note_id(&note.vault_id, &target_path);
+    let written = (|| -> Result<(), String> {
+        let tx = conn.unchecked_transaction().map_err(db_err)?;
+        // id 由 vault 内相对路径决定，重命名后必须迁移到新 id，旧行与旧 FTS 一并删除。
+        tx.execute("DELETE FROM notes_fts WHERE note_id = ?1", params![note.id])
+            .map_err(db_err)?;
+        tx.execute("DELETE FROM vault_notes WHERE id = ?1", params![note.id])
+            .map_err(db_err)?;
+        upsert_note(
+            &tx,
+            &new_id,
+            &note.vault_id,
+            &target_path,
+            &new_title,
+            &content,
+            &at,
+        )?;
+        index_note_fts(&tx, &new_id, &note.vault_id, &new_title, &content)?;
+        rebuild_note_tags(&tx, &new_id, &content)?;
+        rebuild_links(&tx, &note.vault_id)?;
+        tx.commit().map_err(db_err)
+    })();
+    if let Err(err) = written {
+        let _ = fs::write(&disk_path, &content);
+        if !same_file {
+            let _ = fs::remove_file(&target_absolute);
+        }
+        return Err(err);
+    }
+
+    let replacements = rename_replacements(&note.path, &target_path, &old_title, &new_title);
+    if !replacements.is_empty() {
+        rewrite_vault_links(conn, &note.vault_id, &replacements)?;
+    }
+    get_vault_note(conn, &new_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -849,6 +1191,718 @@ fn parse_wikilinks(body: &str) -> Vec<String> {
         rest = &after[end + 2..];
     }
     links
+}
+
+// ---------------------------------------------------------------------------
+// frontmatter / 标签
+// ---------------------------------------------------------------------------
+
+struct FrontmatterParts<'a> {
+    /// 去掉分隔行的 frontmatter 内部文本。
+    block: &'a str,
+    /// 关闭分隔行之后的正文。
+    body: &'a str,
+    /// 原文件使用的换行符。
+    newline: &'static str,
+}
+
+/// 拆分 BOM + frontmatter；没有合法 frontmatter 时返回 `None`。
+fn split_frontmatter(content: &str) -> Option<FrontmatterParts<'_>> {
+    let bom_len = if content.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let rest = &content[bom_len..];
+    let mut lines = rest.split_inclusive('\n');
+    let first = lines.next()?;
+    if first.trim_end_matches(['\r', '\n']).trim() != "---" {
+        return None;
+    }
+    let newline = if first.ends_with("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let block_start = bom_len + first.len();
+    let mut offset = block_start;
+    for line in lines {
+        if line.trim_end_matches(['\r', '\n']).trim() == "---" {
+            let preamble = offset + line.len();
+            return Some(FrontmatterParts {
+                block: &content[block_start..offset],
+                body: &content[preamble..],
+                newline,
+            });
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// 页面里的标签：frontmatter `tags`（列表 / 逗号分隔）+ 正文行内 `#tag`。
+fn parse_tags(content: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut seen = HashSet::new();
+    let body = match split_frontmatter(content) {
+        Some(parts) => {
+            collect_frontmatter_tags(parts.block, &mut tags, &mut seen);
+            parts.body
+        }
+        None => content,
+    };
+    collect_inline_tags(body, &mut tags, &mut seen);
+    tags
+}
+
+fn collect_frontmatter_tags(block: &str, tags: &mut Vec<String>, seen: &mut HashSet<String>) {
+    let mut in_list = false;
+    for line in block.lines() {
+        let trimmed = line.trim();
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let key = key.trim();
+            if key.eq_ignore_ascii_case("tags") || key.eq_ignore_ascii_case("tag") {
+                in_list = true;
+                for part in split_tag_value(value) {
+                    push_tag(&part, tags, seen);
+                }
+                continue;
+            }
+            in_list = false;
+            continue;
+        }
+        if in_list && trimmed.starts_with('-') {
+            for part in split_tag_value(trimmed.trim_start_matches('-')) {
+                push_tag(&part, tags, seen);
+            }
+        } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            // 缩进注释保留列表状态，其它普通行结束列表。
+            in_list = false;
+        }
+    }
+}
+
+/// YAML 标签值：`[a, b]` / `a, b` / `a b`（tag 本身不能含空格）。
+fn split_tag_value(value: &str) -> Vec<String> {
+    let value = value.trim();
+    // 不在 flow 列表内时，` #` 之后是 YAML 行内注释。
+    let value = if value.starts_with('[') {
+        value.find(']').map_or(value, |end| &value[..=end])
+    } else {
+        value.split(" #").next().unwrap_or(value)
+    };
+    let value = value
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(value);
+    value
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn push_tag(raw: &str, tags: &mut Vec<String>, seen: &mut HashSet<String>) {
+    if let Some(tag) = normalize_tag(raw)
+        && seen.insert(tag.clone())
+    {
+        tags.push(tag);
+    }
+}
+
+/// 归一化标签：去 `#`/引号，只允许字母数字（含中文）、`_`、`-`、`/`，小写。
+fn normalize_tag(raw: &str) -> Option<String> {
+    let raw = raw.trim().trim_matches(|character: char| {
+        matches!(
+            character,
+            '#' | '"' | '\'' | '[' | ']' | ',' | ' ' | '\t' | '\r' | '\n'
+        )
+    });
+    if raw.is_empty() {
+        return None;
+    }
+    let mut normalized = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        if character.is_alphanumeric() || matches!(character, '_' | '-' | '/') {
+            normalized.push(character);
+        } else {
+            return None;
+        }
+    }
+    let normalized = normalized.trim_end_matches('/');
+    // 至少保留一个非数字字符，避免把 `#123` 当成标签。
+    if normalized.is_empty()
+        || !normalized
+            .chars()
+            .any(|character| character.is_alphanumeric() && !character.is_numeric())
+    {
+        return None;
+    }
+    Some(normalized.to_lowercase())
+}
+
+fn is_tag_char(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '-' | '/')
+}
+
+fn is_tag_boundary(previous: Option<char>) -> bool {
+    match previous {
+        None => true,
+        Some(character) => {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '(' | '['
+                        | '（'
+                        | '【'
+                        | '「'
+                        | '《'
+                        | '，'
+                        | '。'
+                        | '、'
+                        | '；'
+                        | '：'
+                        | '！'
+                        | '？'
+                        | ','
+                        | ';'
+                        | ':'
+                        | '!'
+                        | '?'
+                        | '"'
+                        | '\''
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                )
+        }
+    }
+}
+
+/// 正文行内标签；忽略围栏代码块，并要求 `#` 前是空白/标点，避免 URL 片段误判。
+fn collect_inline_tags(body: &str, tags: &mut Vec<String>, seen: &mut HashSet<String>) {
+    let mut in_fence = false;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let characters: Vec<char> = line.chars().collect();
+        let mut index = 0;
+        while index < characters.len() {
+            let is_link_anchor = index >= 2
+                && matches!(
+                    (characters[index - 2], characters[index - 1]),
+                    ('[', '[') | (']', '(')
+                );
+            if characters[index] == '#'
+                && !is_link_anchor
+                && is_tag_boundary(if index == 0 {
+                    None
+                } else {
+                    Some(characters[index - 1])
+                })
+            {
+                let mut end = index + 1;
+                while end < characters.len() && is_tag_char(characters[end]) {
+                    end += 1;
+                }
+                if end > index + 1 {
+                    let raw: String = characters[index + 1..end].iter().collect();
+                    push_tag(&raw, tags, seen);
+                }
+                index = end;
+                continue;
+            }
+            index += 1;
+        }
+    }
+}
+
+/// 重建单篇笔记的标签行（先清空再写入，幂等）。
+fn rebuild_note_tags(conn: &Connection, note_id_value: &str, content: &str) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM vault_note_tags WHERE note_id = ?1",
+        params![note_id_value],
+    )
+    .map_err(db_err)?;
+    let tags = parse_tags(content);
+    if tags.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare("INSERT OR IGNORE INTO vault_note_tags (note_id, tag) VALUES (?1, ?2)")
+        .map_err(db_err)?;
+    for tag in tags {
+        stmt.execute(params![note_id_value, tag]).map_err(db_err)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 属性（frontmatter 编辑）
+// ---------------------------------------------------------------------------
+
+fn is_property_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+}
+
+fn format_yaml_property(key: &str, value: &str) -> String {
+    let plain = !value.is_empty()
+        && !value.starts_with(' ')
+        && !value.starts_with('\t')
+        && !value.ends_with(' ')
+        && !value.ends_with('\t')
+        && !value.starts_with('-')
+        && !value.starts_with('?')
+        && !value.chars().any(|character| {
+            matches!(
+                character,
+                ':' | '#'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | ','
+                    | '&'
+                    | '*'
+                    | '!'
+                    | '|'
+                    | '>'
+                    | '\''
+                    | '"'
+                    | '%'
+                    | '@'
+                    | '`'
+                    | '\n'
+                    | '\r'
+                    | '\t'
+            )
+        });
+    if plain {
+        format!("{key}: {value}")
+    } else {
+        let quoted = serde_json::to_string(value)
+            .unwrap_or_else(|_| format!("\"{}\"", value.replace('"', "\\\"").replace('\n', "\\n")));
+        format!("{key}: {quoted}")
+    }
+}
+
+/// 合并 frontmatter：替换传入键、空值删除、其它键与正文原样保留。
+fn set_frontmatter_properties(content: &str, properties: &BTreeMap<String, String>) -> String {
+    if properties.is_empty() {
+        return content.to_string();
+    }
+    let bom_len = if content.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let bom = &content[..bom_len];
+
+    if let Some(parts) = split_frontmatter(content) {
+        let mut lines: Vec<String> = Vec::new();
+        let mut handled: HashSet<String> = HashSet::new();
+        let mut skip_indented = false;
+        for line in parts.block.lines() {
+            let trimmed = line.trim();
+            let top_level =
+                !trimmed.is_empty() && !line.starts_with(' ') && !line.starts_with('\t');
+            if top_level && let Some((key, _)) = line.split_once(':') {
+                let key = key.trim();
+                if let Some(value) = properties.get(key) {
+                    skip_indented = true;
+                    if handled.insert(key.to_string()) && !value.is_empty() {
+                        lines.push(format_yaml_property(key, value));
+                    }
+                    continue;
+                }
+                skip_indented = false;
+            } else if skip_indented && (line.starts_with(' ') || line.starts_with('\t')) {
+                continue;
+            }
+            if !trimmed.is_empty() {
+                skip_indented = false;
+            }
+            lines.push(line.to_string());
+        }
+        for (key, value) in properties {
+            if value.is_empty() || handled.contains(key.as_str()) {
+                continue;
+            }
+            lines.push(format_yaml_property(key, value));
+        }
+
+        let mut out = String::with_capacity(content.len() + 32);
+        if lines.is_empty() {
+            out.push_str(bom);
+            out.push_str(parts.body);
+        } else {
+            out.push_str(bom);
+            out.push_str("---");
+            out.push_str(parts.newline);
+            out.push_str(&lines.join(parts.newline));
+            out.push_str(parts.newline);
+            out.push_str("---");
+            out.push_str(parts.newline);
+            out.push_str(parts.body);
+        }
+        return out;
+    }
+
+    let lines: Vec<String> = properties
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, value)| format_yaml_property(key, value))
+        .collect();
+    if lines.is_empty() {
+        return content.to_string();
+    }
+    let newline = if content[bom_len..].contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut out = String::with_capacity(content.len() + 64);
+    out.push_str(bom);
+    out.push_str("---");
+    out.push_str(newline);
+    out.push_str(&lines.join(newline));
+    out.push_str(newline);
+    out.push_str("---");
+    out.push_str(newline);
+    out.push_str(&content[bom_len..]);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// 重命名：wikilink 改写
+// ---------------------------------------------------------------------------
+
+fn path_without_markdown_extension(path: &str) -> String {
+    let stem = path
+        .get(path.len().saturating_sub(3)..)
+        .filter(|suffix| suffix.eq_ignore_ascii_case(".md"))
+        .map(|_| &path[..path.len() - 3])
+        .unwrap_or(path);
+    stem.to_string()
+}
+
+fn rename_replacements(
+    old_path: &str,
+    new_path: &str,
+    old_title: &str,
+    new_title: &str,
+) -> Vec<(String, String)> {
+    let old_stem = Path::new(old_path)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let new_stem = Path::new(new_path)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let candidates = [
+        (old_title.to_string(), new_title.to_string()),
+        (old_stem, new_stem),
+        (
+            path_without_markdown_extension(old_path),
+            path_without_markdown_extension(new_path),
+        ),
+    ];
+    for (old, new) in candidates {
+        let old = old.trim();
+        let new = new.trim();
+        if old.is_empty() || new.is_empty() || old == new {
+            continue;
+        }
+        let key = old.to_lowercase();
+        if pairs.iter().any(|(existing, _)| existing == &key) {
+            continue;
+        }
+        pairs.push((key, new.to_string()));
+    }
+    pairs
+}
+
+/// 改写单个文件里的 `[[旧目标]]` / `[[旧目标#标题]]` / `[[旧目标|别名]]`；
+/// 围栏代码块（``` / ~~~）内原样保留。
+fn rewrite_wikilinks(content: &str, replacements: &[(String, String)]) -> String {
+    if replacements.is_empty() || !content.contains("[[") {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut in_fence = false;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence {
+            out.push_str(line);
+            continue;
+        }
+        out.push_str(&rewrite_wikilinks_line(line, replacements));
+    }
+    out
+}
+
+/// 改写一行内的 wikilink（行尾换行符原样保留）。
+fn rewrite_wikilinks_line(line: &str, replacements: &[(String, String)]) -> String {
+    if !line.contains("[[") {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find("[[") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("]]") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let inner = &after[..end];
+        let (target_part, alias_suffix) = match inner.split_once('|') {
+            Some((target, alias)) => (target, Some(alias)),
+            None => (inner, None),
+        };
+        let (target, heading_suffix) = match target_part.split_once('#') {
+            Some((target, heading)) => (target, Some(heading)),
+            None => (target_part, None),
+        };
+        let key = target.trim().to_lowercase();
+        match replacements.iter().find(|(old, _)| old == &key) {
+            Some((_, new)) => {
+                out.push_str("[[");
+                out.push_str(new);
+                if let Some(heading) = heading_suffix {
+                    out.push('#');
+                    out.push_str(heading);
+                }
+                if let Some(alias) = alias_suffix {
+                    out.push('|');
+                    out.push_str(alias);
+                }
+                out.push_str("]]");
+            }
+            None => out.push_str(&rest[start..start + 2 + end + 2]),
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 全库改写 wikilink，并同步 DB 正文缓存、FTS 与标签。
+fn rewrite_vault_links(
+    conn: &Connection,
+    vault_id: &str,
+    replacements: &[(String, String)],
+) -> Result<(), String> {
+    let vault = get_vault(conn, vault_id)?;
+    let root = vault.root_path;
+    let notes: Vec<(String, String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, body FROM vault_notes
+                 WHERE vault_id = ?1 ORDER BY path ASC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![vault_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(db_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_err)?
+    };
+
+    let at = now(conn)?;
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    for (id, path, cached_body) in notes {
+        let absolute = Path::new(&root).join(&path);
+        let content = fs::read_to_string(&absolute).unwrap_or(cached_body);
+        let updated = rewrite_wikilinks(&content, replacements);
+        if updated == content {
+            continue;
+        }
+        write_atomic(&absolute, &updated)?;
+        let title = markdown_title(Path::new(&path), &updated);
+        tx.execute(
+            "UPDATE vault_notes SET title = ?1, body = ?2, updated_at = ?3 WHERE id = ?4",
+            params![title, updated, at, id],
+        )
+        .map_err(db_err)?;
+        index_note_fts(&tx, &id, vault_id, &title, &updated)?;
+        rebuild_note_tags(&tx, &id, &updated)?;
+    }
+    rebuild_links(&tx, vault_id)?;
+    tx.commit().map_err(db_err)
+}
+
+// ---------------------------------------------------------------------------
+// 附件路径 / base64
+// ---------------------------------------------------------------------------
+
+/// 文件名清洗：字母数字（含中文）、`_`、`-`；空白折叠为 `-`，截断到 `max_chars`。
+fn sanitize_name_part(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for character in input.chars() {
+        if character.is_alphanumeric() || matches!(character, '_' | '-') {
+            out.push(character);
+            last_dash = character == '-';
+        } else if character.is_whitespace() && !out.is_empty() && !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let limited: String = out.trim_matches('-').chars().take(max_chars).collect();
+    limited.trim_matches('-').to_string()
+}
+
+/// 从用户文件名取扩展名：只保留 ASCII 字母数字，缺失/非法时用 `bin`。
+fn attachment_extension(file_name: &str) -> String {
+    let normalized = file_name.trim().replace('\\', "/");
+    let name = Path::new(&normalized)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.trim().to_lowercase())
+        .unwrap_or_default();
+    if !extension.is_empty()
+        && extension.chars().count() <= 16
+        && extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        extension
+    } else {
+        "bin".to_string()
+    }
+}
+
+/// 只接受 `attachments/...` 相对路径，拒绝绝对路径与 `..`。
+fn normalize_attachment_path(input: &str) -> Result<String, String> {
+    let normalized = input.trim().replace('\\', "/");
+    if normalized.is_empty() {
+        return Err("附件路径不能为空".to_string());
+    }
+    if normalized.starts_with('/') {
+        return Err("附件路径必须是相对笔记库的路径".to_string());
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in normalized.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => return Err("附件路径不能包含 ..".to_string()),
+            other => {
+                if other.contains('\0') {
+                    return Err("附件路径包含非法字符".to_string());
+                }
+                parts.push(other);
+            }
+        }
+    }
+    if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("attachments") {
+        return Err("只允许读取 attachments/ 目录下的附件".to_string());
+    }
+    let rest = parts[1..].join("/");
+    if rest.is_empty() {
+        return Err("附件路径不能为空".to_string());
+    }
+    Ok(format!("attachments/{rest}"))
+}
+
+/// 标准 base64（兼容 URL-safe 与 data URL 前缀）；解码后超过 25 MB 直接报错。
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let input = input.trim();
+    let payload = if let Some(rest) = input.strip_prefix("data:") {
+        rest.split_once(";base64,")
+            .map(|(_, payload)| payload)
+            .unwrap_or(input)
+    } else {
+        input
+    };
+    if payload.len() as u64 > MAX_ATTACHMENT_BYTES * 2 {
+        return Err("附件超过 25 MB".to_string());
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(payload.len() * 3 / 4);
+    let mut buffer: u32 = 0;
+    let mut bits: u32 = 0;
+    for byte in payload.bytes() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            _ => {
+                return Err(format!(
+                    "附件数据不是合法 base64（非法字符：{}）",
+                    char::from(byte)
+                ));
+            }
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+            buffer &= (1u32 << bits) - 1;
+        }
+        if out.len() as u64 > MAX_ATTACHMENT_BYTES {
+            return Err("附件超过 25 MB".to_string());
+        }
+    }
+    if bits == 6 {
+        return Err("附件数据不是合法 base64（长度无效）".to_string());
+    }
+    Ok(out)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        out.push(char::from(ALPHABET[(first >> 2) as usize]));
+        out.push(char::from(
+            ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize],
+        ));
+        if chunk.len() > 1 {
+            out.push(char::from(
+                ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize],
+            ));
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(char::from(ALPHABET[(third & 0x3f) as usize]));
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn note_id(vault_id: &str, relative: &str) -> String {
@@ -1344,5 +2398,353 @@ mod tests {
         assert!(search_vault(conn, &vault.id, "   ").unwrap().is_empty());
         assert_ne!(vault.id, other.id);
         assert_eq!(search_vault(conn, &other.id, "笔记").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tag_parsing_frontmatter_inline_and_code_blocks() {
+        let content = "---\ntags: [Alpha, 中文标签, dev/work]\n---\n# 标题\n\n#正文标签 与 #dev/ops. 还有 #tag-name_1\n\n```rust\n#代码块\n```\n\nhttps://example.com/page#fragment 与 #real\n";
+        assert_eq!(
+            parse_tags(content),
+            vec![
+                "alpha",
+                "中文标签",
+                "dev/work",
+                "正文标签",
+                "dev/ops",
+                "tag-name_1",
+                "real"
+            ]
+        );
+
+        let block_list = "---\ntags:\n  - One\n  - two/three\n---\n\n正文\n";
+        assert_eq!(parse_tags(block_list), vec!["one", "two/three"]);
+
+        let comma_string = "---\ntags: a, b\n---\n\n正文\n";
+        assert_eq!(parse_tags(comma_string), vec!["a", "b"]);
+
+        // 围栏内与 URL 片段都不算标签；重复标签去重。
+        let fenced = "```\n#hidden #重复\n```\n#重复 #可见\n";
+        assert_eq!(parse_tags(fenced), vec!["重复", "可见"]);
+        assert!(normalize_tag("#Rust").is_some_and(|tag| tag == "rust"));
+        assert!(normalize_tag("bad tag").is_none());
+        assert!(normalize_tag("...").is_none());
+
+        // 纯数字不是标签，混有字母/文字的数字标签仍有效。
+        assert!(normalize_tag("#123").is_none());
+        assert!(normalize_tag("2024/01").is_none());
+        assert!(normalize_tag("#v2").is_some_and(|tag| tag == "v2"));
+        assert!(normalize_tag("2024-notes").is_some_and(|tag| tag == "2024-notes"));
+        assert_eq!(
+            parse_tags("#123 #v2 与 #2024-notes\n"),
+            vec!["v2", "2024-notes"]
+        );
+
+        // wikilink 标题与 markdown 锚点里的 # 不是行内标签。
+        let anchors = "[[#标题]] 与 [文字](#锚点) 以及 #真标签\n";
+        assert_eq!(parse_tags(anchors), vec!["真标签"]);
+    }
+
+    #[test]
+    fn tags_are_indexed_and_queryable() {
+        let fixture = Fixture::new("tags");
+        let vault = fixture.vault("tags");
+        let conn = fixture.db.conn();
+        let root = vault.root_path.as_str();
+
+        Fixture::write(
+            root,
+            "A.md",
+            "---\ntags: [Rust, 中文]\n---\n\n# A\n\n#共享\n",
+        );
+        Fixture::write(root, "B.md", "# B\n\n#rust #共享 #dev/ops\n");
+        assert_eq!(index_vault(conn, &vault).unwrap(), 2);
+
+        let tags = vault_tags(conn, &vault.id).unwrap();
+        let counts: HashMap<&str, i64> = tags
+            .iter()
+            .map(|tag| (tag.tag.as_str(), tag.count))
+            .collect();
+        assert_eq!(counts.get("rust"), Some(&2));
+        assert_eq!(counts.get("共享"), Some(&2));
+        assert_eq!(counts.get("中文"), Some(&1));
+        assert_eq!(counts.get("dev/ops"), Some(&1));
+        assert!(
+            tags.windows(2).all(|pair| pair[0].count >= pair[1].count),
+            "{tags:?}"
+        );
+
+        let rust = notes_by_tag(conn, &vault.id, "RUST").unwrap();
+        assert_eq!(
+            rust.iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "B"]
+        );
+        assert!(rust.iter().all(|entry| !entry.is_dir));
+        assert_eq!(notes_by_tag(conn, &vault.id, "中文").unwrap().len(), 1);
+        assert!(notes_by_tag(conn, &vault.id, " ").is_err());
+
+        // 保存后标签随之重建。
+        let b = title_of(conn, &vault.id, "B");
+        save_vault_note(conn, &b.id, None, Some("# B\n\n没有标签\n"), None).unwrap();
+        let counts: HashMap<String, i64> = vault_tags(conn, &vault.id)
+            .unwrap()
+            .into_iter()
+            .map(|tag| (tag.tag, tag.count))
+            .collect();
+        assert_eq!(counts.get("rust"), Some(&1));
+        assert_eq!(counts.get("共享"), Some(&1));
+        assert_eq!(counts.get("dev/ops"), None);
+    }
+
+    #[test]
+    fn attachments_sanitize_and_reject_escapes() {
+        let fixture = Fixture::new("attachments");
+        let vault = fixture.vault("attachments");
+        let conn = fixture.db.conn();
+        let note = create_vault_note(conn, &vault, "assets/base", None, Some("# Base")).unwrap();
+
+        let relative =
+            save_vault_attachment(conn, &vault.id, &note.id, "../../危险 文件.PNG", "aGVsbG8=")
+                .unwrap();
+        let name = relative
+            .strip_prefix("attachments/")
+            .expect("落在 attachments/");
+        assert!(name.starts_with("base-"), "{relative}");
+        assert!(name.ends_with(".png"), "{relative}");
+        assert!(!name.contains("..") && !name.contains('/'), "{relative}");
+        assert_eq!(name.matches('-').count(), 1, "{relative}");
+        let disk = Path::new(&vault.root_path).join(&relative);
+        assert_eq!(fs::read_to_string(&disk).unwrap(), "hello");
+
+        let encoded = read_vault_attachment(conn, &vault.id, &relative).unwrap();
+        assert_eq!(base64_decode(&encoded).unwrap(), b"hello".as_slice());
+        assert_eq!(encoded, "aGVsbG8=");
+
+        assert!(read_vault_attachment(conn, &vault.id, "../temli.db").is_err());
+        assert!(read_vault_attachment(conn, &vault.id, "attachments/../temli.db").is_err());
+        assert!(read_vault_attachment(conn, &vault.id, "notes/base.md").is_err());
+        assert!(read_vault_attachment(conn, &vault.id, &format!("/{relative}")).is_err());
+        assert!(save_vault_attachment(conn, &vault.id, &note.id, "a.txt", "***").is_err());
+
+        let big = vec![0u8; MAX_ATTACHMENT_BYTES as usize + 1];
+        let encoded = base64_encode(&big);
+        let error =
+            save_vault_attachment(conn, &vault.id, &note.id, "big.bin", &encoded).unwrap_err();
+        assert!(error.contains("25 MB"), "{error}");
+    }
+
+    #[test]
+    fn templates_scan_and_create_from_content() {
+        let fixture = Fixture::new("templates");
+        let vault = fixture.vault("templates");
+        let conn = fixture.db.conn();
+        let root = vault.root_path.as_str();
+
+        Fixture::write(root, "templates/Daily.md", "# 日记模板\n\n- [ ] 待办\n");
+        Fixture::write(root, "templates/nested/Deep.md", "# Deep\n");
+        Fixture::write(root, "elsewhere/Other.md", "# Other\n");
+
+        let templates = list_vault_templates(conn, &vault.id).unwrap();
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].path, "templates/Daily.md");
+        assert_eq!(templates[0].title, "日记模板");
+        assert!(!templates[0].is_dir);
+        assert!(!templates[0].id.is_empty());
+
+        let content = fs::read_to_string(Path::new(root).join("templates/Daily.md")).unwrap();
+        let note =
+            create_vault_note_with_content(conn, &vault, "Journal/2026-11-09", &content).unwrap();
+        assert_eq!(note.path, "Journal/2026-11-09.md");
+        assert_eq!(note.title, "日记模板");
+        assert_eq!(
+            fs::read_to_string(Path::new(root).join(&note.path)).unwrap(),
+            content
+        );
+        assert!(
+            create_vault_note_with_content(conn, &vault, "Journal/2026-11-09", "重复").is_err()
+        );
+        assert!(create_vault_note_with_content(conn, &vault, "../escape", "越界").is_err());
+    }
+
+    #[test]
+    fn properties_merge_keep_body_and_reindex_tags() {
+        let fixture = Fixture::new("properties");
+        let vault = fixture.vault("properties");
+        let conn = fixture.db.conn();
+        let note = create_vault_note_with_content(
+            conn,
+            &vault,
+            "props",
+            "---\ntitle: 旧标题\ntags: [a, keep]\naliases: [x]\nstatus: draft\n---\n\n# 正文标题\n\n正文内容\n",
+        )
+        .unwrap();
+
+        let mut properties = BTreeMap::new();
+        properties.insert("status".to_string(), "done".to_string());
+        properties.insert("tags".to_string(), "b/c, 中文".to_string());
+        properties.insert("aliases".to_string(), String::new());
+        properties.insert("owner".to_string(), "lhy".to_string());
+
+        let updated = set_note_properties(conn, &note.id, &properties).unwrap();
+        let body = &updated.body;
+        assert!(body.contains("title: 旧标题"), "{body}");
+        assert!(body.contains("status: done"), "{body}");
+        assert!(body.contains("owner: lhy"), "{body}");
+        assert!(body.contains("tags: \"b/c, 中文\""), "{body}");
+        assert!(!body.contains("draft"), "{body}");
+        assert!(!body.contains("aliases"), "{body}");
+        assert!(body.contains("# 正文标题\n\n正文内容"), "{body}");
+        assert_eq!(updated.title, "正文标题");
+
+        let counts: HashMap<String, i64> = vault_tags(conn, &vault.id)
+            .unwrap()
+            .into_iter()
+            .map(|tag| (tag.tag, tag.count))
+            .collect();
+        assert_eq!(counts.get("b/c"), Some(&1));
+        assert_eq!(counts.get("中文"), Some(&1));
+        assert_eq!(counts.get("a"), None);
+        assert_eq!(counts.get("keep"), None);
+
+        // 没有 frontmatter 的笔记：新建 frontmatter，正文完整保留。
+        let plain =
+            create_vault_note_with_content(conn, &vault, "plain", "# Plain\n\n正文\n").unwrap();
+        let mut properties = BTreeMap::new();
+        properties.insert("foo".to_string(), "bar".to_string());
+        let updated = set_note_properties(conn, &plain.id, &properties).unwrap();
+        assert_eq!(updated.body, "---\nfoo: bar\n---\n# Plain\n\n正文\n");
+
+        let mut invalid = BTreeMap::new();
+        invalid.insert("bad key".to_string(), "x".to_string());
+        assert!(set_note_properties(conn, &plain.id, &invalid).is_err());
+    }
+
+    #[test]
+    fn rename_recomputes_id_and_rewrites_wikilinks() {
+        let fixture = Fixture::new("rename");
+        let vault = fixture.vault("rename");
+        let conn = fixture.db.conn();
+        let root = vault.root_path.as_str();
+
+        let target = create_vault_note(conn, &vault, "Old", None, Some("# Old\n\n正文")).unwrap();
+        let source = create_vault_note(
+            conn,
+            &vault,
+            "Source",
+            None,
+            Some("# Source\n\n[[Old]]、[[Old|别名]]、[[Old#小节|带锚]]、[[Other]] 与 #标签\n"),
+        )
+        .unwrap();
+        create_vault_note(conn, &vault, "Other", None, Some("# Other")).unwrap();
+
+        let renamed = rename_vault_note(conn, &target.id, "Folder/New Name").unwrap();
+        assert_eq!(renamed.id, note_id(&vault.id, "Folder/New Name.md"));
+        assert_ne!(renamed.id, target.id, "重命名后按新路径重算 id");
+        assert_eq!(renamed.path, "Folder/New Name.md");
+        assert!(!Path::new(root).join("Old.md").exists());
+        assert!(Path::new(root).join("Folder/New Name.md").exists());
+        assert!(get_vault_note(conn, &target.id).is_err(), "旧 id 应失效");
+        let old_fts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes_fts WHERE note_id = ?1",
+                params![target.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_fts, 0, "旧 id 的 FTS 行应删除");
+        let new_fts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes_fts WHERE note_id = ?1",
+                params![renamed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_fts, 1, "新 id 应写入 FTS");
+        assert!(
+            search_vault(conn, &vault.id, "正文")
+                .unwrap()
+                .iter()
+                .any(|hit| hit.id == renamed.id),
+            "重命名后新 id 应能被检索到"
+        );
+
+        let source_body = fs::read_to_string(Path::new(root).join(&source.path)).unwrap();
+        assert!(source_body.contains("[[New Name]]"), "{source_body}");
+        assert!(source_body.contains("[[New Name|别名]]"), "{source_body}");
+        assert!(
+            source_body.contains("[[New Name#小节|带锚]]"),
+            "{source_body}"
+        );
+        assert!(source_body.contains("[[Other]]"), "{source_body}");
+        assert!(source_body.contains("#标签"), "{source_body}");
+
+        assert_eq!(get_vault_note(conn, &source.id).unwrap().body, source_body);
+        let backlinks = note_backlinks(conn, &renamed.id).unwrap();
+        assert_eq!(backlinks.len(), 1, "{backlinks:?}");
+        assert_eq!(backlinks[0].target, "New Name");
+        assert_eq!(
+            vault_tree(conn, &vault.id)
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.title == "Old")
+                .count(),
+            1
+        );
+
+        assert!(rename_vault_note(conn, &renamed.id, "Source").is_err());
+        assert!(rename_vault_note(conn, &renamed.id, "../escape").is_err());
+    }
+
+    #[test]
+    fn rename_restores_files_when_db_write_fails() {
+        let fixture = Fixture::new("rename-rollback");
+        let vault = fixture.vault("rename-rollback");
+        let conn = fixture.db.conn();
+        let root = vault.root_path.as_str();
+
+        let note = create_vault_note(conn, &vault, "Keep", None, Some("# Keep\n\n原正文")).unwrap();
+        let blocked_id = note_id(&vault.id, "Broken/Moved.md");
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER fail_rename BEFORE INSERT ON vault_notes
+             WHEN NEW.id = '{blocked_id}'
+             BEGIN SELECT RAISE(ABORT, 'boom'); END;"
+        ))
+        .unwrap();
+
+        assert!(rename_vault_note(conn, &note.id, "Broken/Moved").is_err());
+
+        let restored = Path::new(root).join("Keep.md");
+        assert!(restored.exists(), "DB 失败应恢复旧文件");
+        assert_eq!(fs::read_to_string(&restored).unwrap(), "# Keep\n\n原正文");
+        assert!(
+            !Path::new(root).join("Broken/Moved.md").exists(),
+            "DB 失败应删除新文件"
+        );
+        assert_eq!(get_vault_note(conn, &note.id).unwrap().path, "Keep.md");
+        let moved_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vault_notes WHERE id = ?1",
+                params![blocked_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_rows, 0, "失败的事务不应留下新行");
+    }
+
+    #[test]
+    fn wikilink_rewrite_skips_fenced_code() {
+        let content = "前 [[Old]]\n```md\n[[Old]] 与 [[Old|别名]]\n```\n~~~\n[[Old#锚]]\n~~~\n后 [[Old#小节|带锚]]\n";
+        let replacements = vec![("old".to_string(), "New".to_string())];
+        assert_eq!(
+            rewrite_wikilinks(content, &replacements),
+            "前 [[New]]\n```md\n[[Old]] 与 [[Old|别名]]\n```\n~~~\n[[Old#锚]]\n~~~\n后 [[New#小节|带锚]]\n"
+        );
+        // 没有尾部换行的最后一行同样处理。
+        assert_eq!(rewrite_wikilinks("[[Old]]", &replacements), "[[New]]");
+        assert_eq!(
+            rewrite_wikilinks("```\n[[Old]]\n```\n[[Old]]", &replacements),
+            "```\n[[Old]]\n```\n[[New]]"
+        );
     }
 }

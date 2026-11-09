@@ -2,6 +2,24 @@
 
 本文件记录 temli 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-11-09
+
+### Added
+
+- **标签**：frontmatter `tags`（列表/逗号分隔）与行内 `#tag`（CJK、`_ - /`）；标签面板按引用次数排序，点击筛选笔记；迁移 v11 `vault_note_tags`。
+- **附件**：编辑器选择文件或粘贴图片，存入 `attachments/`（≤25 MB，文件名清洗）；插入 `![](…)` 并在预览中解析为图片。
+- **模板**：`templates/*.md` 出现在新建对话框，支持 `{{date}}` / `{{time}}` / `{{title}}` 替换。
+- **日记**：一键创建/打开 `Daily/YYYY-MM-DD.md`，可套 `templates/Daily.md`。
+- **属性面板**：编辑 frontmatter 键值（保留正文与其他键，空值删除）。
+- **大纲**：解析标题树，点击定位到编辑器对应行。
+- **快速切换**：`⌘O` 按标题/路径模糊跳转。
+- **链接补全**：输入 `[[` 时提示笔记标题，↑↓/Enter 插入。
+- **重命名**：重命名笔记文件并同步改写全库 `[[旧标题]]`（含别名/锚点）。
+
+### Changed
+
+- Vault 右栏改为「反链 / 大纲 / 属性」三个页签（宽 240）；`docs/vault-alignment.md` 记录与 Obsidian 的逐项对照。
+
 ## [0.3.0] - 2026-11-09
 
 ### Added
