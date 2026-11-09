@@ -344,6 +344,21 @@ impl Db {
             tx.commit().map_err(|e| e.to_string())?;
         }
 
+        if current < 10 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                 );",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (10)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
         Ok(())
     }
 
@@ -588,5 +603,50 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("已注册"), "{err}");
+    }
+
+    #[test]
+    fn migration_v10_adds_app_settings_for_v9_database() {
+        let db_path = temp_dir().join("temli.db");
+
+        {
+            let db = Db::open(&db_path).unwrap();
+            // 模拟停在 schema v9 的用户库：v10 的表与迁移记录都不存在。
+            db.conn()
+                .execute_batch(
+                    "DROP TABLE app_settings;
+                     DELETE FROM schema_migrations WHERE version = 10;",
+                )
+                .unwrap();
+        }
+
+        let reopened = Db::open(&db_path).unwrap();
+        let table: i64 = reopened
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'app_settings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "v9 库升级后应存在 app_settings 表");
+
+        reopened
+            .conn()
+            .execute(
+                "INSERT INTO app_settings (key, value) VALUES ('k', 'v')",
+                [],
+            )
+            .unwrap();
+        let (value, updated_at): (String, String) = reopened
+            .conn()
+            .query_row(
+                "SELECT value, updated_at FROM app_settings WHERE key = 'k'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(value, "v");
+        assert!(!updated_at.is_empty(), "updated_at 应有默认值");
     }
 }

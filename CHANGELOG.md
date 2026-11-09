@@ -2,6 +2,21 @@
 
 本文件记录 temli 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-11-09
+
+### Added
+
+- **设置页**：项目（并发上限、自动合并、要求 CI checks、自动维护文档）、运行（默认 Agent、worktree 保留天数 1–90）、关于（版本、数据目录、许可证）；侧栏新增「设置」入口。
+- **全局设置存储**：SQLite 迁移 v10 `app_settings`，键值持久化；默认 Agent 优先级 `TEMLI_AGENT` 环境变量 > 设置 > `omp`。
+- **单实例守卫**：`tauri-plugin-single-instance`，重复启动只保留一个进程并激活已有窗口。
+- **持久日志**：数据目录 `logs/temli.log`（1 MB 轮换），记录启动、退出、设置变更与 panic。
+- CI：新增 `cargo clippy --all-targets -D warnings` 门禁；新增 tag 触发的自动构建与 Release 上传 workflow。
+
+### Changed
+
+- `cleanup_worktrees` 的孤儿回收窗口从硬编码 7 天改为读取设置。
+- 清理 Rust clippy 29 条告警（等价重写，无行为变化）。
+
 ## [0.2.0] - 2026-11-09
 
 ### Added
