@@ -942,6 +942,50 @@ fn create_tasks_from_plan(
 }
 
 #[tauri::command]
+fn create_plan(
+    state: State<AppState>,
+    project_id: String,
+    title: String,
+    goal: String,
+    stages: Vec<store::NewPlanStage>,
+) -> Result<store::Plan, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::create_plan(
+        db.conn(),
+        store::NewPlan {
+            project_id,
+            title,
+            goal,
+            stages,
+        },
+    )
+}
+
+#[tauri::command]
+fn list_plans(state: State<AppState>, project_id: String) -> Result<Vec<store::Plan>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::list_plans(db.conn(), &project_id)
+}
+
+#[tauri::command]
+fn get_plan(state: State<AppState>, plan_id: String) -> Result<store::Plan, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::get_plan(db.conn(), &plan_id)
+}
+
+#[tauri::command]
+fn start_plan(state: State<AppState>, plan_id: String) -> Result<store::Plan, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::start_plan(db.conn(), &plan_id)
+}
+
+#[tauri::command]
+fn accept_stage(state: State<AppState>, stage_id: String) -> Result<store::Plan, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::accept_stage(db.conn(), &stage_id)
+}
+
+#[tauri::command]
 fn get_task(state: State<AppState>, task_id: String) -> Result<TaskDetail, String> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     store::get_task(db.conn(), &task_id)
@@ -1618,6 +1662,11 @@ pub fn run() {
             create_task_from_issue,
             plan_project,
             create_tasks_from_plan,
+            create_plan,
+            list_plans,
+            get_plan,
+            start_plan,
+            accept_stage,
             get_task,
             start_task,
             cancel_task,

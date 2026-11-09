@@ -18,6 +18,7 @@ import { TasksPanel } from "./components/TasksPanel";
 import { Vaults } from "./components/Vaults";
 import { Workspace } from "./components/Workspace";
 import { ReviewsPanel } from "./components/ReviewsPanel";
+import { PlansPanel } from "./components/PlansPanel";
 import { AgentsPanel } from "./components/AgentsPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { getTask, type GlobalHit } from "./lib/api";
@@ -30,6 +31,7 @@ import {
   GitPullRequest,
   Inbox,
   LayoutList,
+  Milestone,
   NotebookPen,
   Plus,
   Search,
@@ -50,6 +52,7 @@ type Project = {
 type ViewId =
   | "overview"
   | "my"
+  | "plans"
   | "reviews"
   | "agent"
   | "projects"
@@ -61,6 +64,7 @@ type ViewId =
 const NAV: { id: ViewId; label: string; icon: typeof Inbox }[] = [
   { id: "overview", label: "概览", icon: Inbox },
   { id: "my", label: "我的任务", icon: CircleDot },
+  { id: "plans", label: "计划", icon: Milestone },
   { id: "reviews", label: "审查", icon: GitPullRequest },
   { id: "agent", label: "Agent", icon: Bot },
 ];
@@ -75,6 +79,7 @@ const SPACE: { id: ViewId; label: string; icon: typeof Inbox }[] = [
 const TITLES: Record<ViewId, string> = {
   overview: "概览",
   my: "我的任务",
+  plans: "计划",
   reviews: "审查",
   agent: "Agent",
   projects: "项目",
@@ -527,6 +532,15 @@ export default function App() {
                       focusTaskId={focusTaskId ?? undefined}
                       onFocusConsumed={() => setFocusTaskId(null)}
                     />
+                  )}
+                </>
+              )}
+
+              {active === "plans" && (
+                <>
+                  {!current && <EmptyProject onRegister={startRegister} />}
+                  {current && (
+                    <PlansPanel key={current.id} projectId={current.id} />
                   )}
                 </>
               )}

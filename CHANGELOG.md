@@ -2,6 +2,19 @@
 
 本文件记录 temli 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.0] - 2026-11-09
+
+### Added
+
+- **计划（Plan）与阶段门**：把任务编排为有序阶段（locked / active / review / passed）；当前阶段任务全部合并后进入待验收，验收通过才解锁下一阶段，最后阶段通过后计划完成；支持草稿计划启动。
+- **下一步（nextActor）**：任务卡/表格显示「待你 / Agent」，待人工决策与失败进入「待你」。
+- 迁移 v12：`plans` / `plan_stages` / `plan_tasks`；任务最多属于一个阶段、同项目校验。
+- `docs/kitestring-borrowing.md`：与 Kitestring 的概念对照与采纳/非目标记录。
+
+### Changed
+
+- 侧栏新增「计划」视图（位于「我的任务」之后）；阶段状态与任务状态分列展示。
+
 ## [0.4.1] - 2026-11-09
 
 ### Added

@@ -184,6 +184,47 @@ export type CreateTasksFromPlanInput = {
   draft: PlanDraft;
 };
 
+export type PlanTask = {
+  id: string;
+  title: string;
+  status: string;
+};
+
+export type StageStatus = "locked" | "active" | "review" | "passed";
+
+export type Stage = {
+  id: string;
+  seq: number;
+  title: string;
+  status: StageStatus;
+  tasks: PlanTask[];
+  passed_at: string | null;
+};
+
+export type PlanStatus = "draft" | "active" | "done";
+
+export type Plan = {
+  id: string;
+  project_id: string;
+  title: string;
+  goal: string;
+  status: PlanStatus;
+  stages: Stage[];
+  created_at: string;
+  updated_at: string;
+};
+
+export type CreatePlanStageInput = {
+  title: string;
+  task_ids: string[];
+};
+
+export type CreatePlanInput = {
+  title: string;
+  goal: string;
+  stages: CreatePlanStageInput[];
+};
+
 export type SetAutoMergeInput = {
   project_id: string;
   enabled: boolean;
@@ -568,6 +609,38 @@ export function createTasksFromPlan(
   input: CreateTasksFromPlanInput,
 ): Promise<TaskDetail[]> {
   return invoke<TaskDetail[]>("create_tasks_from_plan", { input });
+}
+
+export function createPlan(
+  projectId: string,
+  input: CreatePlanInput,
+): Promise<Plan> {
+  return invoke<Plan>("create_plan", {
+    projectId,
+    title: input.title,
+    goal: input.goal,
+    stages: input.stages,
+  });
+}
+
+export function listPlans(projectId: string): Promise<Plan[]> {
+  return invoke<Plan[]>("list_plans", { projectId });
+}
+
+export function getPlan(projectId: string, planId: string): Promise<Plan> {
+  return invoke<Plan>("get_plan", { projectId, planId });
+}
+
+export function startPlan(projectId: string, planId: string): Promise<void> {
+  return invoke<void>("start_plan", { projectId, planId });
+}
+
+export function acceptStage(
+  projectId: string,
+  planId: string,
+  stageId: string,
+): Promise<void> {
+  return invoke<void>("accept_stage", { projectId, planId, stageId });
 }
 
 export function linkContext(input: LinkContextInput): Promise<void> {
