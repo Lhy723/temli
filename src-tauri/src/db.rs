@@ -375,6 +375,43 @@ impl Db {
             tx.commit().map_err(|e| e.to_string())?;
         }
 
+        if current < 12 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS plans (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'draft'
+                        CHECK (status IN ('draft','active','done')),
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                 );
+                 CREATE TABLE IF NOT EXISTS plan_stages (
+                    id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+                    seq INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    passed_at TEXT,
+                    UNIQUE (plan_id, seq)
+                 );
+                 CREATE TABLE IF NOT EXISTS plan_tasks (
+                    stage_id TEXT NOT NULL REFERENCES plan_stages(id) ON DELETE CASCADE,
+                    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    position INTEGER NOT NULL,
+                    PRIMARY KEY (task_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_plans_project ON plans(project_id, created_at);
+                 CREATE INDEX IF NOT EXISTS idx_plan_stages_plan ON plan_stages(plan_id, seq);
+                 CREATE INDEX IF NOT EXISTS idx_plan_tasks_stage ON plan_tasks(stage_id, position);",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
         Ok(())
     }
 
@@ -677,7 +714,7 @@ mod tests {
             db.conn()
                 .execute_batch(
                     "DROP TABLE vault_note_tags;
-                     DELETE FROM schema_migrations WHERE version = 11;",
+                     DELETE FROM schema_migrations WHERE version >= 11;",
                 )
                 .unwrap();
         }
@@ -721,5 +758,64 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM vault_note_tags", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 0, "删除笔记应级联删除标签");
+    }
+
+    #[test]
+    fn migration_v12_adds_plans_for_v11_database() {
+        let db_path = temp_dir().join("temli.db");
+
+        {
+            let db = Db::open(&db_path).unwrap();
+            // 模拟停在 schema v11 的用户库。
+            db.conn()
+                .execute_batch(
+                    "DROP TABLE plan_tasks;
+                     DROP TABLE plan_stages;
+                     DROP TABLE plans;
+                     DELETE FROM schema_migrations WHERE version = 12;",
+                )
+                .unwrap();
+        }
+
+        let reopened = Db::open(&db_path).unwrap();
+        let tables: i64 = reopened
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('plans','plan_stages','plan_tasks')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 3, "v11 库升级后应存在计划三张表");
+
+        reopened
+            .conn()
+            .execute_batch(
+                "INSERT INTO projects (id, name, repo_path) VALUES ('p', 'p', '/tmp/temli-v12');
+                 INSERT INTO items (id, project_id, kind, title) VALUES ('i', 'p', 'issue', 'T');
+                 INSERT INTO tasks (id, item_id) VALUES ('t', 'i');
+                 INSERT INTO plans (id, project_id, title, goal) VALUES ('pl', 'p', 'P', 'G');
+                 INSERT INTO plan_stages (id, plan_id, seq, title) VALUES ('s', 'pl', 1, 'S');
+                 INSERT INTO plan_tasks (stage_id, task_id, position) VALUES ('s', 't', 1);",
+            )
+            .unwrap();
+        let status: String = reopened
+            .conn()
+            .query_row("SELECT status FROM plans WHERE id = 'pl'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "draft");
+
+        reopened
+            .conn()
+            .execute("DELETE FROM plans WHERE id = 'pl'", [])
+            .unwrap();
+        let remaining: i64 = reopened
+            .conn()
+            .query_row("SELECT COUNT(*) FROM plan_tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "删除计划应级联删除阶段与任务引用");
     }
 }
