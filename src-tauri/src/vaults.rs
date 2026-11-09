@@ -2,7 +2,8 @@
 //!
 //! 权威边界：
 //! - 笔记正文在 vault 目录下的 `.md` 文件，文件是权威，`vault_notes.body` 是检索缓存；
-//! - `[[目标]]` / `[[目标|别名]]` 写入 `vault_links`，按标题或路径 stem（大小写不敏感）解析；
+//! - `[[目标]]` / `[[目标|别名]]` 写入 `vault_links`，按标题、路径 stem 或 frontmatter `aliases`
+//!   （大小写不敏感）解析；
 //! - 笔记统一写入 `notes_fts`（trigram），少于 3 字符的查询走 LIKE。
 
 use crate::workspace::markdown_title;
@@ -1098,7 +1099,7 @@ fn index_note_fts(
     Ok(())
 }
 
-/// 从 DB 里每个笔记的正文重建整库链接：标题 / 路径变化后解析结果自然更新。
+/// 从 DB 里每个笔记的正文重建整库链接：标题 / 路径 / frontmatter 别名变化后解析结果自然更新。
 fn rebuild_links(conn: &Connection, vault_id: &str) -> Result<(), String> {
     let notes: Vec<(String, String, String, String)> = {
         let mut stmt = conn
@@ -1116,8 +1117,8 @@ fn rebuild_links(conn: &Connection, vault_id: &str) -> Result<(), String> {
     };
 
     let mut resolver: HashMap<String, String> = HashMap::new();
-    for (id, path, title, _) in &notes {
-        for key in note_keys(title, path) {
+    for (id, path, title, body) in &notes {
+        for key in note_keys(title, path, body) {
             resolver.entry(key).or_insert_with(|| id.clone());
         }
     }
@@ -1152,8 +1153,10 @@ fn rebuild_links(conn: &Connection, vault_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn note_keys(title: &str, path: &str) -> Vec<String> {
-    let mut keys = Vec::with_capacity(3);
+/// 笔记的解析键：标题、路径 stem、无扩展名路径，最后是 frontmatter 别名；
+/// 调用方按先到先得注册，越靠前的键优先级越高。
+fn note_keys(title: &str, path: &str, body: &str) -> Vec<String> {
+    let mut keys = Vec::with_capacity(8);
     keys.push(title.to_lowercase());
     let stem = Path::new(path)
         .file_stem()
@@ -1169,6 +1172,8 @@ fn note_keys(title: &str, path: &str) -> Vec<String> {
     if !without_extension.is_empty() {
         keys.push(without_extension.to_lowercase());
     }
+    // frontmatter 别名作为额外键，已有标题 / 路径键保持优先。
+    keys.extend(parse_aliases(body));
     keys
 }
 
@@ -1238,6 +1243,89 @@ fn split_frontmatter(content: &str) -> Option<FrontmatterParts<'_>> {
         offset += line.len();
     }
     None
+}
+
+/// frontmatter 里的别名：`aliases` / `alias`，支持 flow `[a, b]`、逗号分隔与块列表。
+///
+/// 只扫描 frontmatter 块，正文里的 `aliases:` 字样不参与；复杂嵌套（mapping、
+/// 带 `key: value` 的列表项）直接忽略。
+fn parse_aliases(content: &str) -> Vec<String> {
+    let Some(parts) = split_frontmatter(content) else {
+        return Vec::new();
+    };
+    let mut aliases = Vec::new();
+    let mut seen = HashSet::new();
+    let mut in_list = false;
+    for line in parts.block.lines() {
+        let trimmed = line.trim();
+        if in_list && trimmed.starts_with('-') {
+            let item = trimmed.trim_start_matches('-').trim();
+            // `- key: value` 是 YAML mapping 列表项，属于不支持的复杂嵌套。
+            if item.contains(": ") || item.ends_with(':') {
+                in_list = false;
+                continue;
+            }
+            for alias in split_alias_value(item) {
+                push_alias(&alias, &mut aliases, &mut seen);
+            }
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let key = key.trim();
+            let is_alias_key =
+                key.eq_ignore_ascii_case("aliases") || key.eq_ignore_ascii_case("alias");
+            // 只接受顶格的键；缩进的 `aliases` 属于不支持的嵌套结构。
+            let top_level = !line.starts_with(' ') && !line.starts_with('\t');
+            if top_level && is_alias_key {
+                in_list = true;
+                for alias in split_alias_value(value) {
+                    push_alias(&alias, &mut aliases, &mut seen);
+                }
+                continue;
+            }
+            in_list = false;
+            continue;
+        }
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            // 缩进注释保留列表状态，其它普通行结束列表。
+            in_list = false;
+        }
+    }
+    aliases
+}
+
+/// YAML 别名值：`[a, b]` / `a, b` / 单个值；flow mapping 等复杂嵌套忽略。
+fn split_alias_value(value: &str) -> Vec<String> {
+    let value = value.trim();
+    let value = if value.starts_with('[') {
+        value.find(']').map_or(value, |end| &value[..=end])
+    } else if value.starts_with('{') {
+        return Vec::new();
+    } else {
+        // 不在 flow 列表内时，` #` 之后是 YAML 行内注释。
+        value.split(" #").next().unwrap_or(value)
+    };
+    let value = value
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(value);
+    value
+        .split(',')
+        .map(|part| part.trim().trim_matches(['"', '\'']).trim())
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn push_alias(raw: &str, aliases: &mut Vec<String>, seen: &mut HashSet<String>) {
+    let raw = raw.trim().trim_matches(['"', '\'']).trim();
+    if raw.is_empty() {
+        return;
+    }
+    let alias = raw.to_lowercase();
+    if seen.insert(alias.clone()) {
+        aliases.push(alias);
+    }
 }
 
 /// 页面里的标签：frontmatter `tags`（列表 / 逗号分隔）+ 正文行内 `#tag`。
@@ -2291,6 +2379,124 @@ mod tests {
     }
 
     #[test]
+    fn wikilink_aliases_resolve_from_frontmatter() {
+        let fixture = Fixture::new("aliases");
+        let vault = fixture.vault("brain");
+        let conn = fixture.db.conn();
+        let root = vault.root_path.as_str();
+
+        // flow 列表：去引号、大小写折叠、重复项只留一个。
+        Fixture::write(
+            root,
+            "flow.md",
+            "---\naliases: [Flow Alias, flow alias, \"Quoted Alias\", '单引号别名']\n---\n# Flow Note\n\n正文\n",
+        );
+        // 块列表，`alias` 单数同样生效。
+        Fixture::write(
+            root,
+            "block.md",
+            "---\nalias:\n  - Block One\n  - 'Block Two'\n---\n# Block Note\n\n正文\n",
+        );
+        // 逗号分隔。
+        Fixture::write(
+            root,
+            "comma.md",
+            "---\naliases: Comma One, Comma Two\n---\n# Comma Note\n\n正文\n",
+        );
+        // 没有 aliases 的旧笔记继续按标题解析。
+        Fixture::write(root, "plain.md", "# Plain Note\n\n正文\n");
+        // 正文里的 aliases 字样不是 frontmatter，不参与解析。
+        Fixture::write(root, "body.md", "# Body Note\n\naliases: Fake Alias\n");
+        Fixture::write(
+            root,
+            "source.md",
+            "# Source\n\n[[FLOW ALIAS]] [[Quoted Alias]] [[单引号别名]] [[block one]] [[Block Two]] \
+             [[Comma One]] [[comma two]] [[Plain Note]] [[Fake Alias]]\n",
+        );
+
+        assert_eq!(index_vault(conn, &vault).unwrap(), 6);
+
+        let backlink_targets = |note_id: &str| -> Vec<String> {
+            note_backlinks(conn, note_id)
+                .unwrap()
+                .into_iter()
+                .map(|backlink| backlink.target)
+                .collect()
+        };
+
+        let flow = title_of(conn, &vault.id, "Flow Note");
+        let mut targets = backlink_targets(&flow.id);
+        targets.sort();
+        assert_eq!(targets, vec!["FLOW ALIAS", "Quoted Alias", "单引号别名"]);
+
+        let block = title_of(conn, &vault.id, "Block Note");
+        let mut targets = backlink_targets(&block.id);
+        targets.sort();
+        assert_eq!(targets, vec!["Block Two", "block one"]);
+
+        let comma = title_of(conn, &vault.id, "Comma Note");
+        let mut targets = backlink_targets(&comma.id);
+        targets.sort();
+        assert_eq!(targets, vec!["Comma One", "comma two"]);
+
+        let plain = title_of(conn, &vault.id, "Plain Note");
+        assert_eq!(backlink_targets(&plain.id), vec!["Plain Note"]);
+
+        let unresolved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vault_links
+                 WHERE vault_id = ?1 AND target = 'Fake Alias' AND resolved_note IS NULL",
+                params![vault.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 1, "正文里的 aliases 不应参与解析");
+    }
+
+    #[test]
+    fn wikilink_alias_conflicts_follow_path_order() {
+        let fixture = Fixture::new("alias-conflict");
+        let vault = fixture.vault("brain");
+        let conn = fixture.db.conn();
+        let root = vault.root_path.as_str();
+
+        // a.md 的别名先于 b.md 的标题注册 → 别名胜。
+        Fixture::write(root, "a.md", "---\naliases: [Conflict]\n---\n# A Note\n");
+        Fixture::write(root, "b.md", "# Conflict\n");
+        // c.md 的标题先于 d.md 的别名注册 → 标题胜。
+        Fixture::write(root, "c.md", "# Winner\n");
+        Fixture::write(root, "d.md", "---\naliases: [Winner]\n---\n# D Note\n");
+        Fixture::write(
+            root,
+            "source.md",
+            "# Source\n\n[[Conflict]] 与 [[winner]]\n",
+        );
+
+        assert_eq!(index_vault(conn, &vault).unwrap(), 5);
+
+        let a = title_of(conn, &vault.id, "A Note");
+        let b = title_of(conn, &vault.id, "Conflict");
+        let c = title_of(conn, &vault.id, "Winner");
+        let d = title_of(conn, &vault.id, "D Note");
+
+        let a_backlinks = note_backlinks(conn, &a.id).unwrap();
+        assert_eq!(a_backlinks.len(), 1);
+        assert_eq!(a_backlinks[0].target, "Conflict");
+        assert!(
+            note_backlinks(conn, &b.id).unwrap().is_empty(),
+            "冲突时路径靠前的笔记胜出"
+        );
+
+        let c_backlinks = note_backlinks(conn, &c.id).unwrap();
+        assert_eq!(c_backlinks.len(), 1);
+        assert_eq!(c_backlinks[0].target, "winner");
+        assert!(
+            note_backlinks(conn, &d.id).unwrap().is_empty(),
+            "冲突时路径靠前的笔记胜出"
+        );
+    }
+
+    #[test]
     fn note_create_save_delete_roundtrip() {
         let fixture = Fixture::new("notes");
         let vault = fixture.vault("notes");
@@ -2442,6 +2648,37 @@ mod tests {
         // wikilink 标题与 markdown 锚点里的 # 不是行内标签。
         let anchors = "[[#标题]] 与 [文字](#锚点) 以及 #真标签\n";
         assert_eq!(parse_tags(anchors), vec!["真标签"]);
+    }
+
+    #[test]
+    fn alias_parsing_flow_block_and_comma() {
+        // flow 列表：去引号、trim、小写、去重。
+        assert_eq!(
+            parse_aliases("---\naliases: [Alpha, \"Beta Gamma\", alpha, 'Delta']\n---\n正文\n"),
+            vec!["alpha", "beta gamma", "delta"]
+        );
+        // 块列表：`alias` 单数与缩进 `-` 行。
+        assert_eq!(
+            parse_aliases("---\nalias:\n  - One\n  - \"Two\"\n  - one\n---\n"),
+            vec!["one", "two"]
+        );
+        // 逗号分隔。
+        assert_eq!(
+            parse_aliases("---\naliases: One, Two ,three\n---\n"),
+            vec!["one", "two", "three"]
+        );
+        // 正文里的 aliases 字样不参与。
+        assert!(parse_aliases("# 标题\n\naliases: [Fake]\n").is_empty());
+        // 复杂嵌套与 flow mapping 忽略。
+        assert!(parse_aliases("---\naliases:\n  nested:\n    - x\n---\n").is_empty());
+        assert!(parse_aliases("---\nmeta:\n  aliases: [Fake]\n---\n").is_empty());
+        assert!(parse_aliases("---\naliases: {a: b}\n---\n").is_empty());
+        assert!(parse_aliases("# Plain\n").is_empty());
+        // 其它 frontmatter 键不影响别名解析。
+        assert_eq!(
+            parse_aliases("---\ntitle: T\ntags: [a]\naliases:\n  - A\n---\n"),
+            vec!["a"]
+        );
     }
 
     #[test]
