@@ -2,11 +2,15 @@
 
 本文件记录 temli 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.1.1] - 2026-11-09
 
 ### Added
 
 - 应用图标：深炭底 + 琥珀色对勾（证据门/已验证语义），替换 Tauri 默认图标；菜单栏改用模板图标（随浅色/深色外观自动反色）。
+
+### Fixed
+
+- **签名修复**：Tauri 默认不对 `.app` 做 ad-hoc 签名，产出的包只有二进制 linker 签名、缺少 `_CodeSignature/CodeResources`，导致 macOS 自动安装（DMG 内双击 App）报「无法安装 / 没有更改任何内容」。现显式配置 `bundle.macOS.signingIdentity = "-"`，`codesign -v` 通过。
 
 ## [0.1.0] - 2026-11-09
 
