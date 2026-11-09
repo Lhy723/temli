@@ -22,7 +22,7 @@
 - [x] M15 应用图标：深炭底 + 琥珀对勾（证据门/已验证语义），全平台图标集重新生成；菜单栏用模板图标（随浅色/深色反色）（PR #57）
 - [x] M16 0.1.1 补丁发布：修复 .app 未被 ad-hoc 签名导致 DMG 自动安装报「无法安装」（`signingIdentity = "-"`，`codesign -v` 通过）；CI 时序测试稳定化（PR #61）；`release/0.1.1` → main（PR #62）→ tag `v0.1.1` + GitHub Release（PR #59/#61 后基于 main 重建）
 - [x] M17 真实页面 + 界面统一：审查页（证据/审查报告列表，`list_reviews` 后端）、Agent 页（适配器能力/角色总览）；字号/间距/控件高度/圆角统一、tab 与侧栏选中态一致、看板列宽与卡片密度、120–160ms 动效 + reduced-motion（PR #64）
-- [x] M18 基础设施：设置存储（迁移 v10 `app_settings`）+ 设置页；单实例守卫；持久日志（轮换/panic hook）；默认 Agent 优先级 env > 设置 > omp；孤儿 worktree 窗口可配；CI 增加 clippy `-D warnings` 与 tag 自动发布 workflow（PR #TBD）
+- [x] M18 基础设施：设置存储（迁移 v10 `app_settings`）+ 设置页；单实例守卫；持久日志（轮换/panic hook）；默认 Agent 优先级 env > 设置 > omp；孤儿 worktree 窗口可配；CI 增加 clippy `-D warnings` 与 tag 自动发布 workflow（PR #67）
 
 ## 关键验证
 
