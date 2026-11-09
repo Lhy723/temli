@@ -10,6 +10,7 @@ export type TaskSummary = {
   developer_adapter: string | null;
   reviewer_adapter: string | null;
   model?: string | null;
+  auto_docs?: boolean;
 };
 
 export type Criterion = {
@@ -127,6 +128,8 @@ export type UpdateIssueInput = {
   item_id: string;
   title?: string;
   body?: string;
+  assignee?: string;
+  state?: "open" | "closed";
 };
 
 export type CreateTaskFromIssueInput = {

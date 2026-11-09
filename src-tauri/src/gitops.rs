@@ -116,6 +116,10 @@ pub fn prune_worktrees(repo: &Path) -> Result<(), String> {
 }
 
 /// Whether a rebase is mid-flight in `repo` (or in the worktree at `repo`).
+///
+/// 仅测试使用：生产路径的失败 rebase 已在 [`rebase_onto`] 内 abort，这里用于
+/// 断言不留残余 rebase 状态。
+#[cfg(test)]
 pub fn rebase_in_progress(repo: &Path) -> bool {
     ["rebase-merge", "rebase-apply"].into_iter().any(|name| {
         run(repo, &["rev-parse", "--git-path", name])

@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+#[cfg(test)]
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::mpsc;
+#[cfg(test)]
 use std::thread;
+#[cfg(test)]
 use std::time::Duration;
 
 pub mod claude;
@@ -52,6 +56,8 @@ pub struct Capabilities {
     pub resume: bool,
 }
 
+/// 适配器探测结果；仅测试使用的接口（生产代码不调用 [`AgentAdapter::detect`]）。
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectResult {
     pub available: bool,
@@ -60,6 +66,8 @@ pub struct DetectResult {
     pub detail: Option<String>,
 }
 
+/// 适配器鉴权状态；仅测试使用。
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthState {
@@ -70,12 +78,10 @@ pub enum AuthState {
 
 #[derive(Debug, Clone)]
 pub struct RunSpec {
-    pub run_id: String,
     pub cwd: PathBuf,
     pub prompt: String,
     pub model: Option<String>,
     pub max_minutes: u64,
-    pub max_cost_usd: Option<f64>,
     pub env_allowlist: Vec<String>,
 }
 
@@ -160,6 +166,8 @@ pub type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 
 pub trait AgentAdapter: Send + Sync {
     fn manifest(&self) -> AgentManifest;
+    /// 探测外部 CLI 是否可用；仅测试使用，生产代码不调用。
+    #[cfg(test)]
     fn detect(&self) -> DetectResult;
     fn start(&self, spec: RunSpec, sink: EventSink) -> Result<SessionHandle, String>;
     fn respond(
@@ -206,11 +214,17 @@ impl AdapterRegistry {
 }
 
 /// `--version` 探测超时。
+///
+/// 仅测试使用。
+#[cfg(test)]
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 在独立线程中执行 `<program> --version`，主线程最多等待 5 秒。
 ///
 /// 成功时返回第一条非空输出行作为版本号；命令可用但无输出时返回 `None`。
+///
+/// 仅测试使用：生产代码不调用 [`AgentAdapter::detect`]。
+#[cfg(test)]
 fn probe_version(program: &str) -> Result<Option<String>, String> {
     let (tx, rx) = mpsc::channel::<std::io::Result<std::process::Output>>();
     let command_program = program.to_string();

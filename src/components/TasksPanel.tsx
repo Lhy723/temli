@@ -74,6 +74,7 @@ import {
   syncNow,
   textList,
   unlinkContext,
+  updateIssue,
   verdictLabel,
   type AgentManifest,
   type AgentRole,
@@ -84,6 +85,7 @@ import {
   type TaskDependencies,
   type TaskDetail,
   type TaskSummary,
+  type UpdateIssueInput,
 } from "../lib/api";
 
 type ContextOption = {
@@ -263,6 +265,10 @@ export function TasksPanel({
   const projectRef = useRef(projectId);
   const tasksSettledRef = useRef<string | null>(null);
   const focusConsumedRef = useRef<string | null>(null);
+  // 轮询回调里需要最新的自动文档开关，用 ref 读取以免重建轮询定时器。
+  const autoDocsRef = useRef(false);
+  // 上一轮轮询看到的状态快照；用于识别“非 merged → merged”的合并转变。
+  const polledStatusesRef = useRef<Map<string, string> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -270,6 +276,7 @@ export function TasksPanel({
     selectedRef.current = null;
     tasksSettledRef.current = null;
     focusConsumedRef.current = null;
+    polledStatusesRef.current = null;
     setLoading(true);
     setError(null);
     setTasks([]);
@@ -303,7 +310,11 @@ export function TasksPanel({
     setNotice(null);
     listTasks(projectId)
       .then((next) => {
-        if (!cancelled) setTasks(next);
+        if (cancelled) return;
+        polledStatusesRef.current = new Map(
+          next.map((task) => [task.id, task.status] as const),
+        );
+        setTasks(next);
       })
       .catch((e) => {
         if (!cancelled) setError(errorText(e));
@@ -464,6 +475,10 @@ export function TasksPanel({
       cancelled = true;
     };
   }, [projectId]);
+
+  useEffect(() => {
+    autoDocsRef.current = autoDocs === true;
+  }, [autoDocs]);
 
   async function refreshTasks() {
     const requestedFor = projectId;
@@ -705,6 +720,30 @@ export function TasksPanel({
       void Promise.all([refreshTasks(), refreshIssues()]).catch(() => {});
     } finally {
       if (projectRef.current === requestedFor) setCreatingIssueId(null);
+    }
+  }
+
+  // 已发布 issue 的远端编辑；成功后统一走列表刷新，不做本地乐观改写。
+  async function saveIssueUpdate(
+    input: UpdateIssueInput,
+  ): Promise<string | null> {
+    const requestedFor = projectId;
+    try {
+      await updateIssue(input);
+      if (projectRef.current !== requestedFor) return null;
+      const taskId = selectedRef.current;
+      await Promise.all([
+        refreshIssues(),
+        refreshTasks(),
+        taskId ? loadDetail(taskId, true) : Promise.resolve(),
+      ]);
+      return null;
+    } catch (e) {
+      if (projectRef.current !== requestedFor) return null;
+      const message = errorText(e);
+      return message.includes("远端已变更")
+        ? "远端已变更，请先同步后重试"
+        : message;
     }
   }
 
@@ -951,7 +990,27 @@ export function TasksPanel({
       try {
         const nextTasks = await listTasks(projectId);
         if (cancelled) return;
+        // 合并后后端会紧接着排队文档任务；观察到“非 merged → merged”的转变时
+        // 立即补一次列表刷新，避免轮询因没有活跃任务而停摆、漏掉新的文档任务。
+        const previousStatuses = polledStatusesRef.current;
+        polledStatusesRef.current = new Map(
+          nextTasks.map((task) => [task.id, task.status] as const),
+        );
+        const justMerged =
+          previousStatuses !== null &&
+          nextTasks.some(
+            (task) =>
+              task.status === "merged" &&
+              previousStatuses.get(task.id) !== undefined &&
+              previousStatuses.get(task.id) !== "merged",
+          );
         setTasks(nextTasks);
+        if (justMerged && autoDocsRef.current) {
+          // 只补一次刷新，不新增定时器。
+          void refreshTasks().catch((e) => {
+            if (!cancelled) setError(errorText(e));
+          });
+        }
         const taskId = selectedRef.current;
         if (taskId) {
           const request = ++detailRequestRef.current;
@@ -1269,6 +1328,7 @@ export function TasksPanel({
                 creatingIssueId={creatingIssueId}
                 createIssueError={createIssueError}
                 onCreateFromIssue={createTaskFromIssueItem}
+                onUpdateIssue={saveIssueUpdate}
               />
             )}
 
@@ -1324,6 +1384,7 @@ export function TasksPanel({
           issuesLoading={issuesLoading}
           issuesError={issuesError}
           githubError={githubError}
+          onUpdateIssue={saveIssueUpdate}
           syncing={syncing}
           publishing={publishing}
           loading={detailLoading}
@@ -1369,6 +1430,7 @@ function TaskBoard({
   creatingIssueId,
   createIssueError,
   onCreateFromIssue,
+  onUpdateIssue,
 }: {
   tasks: TaskSummary[];
   issues: ProjectIssue[];
@@ -1379,6 +1441,7 @@ function TaskBoard({
   creatingIssueId: string | null;
   createIssueError: { issueId: string; message: string } | null;
   onCreateFromIssue: (issue: ProjectIssue) => void;
+  onUpdateIssue: (input: UpdateIssueInput) => Promise<string | null>;
 }) {
   const issueByTask = new Map<string, ProjectIssue>();
   for (const issue of issues) {
@@ -1404,13 +1467,14 @@ function TaskBoard({
   }
 
   return (
-    <div className="flex flex-col gap-1.5 pb-2">
+    <div className="flex min-w-0 flex-col gap-1.5 pb-2">
       {issuesLoading && (
         <div className="rounded-md border border-dashed border-[var(--border)] px-2 py-1.5">
           <p className="text-ui-sm text-[var(--muted)]">issue 加载中…</p>
         </div>
       )}
-      <div className="flex min-h-full items-start gap-2 overflow-x-auto">
+      {/* 窄窗口下四列不折行：列容器横向滚动，列自身保持固定宽度。 */}
+      <div className="flex min-h-full min-w-0 items-start gap-2 overflow-x-auto">
         {columns.map((column) => (
           <section
             key={column.key}
@@ -1443,6 +1507,7 @@ function TaskBoard({
                         : null
                     }
                     onCreate={() => onCreateFromIssue(issue)}
+                    onUpdateIssue={onUpdateIssue}
                   />
                 ))}
                 {column.tasks.map((task) => (
@@ -1490,18 +1555,21 @@ function TaskCard({
           onSelect(task.id);
         }
       }}
-      className={`anim-fast cursor-pointer rounded-md border bg-[var(--background)] px-2 py-1.5 hover:bg-[var(--background-secondary)] ${
+      className={`anim-fast min-w-0 cursor-pointer rounded-md border bg-[var(--background)] px-2 py-1.5 hover:bg-[var(--background-secondary)] ${
         selected ? "border-[var(--accent)]" : "border-[var(--border)]"
       }`}
     >
-      <p className="line-clamp-2 text-ui-sm font-medium" title={task.title}>
+      <p
+        className="line-clamp-2 break-words text-ui-sm font-medium"
+        title={task.title}
+      >
         {task.title}
       </p>
       <div className="mt-1 flex flex-wrap items-center gap-1">
         <Chip size="sm" variant="soft" color={statusTone(task.status)}>
           {statusLabel(task.status)}
         </Chip>
-        {task.title.startsWith("文档：") && (
+        {task.auto_docs === true && (
           <Chip size="sm" variant="soft" color="accent">
             文档
           </Chip>
@@ -1572,16 +1640,21 @@ function IssueCard({
   disabled,
   error,
   onCreate,
+  onUpdateIssue,
 }: {
   issue: ProjectIssue;
   creating: boolean;
   disabled: boolean;
   error: string | null;
   onCreate: () => void;
+  onUpdateIssue: (input: UpdateIssueInput) => Promise<string | null>;
 }) {
   return (
-    <div className="rounded-md border border-dashed border-[var(--border)] bg-[var(--background)] px-2 py-1.5">
-      <p className="line-clamp-2 text-ui-sm font-medium" title={issue.title}>
+    <div className="min-w-0 rounded-md border border-dashed border-[var(--border)] bg-[var(--background)] px-2 py-1.5">
+      <p
+        className="line-clamp-2 break-words text-ui-sm font-medium"
+        title={issue.title}
+      >
         {issue.title}
       </p>
       <div className="mt-1 flex flex-wrap items-center gap-1">
@@ -1613,8 +1686,232 @@ function IssueCard({
       >
         {creating ? "创建中…" : "创建任务"}
       </Button>
+      {issue.github_number != null && !issue.ghost && (
+        <div className="mt-1.5 border-t border-[var(--border)] pt-1.5">
+          <IssueEditControls
+            issue={issue}
+            compact
+            onSave={onUpdateIssue}
+          />
+        </div>
+      )}
       {error && (
         <p role="alert" className="mt-1 text-label text-[var(--danger)]">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// 已发布 issue 的远端编辑入口：标题/正文、指派人与关闭/重开。
+// 保存成功后由父级刷新列表，不在这里改本地 issues。
+function IssueEditControls({
+  issue,
+  compact = false,
+  onSave,
+}: {
+  issue: ProjectIssue;
+  compact?: boolean;
+  onSave: (input: UpdateIssueInput) => Promise<string | null>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [title, setTitle] = useState(issue.title);
+  const [body, setBody] = useState("");
+  const [assignee, setAssignee] = useState("");
+  const [saving, setSaving] = useState<"fields" | "assignee" | "state" | null>(
+    null,
+  );
+  const [error, setError] = useState<string | null>(null);
+
+  const trimmedTitle = title.trim();
+  const titleChanged = trimmedTitle !== issue.title;
+  // 后端不返回 issue 正文，输入框留空表示只改其它字段，不覆盖远端正文。
+  const bodyDirty = body.trim().length > 0;
+  const closed = issue.github_state === "closed";
+  const buttonClass = compact ? "h-6 px-2 text-label" : "h-7 px-2.5 text-ui";
+  const fieldClass = compact ? "text-ui-sm" : "text-ui";
+  const errorClass = compact ? "text-label" : "text-ui-sm";
+
+  function openEditor() {
+    setTitle(issue.title);
+    setBody("");
+    setAssignee("");
+    setError(null);
+    setEditing(true);
+  }
+
+  async function saveFields() {
+    if (saving !== null) return;
+    if (!trimmedTitle) {
+      setError("标题不能为空。");
+      return;
+    }
+    if (!titleChanged && !bodyDirty) return;
+    setSaving("fields");
+    setError(null);
+    const input: UpdateIssueInput = { item_id: issue.id };
+    if (titleChanged) input.title = trimmedTitle;
+    if (bodyDirty) input.body = body;
+    const message = await onSave(input);
+    setSaving(null);
+    if (message) {
+      setError(message);
+      return;
+    }
+    setEditing(false);
+  }
+
+  async function saveAssignee() {
+    const login = assignee.trim();
+    // 空输入不提交，避免把远端指派清空。
+    if (!login || saving !== null) return;
+    setSaving("assignee");
+    setError(null);
+    const message = await onSave({ item_id: issue.id, assignee: login });
+    setSaving(null);
+    if (message) {
+      setError(message);
+      return;
+    }
+    setAssignee("");
+  }
+
+  async function toggleState() {
+    if (saving !== null) return;
+    setSaving("state");
+    setError(null);
+    const message = await onSave({
+      item_id: issue.id,
+      state: closed ? "open" : "closed",
+    });
+    setSaving(null);
+    if (message) setError(message);
+  }
+
+  return (
+    <div className="grid gap-1">
+      <div className="flex flex-wrap items-center gap-1">
+        {!editing && (
+          <Button
+            variant="secondary"
+            size="sm"
+            className={buttonClass}
+            onPress={openEditor}
+            isDisabled={saving !== null}
+          >
+            编辑
+          </Button>
+        )}
+        <Button
+          variant="secondary"
+          size="sm"
+          className={buttonClass}
+          onPress={() => void toggleState()}
+          isDisabled={saving !== null}
+        >
+          {saving === "state"
+            ? "处理中…"
+            : closed
+              ? "重开 issue"
+              : "关闭 issue"}
+        </Button>
+      </div>
+      {editing && (
+        <div className="grid gap-1">
+          <label className="grid gap-0.5 text-label text-[var(--muted)]">
+            标题
+            <Input
+              aria-label="issue 标题"
+              value={title}
+              onChange={(event) => {
+                setTitle(event.target.value);
+                setError(null);
+              }}
+              disabled={saving !== null}
+              fullWidth
+              className={fieldClass}
+            />
+          </label>
+          <label className="grid gap-0.5 text-label text-[var(--muted)]">
+            正文
+            <TextArea
+              aria-label="issue 正文"
+              rows={3}
+              placeholder="留空则保持远端正文不变"
+              value={body}
+              onChange={(event) => {
+                setBody(event.target.value);
+                setError(null);
+              }}
+              disabled={saving !== null}
+              fullWidth
+              className={fieldClass}
+            />
+          </label>
+          <div className="flex justify-end gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              className={buttonClass}
+              onPress={() => {
+                setEditing(false);
+                setError(null);
+              }}
+              isDisabled={saving !== null}
+            >
+              取消
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              className={buttonClass}
+              aria-label="保存标题与正文"
+              onPress={() => void saveFields()}
+              isDisabled={
+                saving !== null || (!titleChanged && !bodyDirty)
+              }
+            >
+              {saving === "fields" ? "保存中…" : "保存"}
+            </Button>
+          </div>
+          <div className="flex items-end gap-1">
+            <label className="grid min-w-0 flex-1 gap-0.5 text-label text-[var(--muted)]">
+              指派人
+              <Input
+                aria-label="issue 指派人"
+                placeholder="GitHub 登录名"
+                value={assignee}
+                onChange={(event) => {
+                  setAssignee(event.target.value);
+                  setError(null);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    void saveAssignee();
+                  }
+                }}
+                disabled={saving !== null}
+                fullWidth
+                className={fieldClass}
+              />
+            </label>
+            <Button
+              variant="secondary"
+              size="sm"
+              className={`${buttonClass} shrink-0`}
+              aria-label="保存指派人"
+              onPress={() => void saveAssignee()}
+              isDisabled={saving !== null || !assignee.trim()}
+            >
+              {saving === "assignee" ? "保存中…" : "保存"}
+            </Button>
+          </div>
+        </div>
+      )}
+      {error && (
+        <p role="alert" className={`text-[var(--danger)] ${errorClass}`}>
           {error}
         </p>
       )}
@@ -1993,6 +2290,7 @@ function DetailPane({
   issuesLoading,
   issuesError,
   githubError,
+  onUpdateIssue,
   syncing,
   publishing,
   loading,
@@ -2037,6 +2335,7 @@ function DetailPane({
   issuesLoading: boolean;
   issuesError: string | null;
   githubError: string | null;
+  onUpdateIssue: (input: UpdateIssueInput) => Promise<string | null>;
   syncing: boolean;
   publishing: boolean;
   loading: boolean;
@@ -2588,6 +2887,13 @@ function DetailPane({
                   >
                     {issue.title}
                   </p>
+                  {!issue.ghost && (
+                    <IssueEditControls
+                      key={issue.id}
+                      issue={issue}
+                      onSave={onUpdateIssue}
+                    />
+                  )}
                 </div>
               ) : issue ? (
                 <Muted>尚未发布到 GitHub。</Muted>

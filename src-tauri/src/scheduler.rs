@@ -458,7 +458,7 @@ impl Scheduler {
             eprintln!("调度器收尾任务 {task_id} 失败：{err}");
         }
         if let Some((title, status)) = finished {
-            notify::task_finished(&title, status.as_str());
+            notify::task_finished(&title, status.as_str(), task_id);
         }
     }
 
@@ -829,7 +829,7 @@ mod tests {
             },
         )
         .expect("创建任务");
-        // `next_ready_task` 按 `items.created_at` 排序；序号单调递增即可确定 FIFO 顺序。
+        // `next_ready_tasks` 按 `items.created_at` 排序；序号单调递增即可确定 FIFO 顺序。
         let order = TASK_ORDER.fetch_add(1, Ordering::Relaxed);
         guard
             .conn()

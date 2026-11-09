@@ -126,6 +126,9 @@ pub struct TaskSummary {
     /// 任务级模型覆盖；`None` 表示未指派。
     #[serde(default)]
     pub model: Option<String>,
+    /// 是否为合并后自动生成的文档更新任务。
+    #[serde(default)]
+    pub auto_docs: bool,
 }
 
 /// 项目下的一条 issue item（GitHub 同步视图）。
@@ -245,7 +248,7 @@ pub struct NewTask {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewRun {
-    /// 调用方预先分配的 run id（与 `RunSpec.run_id` / worktree / 分支名一致）；
+    /// 调用方预先分配的 run id（与 worktree / 分支名一致）；
     /// 为 `None` 时由存储层生成。
     #[serde(default)]
     pub id: Option<String>,
@@ -496,6 +499,8 @@ pub fn create_docs_task(
     get_task(conn, &task_id)
 }
 
+/// 全项目任务汇总；仅测试使用（生产走 [`list_tasks_for_project`]）。
+#[cfg(test)]
 pub fn list_tasks(conn: &Connection) -> Result<Vec<TaskSummary>, String> {
     query_task_summaries(conn, None)
 }
@@ -510,6 +515,8 @@ pub fn list_tasks_for_project(
 /// 取最旧的排队任务：`items.status='queued'`，按创建时间、任务 id 升序。
 ///
 /// 排序键与调度器的 FIFO 语义一致；同一毫秒创建时用 `t.id` 兜底，保证结果稳定。
+/// 仅测试使用（调度器走 [`next_ready_tasks`]）。
+#[cfg(test)]
 pub fn next_queued_task(conn: &Connection) -> Result<Option<String>, String> {
     conn.query_row(
         "SELECT t.id
@@ -729,7 +736,7 @@ pub fn task_dependencies(
     let blockers = query_related_tasks(
         conn,
         "SELECT t.id, i.title, i.status, t.attempts, t.acceptance_json, t.created_at,
-                t.developer_adapter, t.reviewer_adapter, t.model
+                t.developer_adapter, t.reviewer_adapter, t.model, t.auto_docs
          FROM links l
          JOIN tasks t ON t.item_id = l.from_item
          JOIN items i ON i.id = t.item_id
@@ -740,7 +747,7 @@ pub fn task_dependencies(
     let blocks = query_related_tasks(
         conn,
         "SELECT t.id, i.title, i.status, t.attempts, t.acceptance_json, t.created_at,
-                t.developer_adapter, t.reviewer_adapter, t.model
+                t.developer_adapter, t.reviewer_adapter, t.model, t.auto_docs
          FROM links l
          JOIN tasks t ON t.item_id = l.to_item
          JOIN items i ON i.id = t.item_id
@@ -892,7 +899,7 @@ pub fn task_context(conn: &Connection, task_id: &str) -> Result<Vec<ContextItem>
 ///
 /// `project_id` 与 `task_id` 都是可选的收窄条件；两者都不传时返回全部就绪任务。
 /// 依赖闭包直接递归，不读取任何物化副本；没有任何依赖的任务天然满足条件。
-/// 排序与 [`next_queued_task`] 一致：创建时间、任务 id 升序。
+/// 排序：创建时间、任务 id 升序，与调度器的 FIFO 语义一致。
 fn query_ready_tasks(
     conn: &Connection,
     project_id: Option<&str>,
@@ -935,17 +942,16 @@ fn query_ready_tasks(
     rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
 }
 
-/// 项目内最旧的排队任务，且其所有传递依赖都已 `merged`。
-///
-/// 等价于 [`next_ready_tasks`] 的首个元素，保留给只关心队首的调用方。
+/// 项目内最旧的已就绪任务；仅测试使用（生产走 [`next_ready_tasks`]）。
+#[cfg(test)]
 pub fn next_ready_task(conn: &Connection, project_id: &str) -> Result<Option<String>, String> {
     Ok(next_ready_tasks(conn, project_id)?.into_iter().next())
 }
 
 /// 项目内全部就绪的排队任务，按创建时间、任务 id 升序。
 ///
-/// 就绪判定与 [`next_ready_task`] 完全一致：关联 item 状态为 `queued`，且传递
-/// 依赖闭包中不存在状态不是 `merged` 的任务。
+/// 就绪判定：关联 item 状态为 `queued`，且传递依赖闭包中不存在状态不是
+/// `merged` 的任务。
 pub fn next_ready_tasks(conn: &Connection, project_id: &str) -> Result<Vec<String>, String> {
     query_ready_tasks(conn, Some(project_id), None)
 }
@@ -1113,7 +1119,7 @@ fn query_task_summaries(
     let mut stmt = conn
         .prepare(
             "SELECT t.id, i.title, i.status, t.attempts, t.acceptance_json, t.created_at,
-                    t.developer_adapter, t.reviewer_adapter, t.model
+                    t.developer_adapter, t.reviewer_adapter, t.model, t.auto_docs
              FROM tasks t JOIN items i ON i.id = t.item_id
              WHERE (?1 IS NULL OR i.project_id = ?1)
              ORDER BY t.created_at DESC, t.rowid DESC",
@@ -1313,8 +1319,8 @@ fn allowed_transition(from: TaskStatus, to: TaskStatus) -> bool {
 
 /// 建立一次运行：attempt 自增，`tasks.attempts` 同步为本次 attempt。
 ///
-/// `NewRun.id` 可传入调用方预先生成的 id（worktree、分支名与 `RunSpec.run_id`
-/// 都以它为准）；未提供时由存储层生成。
+/// `NewRun.id` 可传入调用方预先生成的 id（worktree、分支名都以它为准）；
+/// 未提供时由存储层生成。
 pub fn start_run(conn: &Connection, input: NewRun) -> Result<RunRow, String> {
     let NewRun {
         id,
@@ -1782,6 +1788,7 @@ fn read_task_summary(row: &Row<'_>) -> rusqlite::Result<TaskSummary> {
         developer_adapter: row.get(6)?,
         reviewer_adapter: row.get(7)?,
         model: row.get(8)?,
+        auto_docs: row.get(9)?,
     })
 }
 
@@ -2304,6 +2311,47 @@ mod tests {
             "父任务 item 到文档任务 item 必须有 derived_from 链接"
         );
         assert!(docs.events.is_empty());
+    }
+
+    #[test]
+    fn list_tasks_carries_auto_docs_flag() {
+        let db = open_db();
+        let project_id = project(&db);
+        let conn = db.conn();
+        let parent = create_task(conn, new_task(&project_id, criteria())).unwrap();
+        let docs = create_docs_task(
+            conn,
+            &project_id,
+            &parent.id,
+            "文档：实现证据门",
+            "更新文档",
+            criteria(),
+        )
+        .unwrap();
+
+        let summaries = list_tasks_for_project(conn, &project_id).unwrap();
+        assert_eq!(summaries.len(), 2);
+        let parent_summary = summaries
+            .iter()
+            .find(|summary| summary.id == parent.id)
+            .unwrap();
+        assert!(!parent_summary.auto_docs);
+        let docs_summary = summaries
+            .iter()
+            .find(|summary| summary.id == docs.task.id)
+            .unwrap();
+        assert!(docs_summary.auto_docs);
+
+        // 依赖视图与列表共用行读取器，同样必须读到 auto_docs 列。
+        add_dependency(conn, &docs.task.id, &parent.id).unwrap();
+        let (blockers, _) = task_dependencies(conn, &docs.task.id).unwrap();
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].id, parent.id);
+        assert!(!blockers[0].auto_docs);
+        let (_, blocks) = task_dependencies(conn, &parent.id).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].id, docs.task.id);
+        assert!(blocks[0].auto_docs);
     }
 
     #[test]
@@ -3326,7 +3374,7 @@ mod tests {
         let doc = insert_item(conn, &project_id, "doc", "设计文档", "文档正文");
         let unrelated = insert_item(conn, &project_id, "doc", "无关文档", "不应出现");
         let reverse = insert_item(conn, &project_id, "doc", "反本文档", "不应出现");
-        let foreign = insert_item(conn, &other_project_id, "doc", "外部文档", "不应出现");
+        let _foreign = insert_item(conn, &other_project_id, "doc", "外部文档", "不应出现");
 
         link_item(conn, &task_item, &note, "relates").unwrap();
         link_item(conn, &task_item, &doc, "relates").unwrap();

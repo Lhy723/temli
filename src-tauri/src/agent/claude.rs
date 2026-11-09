@@ -14,9 +14,11 @@ use std::thread;
 use std::time::Duration;
 
 use super::{
-    AgentAdapter, AgentEvent, AgentManifest, AgentRole, AgentState, AuthState, Capabilities,
-    Decision, DetectResult, EventSink, RunSpec, RunStatus, SessionHandle,
+    AgentAdapter, AgentEvent, AgentManifest, AgentRole, AgentState, Capabilities, Decision,
+    EventSink, RunSpec, RunStatus, SessionHandle,
 };
+#[cfg(test)]
+use super::{AuthState, DetectResult};
 
 /// stderr 保留的最大字节数，超出后只保留尾部。
 const STDERR_LIMIT: usize = 4 * 1024;
@@ -63,6 +65,8 @@ impl AgentAdapter for ClaudeAdapter {
         }
     }
 
+    /// 探测 `claude` 是否可用；仅测试使用，生产代码不调用。
+    #[cfg(test)]
     fn detect(&self) -> DetectResult {
         match super::probe_version("claude") {
             Ok(version) => {
@@ -445,12 +449,10 @@ mod tests {
 
     fn run_spec() -> RunSpec {
         RunSpec {
-            run_id: "run-1".into(),
             cwd: PathBuf::from("/tmp/work tree"),
             prompt: "修复失败测试".into(),
             model: None,
             max_minutes: 5,
-            max_cost_usd: None,
             env_allowlist: Vec::new(),
         }
     }

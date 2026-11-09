@@ -595,12 +595,10 @@ pub fn run_task_blocking(ctx: &RunContext, task_id: &str) -> Result<(), String> 
         worker_prompt(guard.conn(), &task)
     };
     let spec = RunSpec {
-        run_id: run_id.clone(),
         cwd: worktree.clone(),
         prompt,
         model: task.model.clone(),
         max_minutes: u64::from(max_minutes),
-        max_cost_usd: None,
         env_allowlist: Vec::new(),
     };
 
@@ -1775,7 +1773,7 @@ fn event_sink(
             );
         }
         if let Some(reason) = approval_notice {
-            notify::decision(&reason);
+            notify::decision(&reason, &task_id);
         }
         let _ = tx.send(event);
     })
@@ -1992,13 +1990,11 @@ fn review_run(
         let _ = tx.send(event);
     });
     let spec = RunSpec {
-        run_id: Uuid::new_v4().to_string(),
         cwd: worktree.to_path_buf(),
         prompt,
         // 审查角色沿用任务的模型覆盖；后续如需角色级模型再从独立字段读取。
         model: task.model.clone(),
         max_minutes: 10,
-        max_cost_usd: None,
         env_allowlist: Vec::new(),
     };
     let handle = reviewer.start(spec, sink)?;
