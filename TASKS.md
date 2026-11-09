@@ -1,6 +1,6 @@
 # TASKS
 
-更新时间：2026-11-09　当前状态：M0–M17 完成，0.2.0 已发布（tag `v0.2.0`，GitHub Release 挂 DMG）
+更新时间：2026-11-09　当前状态：M0–M18 完成，0.3.0 已发布（tag `v0.3.0`，tag 推送自动构建 Release）
 
 ## 里程碑
 
@@ -38,6 +38,7 @@
 - 0.1.0 发布：CI 绿后 PR #53 合入 `main`，tag `v0.1.0`，GitHub Release 附件 `temli_0.1.0_aarch64.dmg`（3,703,023 字节）；DMG 已挂载验证包含 `temli.app`；develop 回合并 PR #55
 - 0.1.1 发布：`codesign -v` 通过（修复前因缺 `_CodeSignature/CodeResources` 失败）；Release 附件下载后 SHA-256 与本地构建一致（07d0f135…）；安装到 `/Applications` 后签名校验通过并可启动；CI 绿（PR #62）
 - M18 基础设施：设置页渲染并读取 `app_settings`（并发/开关/Agent/保留天数/数据目录）；重复启动第二实例自动退出且日志记录「检测到第二个实例，激活主窗口」（仅 1 个进程）；`logs/temli.log` 写入启动/退出/设置变更；`cargo clippy --all-targets -- -D warnings` 0 warning
+- 0.3.0 发布：tag `v0.3.0` 触发 release workflow 自动构建（DMG 3,758,232 字节 + `temli_aarch64.app.tar.gz`），发布说明已补；下载产物 `codesign -v` 通过并安装验证
 
 ## 基础设施缺口（M18 起补齐）
 
