@@ -329,28 +329,40 @@ export function PlansPanel({ projectId }: { projectId: string }) {
                         </p>
                       </div>
                     </button>
-                    <div className="flex shrink-0 items-center gap-1.5 pt-0.5">
+                    <div className="flex shrink-0 flex-col items-end gap-1 pt-0.5">
+                      <div className="flex items-center gap-1.5">
+                        {plan.status === "draft" && (
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            className="h-8 px-3 text-ui"
+                            isDisabled={busyPlanId !== null}
+                            onPress={() => void start(plan)}
+                          >
+                            {starting ? "启动中…" : "启动计划"}
+                          </Button>
+                        )}
+                        {plan.status === "active" && reviewStage && (
+                          <Button
+                            variant="primary"
+                            size="sm"
+                            className="h-8 px-3 text-ui"
+                            isDisabled={acceptingStageId !== null}
+                            onPress={() => void accept(plan, reviewStage)}
+                          >
+                            {accepting ? "验收中…" : "验收阶段"}
+                          </Button>
+                        )}
+                      </div>
                       {plan.status === "draft" && (
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          className="h-8 px-3 text-ui"
-                          isDisabled={busyPlanId !== null}
-                          onPress={() => void start(plan)}
-                        >
-                          {starting ? "启动中…" : "启动计划"}
-                        </Button>
+                        <p className="max-w-[240px] text-right text-label leading-snug text-[var(--muted)]">
+                          启动后首阶段任务会自动入队；后续阶段通过验收解锁。
+                        </p>
                       )}
                       {plan.status === "active" && reviewStage && (
-                        <Button
-                          variant="primary"
-                          size="sm"
-                          className="h-8 px-3 text-ui"
-                          isDisabled={acceptingStageId !== null}
-                          onPress={() => void accept(plan, reviewStage)}
-                        >
-                          {accepting ? "验收中…" : "验收阶段"}
-                        </Button>
+                        <p className="max-w-[240px] text-right text-label leading-snug text-[var(--muted)]">
+                          通过后下一阶段任务会自动入队。
+                        </p>
                       )}
                     </div>
                   </div>

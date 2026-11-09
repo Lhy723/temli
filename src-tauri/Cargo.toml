@@ -1,6 +1,6 @@
 [package]
 name = "temli"
-version = "0.5.0"
+version = "0.5.1"
 description = "AI-native project workspace"
 authors = ["Lhy723"]
 edition = "2024"
