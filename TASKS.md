@@ -1,6 +1,6 @@
 # TASKS
 
-更新时间：2026-11-09　当前状态：M0–M19 完成，0.4.0 已发布（tag `v0.4.0`，tag 推送自动构建 Release）
+更新时间：2026-11-09　当前状态：M0–M19 完成，0.4.1 已发布（tag `v0.4.1`，tag 推送自动构建 Release）
 
 ## 里程碑
 
@@ -27,7 +27,7 @@
 
 ## 关键验证
 
-- `cargo test --lib`：291 passed，1 ignored（需真实 OMP 的 live 规划测试）
+- `cargo test --lib`：294 passed，1 ignored（需真实 OMP 的 live 规划测试）
 - `npm run build`：通过
 - `npm run tauri build`：通过，产物 `temli.app`（7.05 MiB）与 `temli_0.1.0_aarch64.dmg`（3.54 MiB）
 - `cargo build`：0 warning（M13 死代码清零）
@@ -43,6 +43,7 @@
 - 0.3.0 发布：tag `v0.3.0` 触发 release workflow 自动构建（DMG 3,758,232 字节 + `temli_aarch64.app.tar.gz`），发布说明已补；下载产物 `codesign -v` 通过并安装验证
 - M19 Vault 对齐（浏览器 mock IPC）：标签筛选 `notes_by_tag`、属性保存 `set_note_properties`（引号值不二次转义、保存前先 `save_vault_note` 落盘草稿）、大纲跳过 frontmatter、⌘O 切换、`[[` 补全插入 `[[Inbox]]`、模板 `{{date}}`→当日日期
 - 0.4.0 发布：tag 触发 workflow 构建（DMG 3,807,789 字节），`codesign -v` 通过并安装
+- 0.4.1 补丁：浏览器 DOM drop 实测（`save_vault_attachment` 调用、插入 `![pic.png](attachments/…)`、预览读取）；`[[别名]]` 由 frontmatter `aliases/alias` 解析（flow/逗号/块列表，单测覆盖）；矩阵状态与实现对齐；Release DMG 3,811,144 字节，`codesign -v` 通过并安装
 
 ## 基础设施缺口（M18 起补齐）
 
@@ -73,7 +74,7 @@
 ## 验证命令
 
 ```bash
-cd src-tauri && cargo test --lib          # 291 passed, 1 ignored
+cd src-tauri && cargo test --lib          # 294 passed, 1 ignored
 npm run build                             # 前端类型检查 + 构建
 npm run tauri build                       # release .app + .dmg
 cargo test --lib live_plan_generation_with_omp -- --ignored --nocapture
