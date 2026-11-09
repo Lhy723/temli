@@ -6,6 +6,7 @@ import {
   type ChangeEvent,
   type ClipboardEvent,
   type ComponentProps,
+  type DragEvent as ReactDragEvent,
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import Markdown from "react-markdown";
@@ -582,6 +583,7 @@ export function Vaults({
   const attachmentInputRef = useRef<HTMLInputElement>(null);
 
   const [uploading, setUploading] = useState(false);
+  const [attachmentDragActive, setAttachmentDragActive] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renamePath, setRenamePath] = useState("");
   const [renameBusy, setRenameBusy] = useState(false);
@@ -1067,10 +1069,10 @@ export function Vaults({
     setSearchQuery("");
   }
 
-  function insertAtCursor(text: string) {
+  function insertAtCursor(text: string, at?: number) {
     const textarea = bodyRef.current;
-    const start = textarea?.selectionStart ?? null;
-    const end = textarea?.selectionEnd ?? start;
+    const start = at ?? textarea?.selectionStart ?? null;
+    const end = at ?? textarea?.selectionEnd ?? start;
     setCompletion(null);
     setDraftBody((previous) => {
       const from = start ?? previous.length;
@@ -1087,6 +1089,30 @@ export function Vaults({
     });
   }
 
+  async function saveAttachmentFile(
+    file: File,
+    noteId: string,
+    vaultId: string,
+  ) {
+    const extension = file.type.startsWith("image/")
+      ? file.type.slice("image/".length).replace("jpeg", "jpg").split("+")[0]
+      : "bin";
+    const fileName = file.name || `附件-${Date.now()}.${extension || "bin"}`;
+    const dataBase64 = await fileToBase64(file);
+    const relativePath = await saveVaultAttachment(
+      vaultId,
+      noteId,
+      fileName,
+      dataBase64,
+    );
+    return {
+      relativePath,
+      marker: file.type.startsWith("image/")
+        ? `![${fileName}](${relativePath})`
+        : `[${fileName}](${relativePath})`,
+    };
+  }
+
   async function uploadAttachment(file: File) {
     if (!note || uploading) return;
     if (file.size > MAX_ATTACHMENT_BYTES) {
@@ -1094,32 +1120,73 @@ export function Vaults({
       return;
     }
     const request = openRequest.current;
-    const noteId = note.id;
-    const vaultId = note.vault_id;
-    const extension = file.type.startsWith("image/")
-      ? file.type.slice("image/".length).replace("jpeg", "jpg").split("+")[0]
-      : "bin";
-    const fileName = file.name || `附件-${Date.now()}.${extension || "bin"}`;
     setUploading(true);
     setActionError(null);
     try {
-      const dataBase64 = await fileToBase64(file);
-      const relativePath = await saveVaultAttachment(
-        vaultId,
-        noteId,
-        fileName,
-        dataBase64,
+      const { relativePath, marker } = await saveAttachmentFile(
+        file,
+        note.id,
+        note.vault_id,
       );
       if (request !== openRequest.current) return;
-      const marker = file.type.startsWith("image/")
-        ? `![${fileName}](${relativePath})`
-        : `[${fileName}](${relativePath})`;
       insertAtCursor(marker);
       setNotice(`已插入附件 ${relativePath}`);
     } catch (error) {
       if (request === openRequest.current) setActionError(errorText(error));
     } finally {
       setUploading(false);
+    }
+  }
+
+  async function uploadAttachments(files: File[]) {
+    if (!note || uploading || files.length === 0) return;
+    const request = openRequest.current;
+    const noteId = note.id;
+    const vaultId = note.vault_id;
+    const textarea = bodyRef.current;
+    let caret = textarea?.selectionStart ?? null;
+    const inserted: string[] = [];
+    const failures: string[] = [];
+    setUploading(true);
+    setActionError(null);
+    try {
+      for (const file of files) {
+        if (request !== openRequest.current) break;
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          failures.push(
+            `${file.name || "未命名文件"} 超过 25 MB，无法插入。`,
+          );
+          if (request === openRequest.current) {
+            setActionError(failures.join("；"));
+          }
+          continue;
+        }
+        try {
+          const { relativePath, marker } = await saveAttachmentFile(
+            file,
+            noteId,
+            vaultId,
+          );
+          if (request !== openRequest.current) break;
+          insertAtCursor(marker, caret ?? undefined);
+          if (caret !== null) caret += marker.length;
+          inserted.push(relativePath);
+        } catch (error) {
+          failures.push(errorText(error));
+          if (request === openRequest.current) {
+            setActionError(failures.join("；"));
+          }
+        }
+      }
+    } finally {
+      setUploading(false);
+      if (request === openRequest.current) {
+        if (inserted.length === 1) {
+          setNotice(`已插入附件 ${inserted[0]}`);
+        } else if (inserted.length > 1) {
+          setNotice(`已插入 ${inserted.length} 个附件`);
+        }
+      }
     }
   }
 
@@ -1137,6 +1204,33 @@ export function Vaults({
     if (!file) return;
     event.preventDefault();
     void uploadAttachment(file);
+  }
+
+  function handleBodyDragEnter(event: ReactDragEvent<HTMLTextAreaElement>) {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    setAttachmentDragActive(true);
+  }
+
+  function handleBodyDragOver(event: ReactDragEvent<HTMLTextAreaElement>) {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    if (!attachmentDragActive) setAttachmentDragActive(true);
+  }
+
+  function handleBodyDragLeave(event: ReactDragEvent<HTMLTextAreaElement>) {
+    const next = event.relatedTarget as Node | null;
+    if (next && event.currentTarget.contains(next)) return;
+    setAttachmentDragActive(false);
+  }
+
+  function handleBodyDrop(event: ReactDragEvent<HTMLTextAreaElement>) {
+    const files = Array.from(event.dataTransfer.files);
+    if (files.length === 0) return;
+    event.preventDefault();
+    setAttachmentDragActive(false);
+    void uploadAttachments(files);
   }
 
   function syncCompletion(value: string, caret: number | null) {
@@ -2285,8 +2379,16 @@ export function Vaults({
                         }}
                         onKeyDown={handleBodyKeyDown}
                         onPaste={handleBodyPaste}
+                        onDragEnter={handleBodyDragEnter}
+                        onDragOver={handleBodyDragOver}
+                        onDragLeave={handleBodyDragLeave}
+                        onDrop={handleBodyDrop}
                         disabled={saving || deleting}
-                        className="min-h-0 w-full flex-1 resize-none font-mono text-ui-sm"
+                        className={`min-h-0 w-full flex-1 resize-none font-mono text-ui-sm ${
+                          attachmentDragActive
+                            ? "border-[var(--accent)] ring-1 ring-[var(--accent)]"
+                            : ""
+                        }`}
                       />
                     </div>
                     <div className="min-h-0 overflow-auto rounded-md border border-[var(--border)] bg-[var(--background-secondary)] p-3">

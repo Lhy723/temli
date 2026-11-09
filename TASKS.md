@@ -1,6 +1,6 @@
 # TASKS
 
-更新时间：2026-11-09　当前状态：M0–M18 完成，0.3.0 已发布（tag `v0.3.0`，tag 推送自动构建 Release）
+更新时间：2026-11-09　当前状态：M0–M19 完成，0.4.0 已发布（tag `v0.4.0`，tag 推送自动构建 Release）
 
 ## 里程碑
 
@@ -27,7 +27,7 @@
 
 ## 关键验证
 
-- `cargo test --lib`：282 passed，1 ignored（需真实 OMP 的 live 规划测试）
+- `cargo test --lib`：291 passed，1 ignored（需真实 OMP 的 live 规划测试）
 - `npm run build`：通过
 - `npm run tauri build`：通过，产物 `temli.app`（7.05 MiB）与 `temli_0.1.0_aarch64.dmg`（3.54 MiB）
 - `cargo build`：0 warning（M13 死代码清零）
@@ -41,6 +41,8 @@
 - M18 基础设施：设置页渲染并读取 `app_settings`（并发/开关/Agent/保留天数/数据目录）；重复启动第二实例自动退出且日志记录「检测到第二个实例，激活主窗口」（仅 1 个进程）；`logs/temli.log` 写入启动/退出/设置变更；`cargo clippy --all-targets -- -D warnings` 0 warning
 - M18 设置写入链路（隔离浏览器 + mock IPC，真实点击）：retention 7→8 后保存按钮由 disabled 变 enabled，点击调用 `set_worktree_retention_days {days:8}` 并显示「已保存」；自动合并开关调用 `set_auto_merge {input:{project_id,enabled}}`；默认 Agent 选择调用 `set_default_agent {agent:"fake"}`；注入失败后 `role="alert"` 显示「模拟失败：写入被拒绝」
 - 0.3.0 发布：tag `v0.3.0` 触发 release workflow 自动构建（DMG 3,758,232 字节 + `temli_aarch64.app.tar.gz`），发布说明已补；下载产物 `codesign -v` 通过并安装验证
+- M19 Vault 对齐（浏览器 mock IPC）：标签筛选 `notes_by_tag`、属性保存 `set_note_properties`（引号值不二次转义、保存前先 `save_vault_note` 落盘草稿）、大纲跳过 frontmatter、⌘O 切换、`[[` 补全插入 `[[Inbox]]`、模板 `{{date}}`→当日日期
+- 0.4.0 发布：tag 触发 workflow 构建（DMG 3,807,789 字节），`codesign -v` 通过并安装
 
 ## 基础设施缺口（M18 起补齐）
 
@@ -71,7 +73,7 @@
 ## 验证命令
 
 ```bash
-cd src-tauri && cargo test --lib          # 282 passed, 1 ignored
+cd src-tauri && cargo test --lib          # 291 passed, 1 ignored
 npm run build                             # 前端类型检查 + 构建
 npm run tauri build                       # release .app + .dmg
 cargo test --lib live_plan_generation_with_omp -- --ignored --nocapture
