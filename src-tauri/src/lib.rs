@@ -802,6 +802,15 @@ fn list_decisions(state: State<AppState>, project_id: String) -> Result<Vec<Deci
 }
 
 #[tauri::command]
+fn list_reviews(
+    state: State<AppState>,
+    project_id: String,
+) -> Result<Vec<store::ReviewListItem>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::list_reviews(db.conn(), &project_id)
+}
+
+#[tauri::command]
 fn resolve_decision(state: State<AppState>, input: ResolveDecisionInput) -> Result<(), String> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     let decision = store::resolve_decision(db.conn(), &input.id, &input.resolution)?;
@@ -1348,6 +1357,7 @@ pub fn run() {
             start_task,
             cancel_task,
             list_decisions,
+            list_reviews,
             resolve_decision,
             list_events,
             list_adapters,

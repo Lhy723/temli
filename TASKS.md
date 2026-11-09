@@ -1,6 +1,6 @@
 # TASKS
 
-更新时间：2026-11-09　当前状态：M0–M13 全部完成，0.1.0 已发布（main tag v0.1.0，GitHub Release 挂 DMG）
+更新时间：2026-11-09　当前状态：M0–M16 完成，0.1.1 已发布（tag `v0.1.1`，GitHub Release 挂 DMG）
 
 ## 里程碑
 
@@ -20,10 +20,12 @@
 - [x] M13 GitHub 写回闭环 + 文档任务结构化：issue 标题/正文/指派人/关闭重开写回（乐观并发）、远端关闭同步、auto_docs 字段驱动 chip、merged 即时刷新、通知点击深链、孤儿 worktree 时间窗回收、死代码清零（PR #51）
 - [x] M14 发布 0.1.0：CI workflow（PR #52）、CHANGELOG 定稿、`release/0.1.0` → `main`（PR #53）、tag `v0.1.0`、GitHub Release 挂 DMG、回合并 develop（PR #55）
 - [x] M15 应用图标：深炭底 + 琥珀对勾（证据门/已验证语义），全平台图标集重新生成；菜单栏用模板图标（随浅色/深色反色）（PR #57）
+- [x] M16 0.1.1 补丁发布：修复 .app 未被 ad-hoc 签名导致 DMG 自动安装报「无法安装」（`signingIdentity = "-"`，`codesign -v` 通过）；CI 时序测试稳定化（PR #61）；`release/0.1.1` → main（PR #62）→ tag `v0.1.1` + GitHub Release（PR #59/#61 后基于 main 重建）
+- [x] M17 真实页面 + 界面统一：审查页（证据/审查报告列表，`list_reviews` 后端）、Agent 页（适配器能力/角色总览）；字号/间距/控件高度/圆角统一、tab 与侧栏选中态一致、看板列宽与卡片密度、120–160ms 动效 + reduced-motion（PR #TBD）
 
 ## 关键验证
 
-- `cargo test --lib`：271 passed，1 ignored（需真实 OMP 的 live 规划测试）
+- `cargo test --lib`：272 passed，1 ignored（需真实 OMP 的 live 规划测试）
 - `npm run build`：通过
 - `npm run tauri build`：通过，产物 `temli.app`（7.05 MiB）与 `temli_0.1.0_aarch64.dmg`（3.54 MiB）
 - `cargo build`：0 warning（M13 死代码清零）
@@ -33,6 +35,7 @@
 - M11 真实链路：父任务合并（PR #4）→ 自动生成 `文档：add farewell` → PR #5 合并 → `docs/guide.md` 更新；仅 1 条文档任务，无递归
 - M12 运行时（release bundle + fake 适配器）：托盘左键恢复窗口、右键菜单「显示 temli / 退出 temli」；关闭窗口后进程存活；通知授权后横幅显示「需要决策 / 任务标题 / 状态：等待人工决策」
 - 0.1.0 发布：CI 绿后 PR #53 合入 `main`，tag `v0.1.0`，GitHub Release 附件 `temli_0.1.0_aarch64.dmg`（3,703,023 字节）；DMG 已挂载验证包含 `temli.app`；develop 回合并 PR #55
+- 0.1.1 发布：`codesign -v` 通过（修复前因缺 `_CodeSignature/CodeResources` 失败）；Release 附件下载后 SHA-256 与本地构建一致（07d0f135…）；安装到 `/Applications` 后签名校验通过并可启动；CI 绿（PR #62）
 
 ## 已知遗留
 
@@ -41,7 +44,7 @@
 - 通知在 `tauri dev` 下由插件回退为 Terminal 名义发送；release bundle 使用 `com.lhy.temli`，首次发送会请求系统授权
 - 文档工作区只读；GitHub Projects V2 未接入；assignee 移除仅后端支持（`Some(None)→[]`），UI 只做设置
 - Vault 附件、标签、模板未做；团队抽象、预算/成本上限未做
-- 无真实 E2E 前端测试；`release/*` 分支、签名与公证流程尚未跑过（当前按开源分发：ad-hoc + `xattr` 提示）
+- 无真实 E2E 前端测试；Developer ID 签名与公证未做（当前 ad-hoc 签名 + `xattr` 提示，安装链路已验证）
 - 前端看板窄窗口已改横向滚动（M13），仍需 E2E 回归覆盖
 
 ## 下一步
@@ -54,7 +57,7 @@
 ## 验证命令
 
 ```bash
-cd src-tauri && cargo test --lib          # 271 passed, 1 ignored
+cd src-tauri && cargo test --lib          # 272 passed, 1 ignored
 npm run build                             # 前端类型检查 + 构建
 npm run tauri build                       # release .app + .dmg
 cargo test --lib live_plan_generation_with_omp -- --ignored --nocapture
