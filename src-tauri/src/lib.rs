@@ -975,14 +975,12 @@ fn get_plan(state: State<AppState>, plan_id: String) -> Result<store::Plan, Stri
 
 #[tauri::command]
 fn start_plan(state: State<AppState>, plan_id: String) -> Result<store::Plan, String> {
-    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::start_plan(db.conn(), &plan_id)
+    state.scheduler.start_plan(&plan_id)
 }
 
 #[tauri::command]
 fn accept_stage(state: State<AppState>, stage_id: String) -> Result<store::Plan, String> {
-    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::accept_stage(db.conn(), &stage_id)
+    state.scheduler.accept_stage(&stage_id)
 }
 
 #[tauri::command]

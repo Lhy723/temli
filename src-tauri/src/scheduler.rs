@@ -5,6 +5,7 @@
 //! 每个被认领的任务在独立线程里运行，单个运行失败（包括 panic）不会阻塞其它任务。
 //! 任务结束后由本模块决定自动重试还是转人工处理。
 
+use crate::logging;
 use crate::notify;
 use crate::orchestrator::{self, RunContext};
 use crate::store::{self, NewDecision, NewEvent, TaskStatus};
@@ -80,6 +81,88 @@ impl Scheduler {
             .spawn(move || scheduler.work_loop())
             .map(|_| ())
             .map_err(|err| format!("无法启动调度线程：{err}"))
+    }
+
+    /// 启动计划并把首阶段可自动执行的任务入队。
+    ///
+    /// 计划状态迁移和任务入队都需要数据库锁，因此先在锁内启动计划、释放锁后
+    /// 再逐个入队。单个任务入队失败不回滚已启动的计划，只记录日志；返回重新
+    /// 读取的计划，反映入队后的真实状态。
+    pub fn start_plan(&self, plan_id: &str) -> Result<store::Plan, String> {
+        let plan = {
+            let guard = self
+                .ctx
+                .db
+                .lock()
+                .map_err(|_| "数据库锁被占用".to_string())?;
+            store::start_plan(guard.conn(), plan_id)?
+        };
+        if let Some(stage) = plan.stages.first() {
+            self.enqueue_stage_tasks(&plan.id, stage);
+        }
+        let guard = self
+            .ctx
+            .db
+            .lock()
+            .map_err(|_| "数据库锁被占用".to_string())?;
+        store::get_plan(guard.conn(), plan_id)
+    }
+
+    /// 验收阶段，并把新解锁阶段的可自动执行任务入队。
+    ///
+    /// 与 [`Scheduler::start_plan`] 相同：状态迁移在锁内完成，入队失败只记日志，
+    /// 最后返回重新读取的计划。
+    pub fn accept_stage(&self, stage_id: &str) -> Result<store::Plan, String> {
+        let plan = {
+            let guard = self
+                .ctx
+                .db
+                .lock()
+                .map_err(|_| "数据库锁被占用".to_string())?;
+            store::accept_stage(guard.conn(), stage_id)?
+        };
+        if let Some(stage) = plan
+            .stages
+            .iter()
+            .find(|stage| stage.status == store::StageStatus::Active)
+        {
+            self.enqueue_stage_tasks(&plan.id, stage);
+        }
+        let guard = self
+            .ctx
+            .db
+            .lock()
+            .map_err(|_| "数据库锁被占用".to_string())?;
+        store::get_plan(guard.conn(), &plan.id)
+    }
+
+    /// 对阶段内可自动执行的任务逐个入队。
+    ///
+    /// 已排队或已在执行的任务保持现状；失败/中断/待人工的任务不自动重启，只
+    /// 记录日志等待人工处理。
+    fn enqueue_stage_tasks(&self, plan_id: &str, stage: &store::PlanStage) {
+        for task in &stage.tasks {
+            match task.status {
+                TaskStatus::Draft | TaskStatus::Ready => {
+                    if let Err(err) = self.enqueue(&task.id) {
+                        logging::log(format!(
+                            "计划 {plan_id} 阶段 {} 的任务 {} 入队失败：{err}",
+                            stage.id, task.id
+                        ));
+                    }
+                }
+                TaskStatus::Queued
+                | TaskStatus::Running
+                | TaskStatus::Verifying
+                | TaskStatus::Merged => {}
+                TaskStatus::Failed | TaskStatus::Interrupted | TaskStatus::NeedsHuman => {
+                    logging::log(format!(
+                        "计划 {plan_id} 阶段 {} 的任务 {} 处于 {}，不自动重新入队",
+                        stage.id, task.id, task.status
+                    ));
+                }
+            }
+        }
     }
 
     /// 把任务推入队列：draft → ready → queued；已排队时幂等。
@@ -527,7 +610,7 @@ mod tests {
         Capabilities, Decision, DetectResult, EventSink, RunSpec, RunStatus, SessionHandle,
     };
     use crate::db::{Db, RegisterProjectInput};
-    use crate::store::{Criterion, NewTask};
+    use crate::store::{Criterion, NewPlan, NewPlanStage, NewTask, PlanStatus, StageStatus};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -848,6 +931,76 @@ mod tests {
             .expect("读取任务")
             .task
             .status
+    }
+
+    /// 把草稿任务推进到排队状态。
+    fn make_queued(ctx: &RunContext, task_id: &str) {
+        let guard = ctx.db.lock().expect("数据库锁被占用");
+        let conn = guard.conn();
+        store::transition(conn, task_id, TaskStatus::Ready).expect("任务进入 ready");
+        store::transition(conn, task_id, TaskStatus::Queued).expect("任务进入 queued");
+    }
+
+    /// 按阶段创建计划；`stages` 中每个数组对应一个阶段的任务 id。
+    fn create_plan(ctx: &RunContext, project_id: &str, stages: Vec<Vec<&str>>) -> store::Plan {
+        let guard = ctx.db.lock().expect("数据库锁被占用");
+        store::create_plan(
+            guard.conn(),
+            NewPlan {
+                project_id: project_id.to_string(),
+                title: "分阶段交付".to_string(),
+                goal: "验证计划自动入队".to_string(),
+                stages: stages
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, task_ids)| NewPlanStage {
+                        title: format!("阶段 {}", index + 1),
+                        task_ids: task_ids.into_iter().map(str::to_string).collect(),
+                    })
+                    .collect(),
+            },
+        )
+        .expect("创建计划")
+    }
+
+    /// 把任务从当前状态推进到 `merged`；迁移链取决于当前状态，不能假设从草稿开始。
+    fn merge_task(ctx: &RunContext, task_id: &str) {
+        let guard = ctx.db.lock().expect("数据库锁被占用");
+        let conn = guard.conn();
+        let current = store::task_status(conn, task_id).expect("读取任务状态");
+        let chain: Vec<TaskStatus> = match current {
+            TaskStatus::Draft => vec![
+                TaskStatus::Ready,
+                TaskStatus::Queued,
+                TaskStatus::Running,
+                TaskStatus::Verifying,
+                TaskStatus::Merged,
+            ],
+            TaskStatus::Ready => vec![
+                TaskStatus::Queued,
+                TaskStatus::Running,
+                TaskStatus::Verifying,
+                TaskStatus::Merged,
+            ],
+            TaskStatus::Queued => vec![
+                TaskStatus::Running,
+                TaskStatus::Verifying,
+                TaskStatus::Merged,
+            ],
+            TaskStatus::Running => vec![TaskStatus::Verifying, TaskStatus::Merged],
+            TaskStatus::Verifying => vec![TaskStatus::Merged],
+            TaskStatus::Merged => Vec::new(),
+            TaskStatus::Failed | TaskStatus::Interrupted | TaskStatus::NeedsHuman => vec![
+                TaskStatus::Queued,
+                TaskStatus::Running,
+                TaskStatus::Verifying,
+                TaskStatus::Merged,
+            ],
+        };
+        for next in chain {
+            store::transition(conn, task_id, next)
+                .unwrap_or_else(|err| panic!("任务 {task_id} 迁移到 {next} 失败：{err}"));
+        }
     }
 
     fn set_project_limit(ctx: &RunContext, project_id: &str, limit: i64) {
@@ -1360,5 +1513,92 @@ mod tests {
             .expect("释放额度后可再次认领");
         assert_eq!(reclaimed, second);
         drop(guard);
+    }
+
+    #[test]
+    fn start_plan_enqueues_first_stage_tasks_only() {
+        let fixture = Fixture::new("plan-start");
+        let (ctx, project_id) = fixture.setup(Arc::new(ScriptedAdapter::new()));
+
+        let draft = add_task(&ctx, &project_id, "draft");
+        let queued = add_task(&ctx, &project_id, "queued");
+        make_queued(&ctx, &queued);
+        let later = add_task(&ctx, &project_id, "later");
+        let plan = create_plan(
+            &ctx,
+            &project_id,
+            vec![vec![draft.as_str(), queued.as_str()], vec![later.as_str()]],
+        );
+
+        let scheduler = Scheduler::new(ctx.clone());
+        let started = scheduler.start_plan(&plan.id).expect("启动计划");
+
+        assert_eq!(started.status, PlanStatus::Active);
+        assert_eq!(status(&ctx, &draft), TaskStatus::Queued, "草稿任务必须入队");
+        assert_eq!(
+            status(&ctx, &queued),
+            TaskStatus::Queued,
+            "已排队任务保持 queued"
+        );
+        assert_eq!(
+            status(&ctx, &later),
+            TaskStatus::Draft,
+            "次阶段任务必须保持草稿"
+        );
+        assert_eq!(started.stages[0].status, StageStatus::Active);
+        assert_eq!(started.stages[1].status, StageStatus::Locked);
+
+        let err = scheduler
+            .start_plan(&plan.id)
+            .expect_err("重复启动必须报错");
+        assert!(err.contains("只有草稿计划"), "{err}");
+        let unchanged = {
+            let guard = ctx.db.lock().expect("数据库锁被占用");
+            store::get_plan(guard.conn(), &plan.id).expect("读取计划")
+        };
+        assert_eq!(unchanged.status, PlanStatus::Active);
+    }
+
+    #[test]
+    fn accept_stage_enqueues_next_stage_tasks() {
+        let fixture = Fixture::new("plan-accept");
+        let (ctx, project_id) = fixture.setup(Arc::new(ScriptedAdapter::new()));
+
+        let first = add_task(&ctx, &project_id, "first");
+        make_queued(&ctx, &first);
+        let second = add_task(&ctx, &project_id, "second");
+        let plan = create_plan(
+            &ctx,
+            &project_id,
+            vec![vec![first.as_str()], vec![second.as_str()]],
+        );
+
+        let scheduler = Scheduler::new(ctx.clone());
+        let started = scheduler.start_plan(&plan.id).expect("启动计划");
+        assert_eq!(started.stages[0].status, StageStatus::Active);
+        assert_eq!(status(&ctx, &second), TaskStatus::Draft);
+
+        // 首阶段任务从 queued 起步推进到 merged，覆盖非草稿迁移链。
+        merge_task(&ctx, &first);
+        let review = {
+            let guard = ctx.db.lock().expect("数据库锁被占用");
+            store::get_plan(guard.conn(), &plan.id).expect("读取计划")
+        };
+        assert_eq!(review.stages[0].status, StageStatus::Review);
+
+        let accepted = scheduler
+            .accept_stage(&review.stages[0].id)
+            .expect("验收阶段");
+
+        assert_eq!(status(&ctx, &first), TaskStatus::Merged);
+        assert_eq!(
+            status(&ctx, &second),
+            TaskStatus::Queued,
+            "新解锁阶段的任务必须入队"
+        );
+        assert_eq!(accepted.status, PlanStatus::Active);
+        assert_eq!(accepted.stages[0].status, StageStatus::Passed);
+        assert!(accepted.stages[0].passed_at.is_some());
+        assert_eq!(accepted.stages[1].status, StageStatus::Active);
     }
 }
