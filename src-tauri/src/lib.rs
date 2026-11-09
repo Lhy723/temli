@@ -1219,6 +1219,85 @@ fn vault_graph(state: State<AppState>, vault_id: String) -> Result<vaults::Graph
 }
 
 #[tauri::command]
+fn vault_tags(state: State<AppState>, vault_id: String) -> Result<Vec<vaults::VaultTag>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    vaults::vault_tags(db.conn(), &vault_id)
+}
+
+#[tauri::command]
+fn notes_by_tag(
+    state: State<AppState>,
+    vault_id: String,
+    tag: String,
+) -> Result<Vec<vaults::VaultEntry>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    vaults::notes_by_tag(db.conn(), &vault_id, &tag)
+}
+
+#[tauri::command]
+fn save_vault_attachment(
+    state: State<AppState>,
+    vault_id: String,
+    note_id: String,
+    file_name: String,
+    data_base64: String,
+) -> Result<String, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    vaults::save_vault_attachment(db.conn(), &vault_id, &note_id, &file_name, &data_base64)
+}
+
+#[tauri::command]
+fn read_vault_attachment(
+    state: State<AppState>,
+    vault_id: String,
+    relative_path: String,
+) -> Result<String, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    vaults::read_vault_attachment(db.conn(), &vault_id, &relative_path)
+}
+
+#[tauri::command]
+fn list_vault_templates(
+    state: State<AppState>,
+    vault_id: String,
+) -> Result<Vec<vaults::VaultEntry>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    vaults::list_vault_templates(db.conn(), &vault_id)
+}
+
+#[tauri::command]
+fn create_vault_note_with_content(
+    state: State<AppState>,
+    vault_id: String,
+    path: String,
+    content: String,
+) -> Result<vaults::VaultNote, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    let vault = vaults::get_vault(db.conn(), &vault_id)?;
+    vaults::create_vault_note_with_content(db.conn(), &vault, &path, &content)
+}
+
+#[tauri::command]
+fn set_note_properties(
+    state: State<AppState>,
+    note_id: String,
+    properties: std::collections::BTreeMap<String, String>,
+) -> Result<vaults::VaultNote, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    vaults::set_note_properties(db.conn(), &note_id, &properties)
+}
+
+#[tauri::command]
+fn rename_vault_note(
+    state: State<AppState>,
+    note_id: String,
+    new_path: String,
+) -> Result<vaults::VaultNote, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    vaults::rename_vault_note(db.conn(), &note_id, &new_path)
+}
+
+#[tauri::command]
 fn list_docs(
     state: State<AppState>,
     project_id: String,
@@ -1571,6 +1650,14 @@ pub fn run() {
             search_vault,
             note_backlinks,
             vault_graph,
+            vault_tags,
+            notes_by_tag,
+            save_vault_attachment,
+            read_vault_attachment,
+            list_vault_templates,
+            create_vault_note_with_content,
+            set_note_properties,
+            rename_vault_note,
             list_docs,
             get_doc,
             reindex_workspace,

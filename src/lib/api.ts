@@ -301,6 +301,12 @@ export type VaultEntry = {
   updated_at?: string | null;
 };
 
+/** 笔记库标签聚合：`count` 为引用该标签的笔记数。 */
+export type VaultTag = {
+  tag: string;
+  count: number;
+};
+
 export type VaultNote = {
   id: string;
   vault_id: string;
@@ -651,6 +657,68 @@ export function noteBacklinks(noteId: string): Promise<Backlink[]> {
 
 export function vaultGraph(vaultId: string): Promise<VaultGraph> {
   return invoke<VaultGraph>("vault_graph", { vaultId });
+}
+
+export function vaultTags(vaultId: string): Promise<VaultTag[]> {
+  return invoke<VaultTag[]>("vault_tags", { vaultId });
+}
+
+export function notesByTag(
+  vaultId: string,
+  tag: string,
+): Promise<VaultEntry[]> {
+  return invoke<VaultEntry[]>("notes_by_tag", { vaultId, tag });
+}
+
+export function saveVaultAttachment(
+  vaultId: string,
+  noteId: string,
+  fileName: string,
+  dataBase64: string,
+): Promise<string> {
+  return invoke<string>("save_vault_attachment", {
+    vaultId,
+    noteId,
+    fileName,
+    dataBase64,
+  });
+}
+
+export function readVaultAttachment(
+  vaultId: string,
+  relativePath: string,
+): Promise<string> {
+  return invoke<string>("read_vault_attachment", { vaultId, relativePath });
+}
+
+export function listVaultTemplates(vaultId: string): Promise<VaultEntry[]> {
+  return invoke<VaultEntry[]>("list_vault_templates", { vaultId });
+}
+
+export function createVaultNoteWithContent(
+  vaultId: string,
+  path: string,
+  content: string,
+): Promise<VaultNote> {
+  return invoke<VaultNote>("create_vault_note_with_content", {
+    vaultId,
+    path,
+    content,
+  });
+}
+
+export function setNoteProperties(
+  noteId: string,
+  properties: Record<string, string>,
+): Promise<VaultNote> {
+  return invoke<VaultNote>("set_note_properties", { noteId, properties });
+}
+
+export function renameVaultNote(
+  noteId: string,
+  newPath: string,
+): Promise<VaultNote> {
+  return invoke<VaultNote>("rename_vault_note", { noteId, newPath });
 }
 
 const STATUS_LABELS: Record<string, string> = {
