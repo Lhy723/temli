@@ -402,8 +402,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// 单次等待上限；正常路径下事件立即到达，仅失败时才会等满。
-    const TEST_TIMEOUT: Duration = Duration::from_millis(100);
+    /// 等待事件的单次上限。正常路径下事件几十毫秒内到达，这个值只在真的
+    /// 没有事件时用来给出可读错误；必须给足余量，否则慢 CI 机器上的线程
+    /// 启动/调度延迟会被误判成“没有事件”。
+    const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// 断言“不应再有事件”时的观察窗口。脚本事件都排在终态之前同步送入
+    /// 通道，终态读到后不会再有新事件，短窗口足以确认，又不会拖慢用例。
+    const QUIET_WINDOW: Duration = Duration::from_millis(200);
 
     fn channel_sink() -> (EventSink, Receiver<AgentEvent>) {
         let (sender, receiver) = mpsc::channel();
@@ -428,7 +434,7 @@ mod tests {
 
     fn next_event(receiver: &Receiver<AgentEvent>) -> AgentEvent {
         receiver
-            .recv_timeout(TEST_TIMEOUT)
+            .recv_timeout(EVENT_TIMEOUT)
             .expect("等待 fake 事件超时")
     }
 
@@ -565,7 +571,7 @@ mod tests {
         expect_ended(&receiver, RunStatus::Cancelled);
         expect_terminal_state(&receiver, AgentState::Cancelled);
         assert!(
-            receiver.recv_timeout(TEST_TIMEOUT).is_err(),
+            receiver.recv_timeout(QUIET_WINDOW).is_err(),
             "拒绝后不应再有任何事件"
         );
     }
@@ -586,7 +592,7 @@ mod tests {
         // 幂等：再次取消不应产生任何新事件（包括第二个 Ended）。
         adapter.cancel(&handle).unwrap();
         assert!(
-            receiver.recv_timeout(TEST_TIMEOUT).is_err(),
+            receiver.recv_timeout(QUIET_WINDOW).is_err(),
             "取消后不应再有任何事件"
         );
     }
