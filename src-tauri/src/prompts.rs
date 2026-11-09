@@ -236,7 +236,7 @@ fn kind_label(kind: &CmdKind) -> &'static str {
 
 /// Extract the first balanced `open`..`close` span, ignoring delimiters that
 /// appear inside JSON strings. Prose and markdown fences around it are ignored.
-fn extract_balanced<'a>(output: &'a str, open: char, close: char) -> Result<&'a str, String> {
+fn extract_balanced(output: &str, open: char, close: char) -> Result<&str, String> {
     let start = output
         .find(open)
         .ok_or_else(|| format!("输出中没有找到以 {open} 开头的 JSON 内容"))?;

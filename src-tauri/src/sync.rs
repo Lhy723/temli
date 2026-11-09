@@ -76,10 +76,10 @@ impl SyncEngine {
                     continue;
                 }
             }
-            if let Err(err) = self.sync_project(&project.id) {
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
+            if let Err(err) = self.sync_project(&project.id)
+                && first_error.is_none()
+            {
+                first_error = Some(err);
             }
         }
         match first_error {

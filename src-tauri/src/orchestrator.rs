@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -25,7 +25,9 @@ pub struct RunContext {
     /// 可用的 agent 适配器；任务级指派与默认值都从这里解析。
     pub adapters: Arc<AdapterRegistry>,
     /// 任务未指派开发者时使用的默认适配器 id。
-    pub default_agent: String,
+    ///
+    /// 与 AppState 共享同一份句柄；设置页保存后对新任务立即生效。
+    pub default_agent: Arc<RwLock<String>>,
     pub data_dir: PathBuf,
     /// 已启动但尚未结束的任务 id，防止同一任务被并发启动两次。
     pub running: Arc<Mutex<HashSet<String>>>,
@@ -39,10 +41,13 @@ pub struct RunContext {
     pub github: Option<Arc<dyn crate::github::GitHubOps>>,
 }
 
-/// 任务 id -> (适配器, 会话句柄)，用于取消正在运行的任务。
+/// 取消登记表中的一项：(适配器, 会话句柄)。
+type CancelEntry = (Arc<dyn AgentAdapter>, SessionHandle);
+
+/// 任务 id -> 适配器与会话句柄的映射，用于取消正在运行的任务。
 #[derive(Clone, Default)]
 pub struct CancelRegistry {
-    inner: Arc<Mutex<HashMap<String, (Arc<dyn AgentAdapter>, SessionHandle)>>>,
+    inner: Arc<Mutex<HashMap<String, CancelEntry>>>,
 }
 
 impl CancelRegistry {
@@ -502,10 +507,15 @@ fn lookup_adapter(ctx: &RunContext, role: &str, id: &str) -> Result<Arc<dyn Agen
 
 /// 任务级指派优先：开发者缺省为默认适配器，审查者缺省沿用开发者。
 fn resolve_task_agents(ctx: &RunContext, task: &TaskRow) -> Result<TaskAgents, String> {
+    let default_agent = ctx
+        .default_agent
+        .read()
+        .map_err(|_| "默认适配器锁被占用".to_string())?
+        .clone();
     let developer_id = task
         .developer_adapter
         .as_deref()
-        .unwrap_or(ctx.default_agent.as_str());
+        .unwrap_or(default_agent.as_str());
     let developer = lookup_adapter(ctx, "开发者", developer_id)?;
     let reviewer_id = task.reviewer_adapter.as_deref().unwrap_or(developer_id);
     let reviewer = lookup_adapter(ctx, "审查者", reviewer_id)?;
@@ -1206,6 +1216,10 @@ enum RebaseDisposition {
 /// 且文件数在阈值内、无高风险路径、仍有重试次数时才自动重排；冲突文件为空
 /// （rebase 因非冲突原因失败）一律转人工，不消耗自动重试次数。证据收集前的
 /// rebase 与合并前的 rebase 共用本函数，保证两条路径的策略完全一致。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "冲突处理需要同时携带运行上下文、任务标识与冲突详情，拆成结构体只会让两条调用路径更嘈杂"
+)]
 fn handle_rebase_conflict(
     ctx: &RunContext,
     project_id: &str,
@@ -1343,6 +1357,10 @@ fn rollback_to_pre_merge(repo: &Path, merged: &str, pre_merge_sha: &str) -> Opti
 /// 一定会看到前一个任务推进后的 tip，从而在锁内换基线而不是快进失败。验收命令
 /// 在锁内执行（每条最多 600s）是刻意取舍：宁可合并排队，也不能让“验证过的提交”
 /// 与“最终合并的提交”之间的基线再次移动。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "合并流程的每一步都依赖这些独立事实（仓库、worktree、分支、head、运行 id 等），收拢成结构体反而隐藏调用约束"
+)]
 fn merge_and_verify(
     ctx: &RunContext,
     repo: &Path,
@@ -1499,6 +1517,10 @@ fn mark_pr_state(
 /// `merge_lock` 内串行，且合并只钉在复核过的 `head` 上。合并走 squash，默认分支
 /// 上的提交是新提交，不能与 `head` 做严格 SHA 相等校验；这里改为要求拉取后默认
 /// 分支确实前进了。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "自动合并需要完整的 PR 与任务上下文，参数均为调用点已持有的独立值"
+)]
 fn auto_merge_pull_request(
     ctx: &RunContext,
     cfg: &AutoMergeConfig,
@@ -1646,7 +1668,7 @@ fn auto_merge_pull_request(
 
     // 合并必须钉在刚复核过的被审查 head 上，避免 checks 之后新推的提交被一并合并。
     cfg.ops
-        .merge_pull_request(&cfg.repo, pr.number, &head)
+        .merge_pull_request(&cfg.repo, pr.number, head)
         .map_err(|err| AutoMergeFailure::PullRequest {
             url: pr.url.clone(),
             message: format!("合并 PR 失败：{err}"),
@@ -1775,8 +1797,7 @@ fn event_sink(
                 options,
                 ..
             } = &event
-            {
-                if let Ok(decision) = store::open_decision(
+                && let Ok(decision) = store::open_decision(
                     guard.conn(),
                     NewDecision {
                         project_id: project_id.clone(),
@@ -1786,17 +1807,17 @@ fn event_sink(
                         prompt: format!("{title}\n{detail}\n请求 {request_id}"),
                         options: options.clone(),
                     },
-                ) {
-                    if let Ok(mut map) = decisions.lock() {
-                        map.insert(request_id.clone(), decision.id);
-                    }
-                    approval_notice = Some(match (title.trim(), detail.trim()) {
-                        ("", "") => String::new(),
-                        ("", detail) => detail.to_string(),
-                        (title, "") => title.to_string(),
-                        (title, detail) => format!("{title}：{detail}"),
-                    });
+                )
+            {
+                if let Ok(mut map) = decisions.lock() {
+                    map.insert(request_id.clone(), decision.id);
                 }
+                approval_notice = Some(match (title.trim(), detail.trim()) {
+                    ("", "") => String::new(),
+                    ("", detail) => detail.to_string(),
+                    (title, "") => title.to_string(),
+                    (title, detail) => format!("{title}：{detail}"),
+                });
             }
             let _ = store::append_event(
                 guard.conn(),
@@ -1884,16 +1905,16 @@ fn wait_for_approval(
                 .ok();
             row
         };
-        if let Some((status, resolution)) = resolved {
-            if status == "resolved" {
-                let decision = match resolution.as_deref() {
-                    Some("allow") | Some("approve") | Some("retry") => Decision::Allow,
-                    Some(other) => Decision::Select(other.to_string()),
-                    None => Decision::Deny,
-                };
-                adapter.respond(handle, request_id, decision)?;
-                return Ok(true);
-            }
+        if let Some((status, resolution)) = resolved
+            && status == "resolved"
+        {
+            let decision = match resolution.as_deref() {
+                Some("allow") | Some("approve") | Some("retry") => Decision::Allow,
+                Some(other) => Decision::Select(other.to_string()),
+                None => Decision::Deny,
+            };
+            adapter.respond(handle, request_id, decision)?;
+            return Ok(true);
         }
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -1935,10 +1956,10 @@ fn run_acceptance(
                 outcome.exit_code, criterion.expect_exit
             ));
         }
-        if let Some(fragment) = criterion.expect_match.as_deref() {
-            if !body.contains(fragment) {
-                notes.push(format!("输出未包含 {fragment:?}"));
-            }
+        if let Some(fragment) = criterion.expect_match.as_deref()
+            && !body.contains(fragment)
+        {
+            notes.push(format!("输出未包含 {fragment:?}"));
         }
         if outcome.timed_out {
             notes.push("执行超时".to_string());
@@ -2638,6 +2659,9 @@ mod tests {
         }
     }
 
+    /// 首次读取检查时写入的取消意图：(共享取消集合, 任务 id)。
+    type CancelOnChecks = Option<(Arc<Mutex<HashSet<String>>>, String)>;
+
     /// 只覆盖自动合并用到的 GitHub 操作；其余方法在测试里不会被调用。
     struct FakeGitHubOps {
         checks: Mutex<Vec<CheckRun>>,
@@ -2649,7 +2673,7 @@ mod tests {
         /// `fetch + pull --ff-only` 验证。
         repo: Mutex<Option<PathBuf>>,
         /// 首次读取检查时写入取消意图，模拟轮询期间的取消请求。
-        cancel_on_checks: Mutex<Option<(Arc<Mutex<HashSet<String>>>, String)>>,
+        cancel_on_checks: Mutex<CancelOnChecks>,
         /// 远端合并成功后把本地默认分支改成分叉提交，模拟本地同步失败。
         diverge_local: Mutex<bool>,
         /// 前 N 次读取检查返回网络错误，模拟 TLS 抖动。
@@ -2952,7 +2976,7 @@ mod tests {
         let ctx = RunContext {
             db: Arc::new(Mutex::new(db)),
             adapters: Arc::new(registry),
-            default_agent,
+            default_agent: Arc::new(RwLock::new(default_agent)),
             data_dir: db_dir.join("data"),
             running: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cancels: CancelRegistry::new(),

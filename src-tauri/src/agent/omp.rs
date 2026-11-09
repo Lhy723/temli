@@ -550,10 +550,10 @@ fn read_stdout(
 
         if frame_type == "response" {
             // get_state 的响应：记录 omp 的 sessionId。
-            if let Some(session_id) = extract_session_id(&frame) {
-                if let Ok(mut ids) = session_ids.lock() {
-                    ids.insert(handle_id.clone(), session_id);
-                }
+            if let Some(session_id) = extract_session_id(&frame)
+                && let Ok(mut ids) = session_ids.lock()
+            {
+                ids.insert(handle_id.clone(), session_id);
             }
             let command = response_command(&frame);
             if command.eq_ignore_ascii_case("negotiate_protocol")
@@ -1074,10 +1074,10 @@ fn tool_name(frame: &Value) -> String {
 }
 
 fn tool_summary(frame: &Value) -> String {
-    if let Some(summary) = lookup_str(frame, &["summary", "title", "description"]) {
-        if !summary.is_empty() {
-            return truncate(summary, SUMMARY_LIMIT);
-        }
+    if let Some(summary) = lookup_str(frame, &["summary", "title", "description"])
+        && !summary.is_empty()
+    {
+        return truncate(summary, SUMMARY_LIMIT);
     }
     if let Some(args) = frame
         .get("args")
@@ -1190,7 +1190,7 @@ impl RpcChunkBuffer {
             .and_then(Value::as_str)
             .ok_or_else(|| "rpc_chunk 缺少 data".to_string())?;
 
-        if count < 2 || count > MAX_CHUNK_COUNT || index >= count {
+        if !(2..=MAX_CHUNK_COUNT).contains(&count) || index >= count {
             return self.reject("rpc_chunk 的 count/index 非法");
         }
         if byte_length == 0 || byte_length > MAX_FRAME_BYTES as u64 {
@@ -1274,12 +1274,12 @@ impl RpcChunkBuffer {
 /// 严格的标准 base64 解码：只接受带规范填充、尾位为零的输入。
 fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err("长度不是 4 的倍数".to_string());
     }
     let quad_count = bytes.len() / 4;
     let mut output = Vec::with_capacity(quad_count * 3);
-    for (quad_index, quad) in bytes.chunks_exact(4).enumerate() {
+    for (quad_index, quad) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let last_quad = quad_index + 1 == quad_count;
         let mut values = [0u8; 4];
         let mut padding = 0usize;
