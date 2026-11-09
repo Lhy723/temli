@@ -405,8 +405,45 @@ const AUTO_MERGE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const AUTO_MERGE_CHECK_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(not(test))]
 const AUTO_MERGE_CHECK_TIMEOUT: Duration = Duration::from_secs(600);
+/// 测试超时只决定“何时放弃”，不参与成功路径：给足余量，慢机器上的调度/
+/// 进程抖动不会把“下一次读取就成功”的重试误判成超时。需要验证超时放弃的
+/// 用例通过 [`with_check_poll_timeout`] 按线程缩短，不依赖这个默认值。
 #[cfg(test)]
-const AUTO_MERGE_CHECK_TIMEOUT: Duration = Duration::from_millis(150);
+const AUTO_MERGE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+thread_local! {
+    /// 单元测试按线程覆盖检查轮询超时，避免并行用例互相影响。
+    static CHECK_POLL_TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// 检查轮询的总超时；生产环境恒为 [`AUTO_MERGE_CHECK_TIMEOUT`]，测试可以在
+/// 当前线程覆盖（见 [`with_check_poll_timeout`]）。
+fn check_poll_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = CHECK_POLL_TIMEOUT_OVERRIDE.with(|cell| cell.get()) {
+        return timeout;
+    }
+    AUTO_MERGE_CHECK_TIMEOUT
+}
+
+/// 测试辅助：`body` 执行期间把当前线程的检查轮询超时改成 `timeout`；退出
+/// （包括 panic 展开）时恢复原值。
+#[cfg(test)]
+fn with_check_poll_timeout<T>(timeout: Duration, body: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Duration>);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CHECK_POLL_TIMEOUT_OVERRIDE.with(|cell| cell.set(self.0.take()));
+        }
+    }
+
+    let previous = CHECK_POLL_TIMEOUT_OVERRIDE.with(|cell| cell.replace(Some(timeout)));
+    let _reset = Reset(previous);
+    body()
+}
 
 /// 永远不会再变绿的检查结论；出现任意一条就没必要继续轮询到超时。
 const FAILED_CHECK_BUCKETS: &[&str] = &[
@@ -1510,7 +1547,7 @@ fn auto_merge_pull_request(
         })?;
     }
 
-    let deadline = Instant::now() + AUTO_MERGE_CHECK_TIMEOUT;
+    let deadline = Instant::now() + check_poll_timeout();
     loop {
         // 取消必须能在下一次轮询前生效：PR 尚未合并，直接停在当前状态。
         if cancel_requested(ctx, &task.id) {
@@ -2617,6 +2654,8 @@ mod tests {
         diverge_local: Mutex<bool>,
         /// 前 N 次读取检查返回网络错误，模拟 TLS 抖动。
         checks_failures: Mutex<usize>,
+        /// 每次读取检查前的人为延迟，模拟慢机器 / 慢 API。
+        checks_delay: Mutex<Option<Duration>>,
     }
 
     impl FakeGitHubOps {
@@ -2630,11 +2669,18 @@ mod tests {
                 cancel_on_checks: Mutex::new(None),
                 diverge_local: Mutex::new(false),
                 checks_failures: Mutex::new(0),
+                checks_delay: Mutex::new(None),
             }
         }
 
         fn fail_checks_times(&self, times: usize) {
             *self.checks_failures.lock().unwrap() = times;
+        }
+
+        /// 让每次读取检查都耗时 `delay`，用于验证慢环境下重试也不会被
+        /// 截止时间误杀。
+        fn delay_checks(&self, delay: Duration) {
+            *self.checks_delay.lock().unwrap() = Some(delay);
         }
 
         fn simulate_merge_in(&self, repo: PathBuf) {
@@ -2711,6 +2757,10 @@ mod tests {
         }
 
         fn pull_request_checks(&self, _repo: &str, _number: u64) -> Result<Vec<CheckRun>, String> {
+            let delay = *self.checks_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
             self.calls.lock().unwrap().push("pull_request_checks");
             {
                 let mut failures = self.checks_failures.lock().unwrap();
@@ -4385,6 +4435,9 @@ mod tests {
     fn auto_merge_retries_transient_check_read_failures() {
         let ops = Arc::new(FakeGitHubOps::new(vec![green_check("ci", "success")]));
         ops.fail_checks_times(2);
+        // 每次读取都耗时 150ms：三次读取（两次失败 + 一次成功）远低于
+        // cfg(test) 的轮询超时，验证慢机器上重试不会因墙钟被误判成超时。
+        ops.delay_checks(Duration::from_millis(150));
         let (ctx, task_id) = setup_full(
             "test -f done.txt",
             |_| Arc::new(ScriptedAdapter),
@@ -4413,7 +4466,12 @@ mod tests {
         let repo = repo_of(&ctx, &task_id);
         ops.simulate_merge_in(repo);
 
-        run_task_blocking(&ctx, &task_id).unwrap();
+        // “放弃”只由截止时间触发：按线程把超时缩短到几百毫秒，让本用例快速
+        // 走到超时分支；默认测试超时留给“重试后应成功”的用例，避免慢机器
+        // 上的调度抖动把重试误判成超时。
+        with_check_poll_timeout(Duration::from_millis(300), || {
+            run_task_blocking(&ctx, &task_id).unwrap();
+        });
 
         assert_eq!(status(&ctx, &task_id), TaskStatus::NeedsHuman);
         assert!(ops.merged.lock().unwrap().is_empty(), "持续失败不得合并");

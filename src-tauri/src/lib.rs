@@ -1253,8 +1253,13 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                 show_main_window(tray.app_handle());
             }
         });
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
+    // macOS 菜单栏用模板图标（黑色 + alpha），由系统随浅色/深色外观反色；
+    // 其它平台沿用窗口图标。模板缺失时退回窗口图标。
+    let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))
+        .ok()
+        .or_else(|| app.default_window_icon().cloned());
+    if let Some(icon) = tray_icon {
+        builder = builder.icon(icon).icon_as_template(true);
     }
     builder.build(app)?;
     Ok(())
