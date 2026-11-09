@@ -158,6 +158,56 @@ function taskAgentInfo(task: TaskSummary | TaskDetail["task"]): TaskAgentInfo {
   };
 }
 
+// nextActor 由状态推导：需要人处理的状态标「待你」，Agent 驱动的状态标「Agent」。
+const NEXT_ACTOR_TAGS: Record<
+  string,
+  { label: string; className: string; title: string }
+> = {
+  needs_human: {
+    label: "待你",
+    className:
+      "bg-[var(--warning-soft)] text-[var(--warning-soft-foreground)]",
+    title: "下一步需要你处理",
+  },
+  failed: {
+    label: "待你",
+    className:
+      "bg-[var(--warning-soft)] text-[var(--warning-soft-foreground)]",
+    title: "下一步需要你处理",
+  },
+  interrupted: {
+    label: "待你",
+    className:
+      "bg-[var(--warning-soft)] text-[var(--warning-soft-foreground)]",
+    title: "下一步需要你处理",
+  },
+  queued: {
+    label: "Agent",
+    className:
+      "bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]",
+    title: "下一步由 Agent 推进",
+  },
+  running: {
+    label: "Agent",
+    className:
+      "bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]",
+    title: "下一步由 Agent 推进",
+  },
+};
+
+function NextActorTag({ status }: { status: string }) {
+  const next = NEXT_ACTOR_TAGS[status];
+  if (!next) return null;
+  return (
+    <span
+      className={`rounded px-1.5 py-0.5 text-label leading-none ${next.className}`}
+      title={next.title}
+    >
+      {next.label}
+    </span>
+  );
+}
+
 function adapterLabel(adapters: AgentManifest[], id: string | null): string {
   if (!id) return "默认适配器";
   const name = adapters.find((adapter) => adapter.id === id)?.name;
@@ -1581,6 +1631,7 @@ function TaskCard({
         <Chip size="sm" variant="soft" color={statusTone(task.status)}>
           {statusLabel(task.status)}
         </Chip>
+        <NextActorTag status={task.status} />
         {task.auto_docs === true && (
           <Chip size="sm" variant="soft" color="accent">
             文档
@@ -1941,7 +1992,7 @@ function TaskTable({
   onSelect: (taskId: string) => void;
 }) {
   const columns =
-    "grid-cols-[minmax(0,1fr)_78px_48px_48px_84px]";
+    "grid-cols-[minmax(0,1fr)_78px_56px_48px_48px_84px]";
 
   return (
     <div className="overflow-hidden rounded-[10px] border border-[var(--border)]">
@@ -1950,6 +2001,7 @@ function TaskTable({
       >
         <span>名称</span>
         <span>状态</span>
+        <span>下一步</span>
         <span>尝试</span>
         <span>验收</span>
         <span>创建</span>
@@ -1972,6 +2024,9 @@ function TaskTable({
             >
               {statusLabel(task.status)}
             </Chip>
+          </span>
+          <span>
+            <NextActorTag status={task.status} />
           </span>
           <span className="text-[var(--muted)]">{task.attempts}</span>
           <span className="text-[var(--muted)]">{task.criterion_count}</span>
