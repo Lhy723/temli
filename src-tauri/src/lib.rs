@@ -27,7 +27,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use store::{Criterion, DecisionRow, EventRow, TaskDetail, TaskSummary};
 use tauri::{
     Manager, State, WindowEvent,
@@ -105,6 +105,12 @@ struct UpdateIssueInput {
     title: Option<String>,
     #[serde(default)]
     body: Option<String>,
+    /// 指派人登录名；不传表示不改动。
+    #[serde(default)]
+    assignee: Option<String>,
+    /// `"open"` / `"closed"`；不传表示不改动。
+    #[serde(default)]
+    state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,12 +344,10 @@ fn plan_acceptance(
         let _ = tx.send(event);
     });
     let spec = RunSpec {
-        run_id: uuid::Uuid::new_v4().to_string(),
         cwd: repo.to_path_buf(),
         prompt,
         model: None,
         max_minutes: 2,
-        max_cost_usd: None,
         env_allowlist: Vec::new(),
     };
     let handle = adapter.start(spec, sink).ok()?;
@@ -422,12 +426,10 @@ fn run_plan(
         let _ = tx.send(event);
     });
     let spec = RunSpec {
-        run_id: uuid::Uuid::new_v4().to_string(),
         cwd: PathBuf::from(&project.repo_path),
         prompt,
         model: None,
         max_minutes: 3,
-        max_cost_usd: None,
         env_allowlist: Vec::new(),
     };
     let handle = adapter
@@ -842,9 +844,13 @@ fn sync_now(state: State<AppState>, project_id: String) -> Result<(), String> {
 
 #[tauri::command]
 fn update_issue(state: State<AppState>, input: UpdateIssueInput) -> Result<(), String> {
-    state
-        .sync
-        .update_remote_issue(&input.item_id, input.title, input.body)
+    state.sync.update_remote_issue(
+        &input.item_id,
+        input.title,
+        input.body,
+        input.assignee,
+        input.state,
+    )
 }
 
 #[tauri::command]
@@ -1112,7 +1118,12 @@ fn list_context(
     store::task_context_meta(db.conn(), &task_id)
 }
 
-/// 启动时回收 worktree：先让 git 清掉失效登记，再删除项目目录下未被 git 登记的残留目录。
+/// 登记但 run 行已消失的 worktree（例如任务行被手工清理）的保留窗口；
+/// 失败/需决策任务的 run 行仍在库，不受影响。窗口内一律保留，供排查。
+const ORPHAN_WORKTREE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// 启动时回收 worktree：先让 git 清掉失效登记，再删除项目目录下未被 git 登记的
+/// 残留目录；登记仍在但 run 行已消失的孤儿按保留窗口回收。
 fn cleanup_worktrees(db: &Db, data_dir: &Path) {
     let projects = match db.list_projects() {
         Ok(projects) => projects,
@@ -1142,6 +1153,7 @@ fn cleanup_worktrees(db: &Db, data_dir: &Path) {
             // 项目还没有产生过 worktree。
             Err(_) => continue,
         };
+        let mut reclaimed = false;
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() {
@@ -1149,17 +1161,63 @@ fn cleanup_worktrees(db: &Db, data_dir: &Path) {
             }
             let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
             if registered.contains(&canonical) {
+                if reclaim_orphan_worktree(
+                    db.conn(),
+                    &path,
+                    SystemTime::now() - ORPHAN_WORKTREE_RETENTION,
+                ) {
+                    reclaimed = true;
+                }
                 continue;
             }
             if let Err(err) = std::fs::remove_dir_all(&path) {
                 eprintln!("删除残留 worktree {} 失败：{err}", path.display());
             }
         }
+        if reclaimed {
+            if let Err(err) = gitops::prune_worktrees(repo) {
+                eprintln!("回收孤儿 worktree 后清理登记失败：{err}");
+            }
+        }
     }
 }
 
+/// 回收孤儿 worktree：git 登记仍在，但对应 `runs` 行已被清理（任务行被手工
+/// 删除时不会自动移除 worktree）。修改时间早于 `cutoff` 才回收，返回是否删除。
+fn reclaim_orphan_worktree(conn: &rusqlite::Connection, path: &Path, cutoff: SystemTime) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let has_run: i64 = match conn.query_row(
+        "SELECT COUNT(*) FROM runs WHERE id = ?1",
+        params![name],
+        |row| row.get(0),
+    ) {
+        Ok(count) => count,
+        Err(err) => {
+            eprintln!("查询 run {name} 失败，保留 worktree：{err}");
+            return false;
+        }
+    };
+    if has_run > 0 {
+        return false;
+    }
+    let modified = match std::fs::metadata(path).and_then(|meta| meta.modified()) {
+        Ok(modified) => modified,
+        Err(_) => return false,
+    };
+    if modified >= cutoff {
+        return false;
+    }
+    if let Err(err) = std::fs::remove_dir_all(path) {
+        eprintln!("回收孤儿 worktree {} 失败：{err}", path.display());
+        return false;
+    }
+    true
+}
+
 /// 显示并聚焦主窗口；窗口尚未创建时静默跳过。
-fn show_main_window(app: &tauri::AppHandle) {
+pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -1464,6 +1522,35 @@ mod tests {
 
     fn criteria_json(cmd: &str) -> String {
         format!(r#"[{{"id":"c-1","cmd":"{cmd}","expect_exit":0}}]"#)
+    }
+
+    #[test]
+    fn update_issue_input_matches_frontend_contract() {
+        // 字段名与 `src/lib/api.ts` 的 `UpdateIssueInput` 一一对应。
+        let input: UpdateIssueInput = serde_json::from_value(serde_json::json!({
+            "item_id": "i-1",
+            "title": "标题",
+            "body": "正文",
+            "assignee": "octocat",
+            "state": "closed",
+        }))
+        .unwrap();
+        assert_eq!(input.item_id, "i-1");
+        assert_eq!(input.title.as_deref(), Some("标题"));
+        assert_eq!(input.body.as_deref(), Some("正文"));
+        assert_eq!(input.assignee.as_deref(), Some("octocat"));
+        assert_eq!(input.state.as_deref(), Some("closed"));
+
+        // 省略的可选字段为 None，表示远端保持不变。
+        let input: UpdateIssueInput = serde_json::from_value(serde_json::json!({
+            "item_id": "i-1",
+            "state": "open",
+        }))
+        .unwrap();
+        assert!(input.title.is_none());
+        assert!(input.body.is_none());
+        assert!(input.assignee.is_none());
+        assert_eq!(input.state.as_deref(), Some("open"));
     }
 
     #[test]
@@ -1867,6 +1954,77 @@ mod tests {
         assert!(registered.iter().all(|path| path != &worktree));
     }
 
+    #[test]
+    fn cleanup_worktrees_keeps_fresh_orphans_and_reclaims_expired_ones() {
+        let fixture = WorktreeFixture::new("orphan-window");
+        let repo = fixture.repo.canonicalize().expect("规范化仓库路径");
+        let project = fixture
+            .db
+            .insert_project(
+                RegisterProjectInput {
+                    repo_path: repo.to_string_lossy().into_owned(),
+                    name: Some("demo".to_string()),
+                    github_owner: None,
+                    github_repo: None,
+                    default_branch: Some("main".to_string()),
+                },
+                repo.clone(),
+            )
+            .expect("登记项目");
+
+        let base = gitops::rev_parse(&repo, "main").expect("读取初始提交");
+        let project_root = fixture.data_dir.join("worktrees").join(&project.id);
+        fs::create_dir_all(&project_root).expect("创建 worktree 根目录");
+        // 登记仍在、但 run 行已被清理的孤儿（手工 DB 清理的产物）。
+        let orphan = project_root.join("run-dead");
+        gitops::create_worktree(&repo, &orphan, "temli/cleanup-run-dead", &base)
+            .expect("创建孤儿 worktree");
+        // run 行仍在的登记 worktree：失败现场按 PRD 保留调试。
+        let conn = fixture.db.conn();
+        conn.execute(
+            "INSERT INTO items (id, project_id, kind, title, status, created_at)
+             VALUES ('item-alive', ?1, 'issue', 'alive', 'queued',
+                     strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            rusqlite::params![project.id],
+        )
+        .expect("插入 item");
+        conn.execute(
+            "INSERT INTO tasks (id, item_id, acceptance_json, prompt, attempts)
+             VALUES ('task-alive', 'item-alive', '[]', 'p', 0)",
+            [],
+        )
+        .expect("插入 task");
+        conn.execute(
+            "INSERT INTO runs (id, task_id, attempt, adapter_id) VALUES ('run-alive', 'task-alive', 1, 'fake')",
+            [],
+        )
+        .expect("插入 run");
+        let alive = project_root.join("run-alive");
+        gitops::create_worktree(&repo, &alive, "temli/cleanup-run-alive", &base)
+            .expect("创建在跑 run 的 worktree");
+
+        // 保留窗口内：孤儿新鲜，不回收；run 行仍在的更不回收。
+        cleanup_worktrees(&fixture.db, &fixture.data_dir);
+        assert!(orphan.exists(), "窗口内的孤儿 worktree 应保留调试");
+        assert!(alive.exists(), "run 行仍在的 worktree 应保留");
+
+        // 超过保留窗口：孤儿回收并清掉登记；run 行仍在的原样保留。
+        let cutoff = std::time::SystemTime::now() + Duration::from_secs(3600);
+        assert!(
+            reclaim_orphan_worktree(fixture.db.conn(), &orphan, cutoff),
+            "超窗孤儿应被回收"
+        );
+        assert!(!orphan.exists(), "超窗孤儿目录应被删除");
+        assert!(
+            !reclaim_orphan_worktree(fixture.db.conn(), &alive, cutoff),
+            "run 行仍在的 worktree 不应回收"
+        );
+        assert!(alive.exists(), "run 行仍在的 worktree 目录应保留");
+        gitops::prune_worktrees(&repo).expect("清理登记");
+        let registered = gitops::list_worktrees(&repo).expect("列出 worktree");
+        assert!(registered.iter().all(|path| path != &orphan));
+    }
+
     fn planned_issue(title: &str, cmd: &str, depends_on: Vec<usize>) -> planner::PlanIssue {
         planner::PlanIssue {
             title: title.to_string(),
@@ -2136,12 +2294,10 @@ mod tests {
             let _ = tx.send(event);
         });
         let spec = RunSpec {
-            run_id: "live-plan".into(),
             cwd: fixture.repo.clone(),
             prompt,
             model: None,
             max_minutes: 10,
-            max_cost_usd: None,
             env_allowlist: Vec::new(),
         };
         let handle = adapter.start(spec, sink).expect("启动 OMP 会话");

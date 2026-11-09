@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   Button,
   Card,
@@ -16,7 +17,7 @@ import { DecisionInbox } from "./components/DecisionInbox";
 import { TasksPanel } from "./components/TasksPanel";
 import { Vaults } from "./components/Vaults";
 import { Workspace } from "./components/Workspace";
-import type { GlobalHit } from "./lib/api";
+import { getTask, type GlobalHit } from "./lib/api";
 import {
   Bot,
   ChevronDown,
@@ -165,6 +166,40 @@ export default function App() {
     }
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
+  }, []);
+
+  // 点击系统通知：解析任务所属项目，切到“我的任务”并打开对应任务。
+  useEffect(() => {
+    let disposed = false;
+    let request = 0;
+    let unlisten: (() => void) | null = null;
+    listen<{ task_id?: string }>("navigate-task", (event) => {
+      const taskId = event.payload?.task_id;
+      if (!taskId) return;
+      const seq = ++request;
+      void getTask(taskId)
+        .then((detail) => {
+          if (disposed || seq !== request) return;
+          switchProject(detail.task.project_id);
+          setFocusTaskId(taskId);
+          open("my");
+        })
+        .catch((e) => {
+          if (!disposed && seq === request) setError(String(e));
+        });
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch((e) => {
+        if (!disposed) setError(String(e));
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+    // 监听只注册一次；状态更新通过 setState 与组件内函数完成，不依赖当次渲染的闭包值。
   }, []);
 
   const current =

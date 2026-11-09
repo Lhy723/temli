@@ -28,6 +28,7 @@ pub struct IssuePatch {
     pub title: Option<String>,
     pub body: Option<String>,
     pub state: Option<String>,
+    /// 指派人：`Some(Some(login))` 设为该登录名，`Some(None)` 清空指派，`None` 不变。
     pub assignee: Option<Option<String>>,
     /// 本地持有的 `updated_at`；用于乐观并发校验。
     pub expected_updated_at: String,
@@ -281,26 +282,7 @@ impl GitHubOps for GhOps {
             return Err("远端已变更".to_string());
         }
 
-        let mut payload = Map::new();
-        if let Some(title) = &patch.title {
-            payload.insert("title".to_string(), Value::String(title.to_string()));
-        }
-        if let Some(body) = &patch.body {
-            payload.insert("body".to_string(), Value::String(body.to_string()));
-        }
-        if let Some(state) = &patch.state {
-            payload.insert("state".to_string(), Value::String(state.to_string()));
-        }
-        if let Some(assignee) = &patch.assignee {
-            payload.insert(
-                "assignee".to_string(),
-                match assignee {
-                    Some(login) => Value::String(login.to_string()),
-                    None => Value::Null,
-                },
-            );
-        }
-        let body = Value::Object(payload).to_string();
+        let body = issue_patch_payload(patch);
 
         let url = format!("{API_BASE}/repos/{repo}/issues/{number}");
         let resp = self.call("PATCH", &url, Some(&body), None)?;
@@ -364,6 +346,31 @@ impl GitHubOps for GhOps {
 
 fn merge_pull_request_payload(sha: &str) -> String {
     serde_json::json!({ "merge_method": "squash", "sha": sha }).to_string()
+}
+
+/// 组装 PATCH body：只有显式传入的字段才出现；`expected_updated_at` 仅用于本地校验。
+///
+/// 指派人按 GitHub 的 `assignees` 数组提交：`Some(Some(login))` 设为该登录名，
+/// `Some(None)` 传空数组移除全部指派（前端暂不暴露移除入口）。
+fn issue_patch_payload(patch: &IssuePatch) -> String {
+    let mut payload = Map::new();
+    if let Some(title) = &patch.title {
+        payload.insert("title".to_string(), Value::String(title.to_string()));
+    }
+    if let Some(body) = &patch.body {
+        payload.insert("body".to_string(), Value::String(body.to_string()));
+    }
+    if let Some(state) = &patch.state {
+        payload.insert("state".to_string(), Value::String(state.to_string()));
+    }
+    if let Some(assignee) = &patch.assignee {
+        let assignees = match assignee {
+            Some(login) => vec![Value::String(login.to_string())],
+            None => Vec::new(),
+        };
+        payload.insert("assignees".to_string(), Value::Array(assignees));
+    }
+    Value::Object(payload).to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -807,6 +814,50 @@ mod tests {
         let value: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["merge_method"], "squash");
         assert_eq!(value["sha"], "abc123");
+    }
+
+    fn patch_payload(patch: IssuePatch) -> Value {
+        serde_json::from_str(&issue_patch_payload(&patch)).unwrap()
+    }
+
+    #[test]
+    fn issue_patch_payload_includes_state_and_assignee() {
+        let value = patch_payload(IssuePatch {
+            state: Some("closed".to_string()),
+            assignee: Some(Some("octocat".to_string())),
+            expected_updated_at: "2026-01-01T00:00:00Z".to_string(),
+            ..IssuePatch::default()
+        });
+        assert_eq!(value["state"], "closed");
+        assert_eq!(value["assignees"], serde_json::json!(["octocat"]));
+        // 使用 GitHub 的复数键，避免旧的单数键残留。
+        assert!(value.get("assignee").is_none());
+        assert!(value.get("title").is_none());
+        assert!(value.get("body").is_none());
+        // 乐观并发用的本地时间戳绝不能出现在 PATCH 正文里。
+        assert!(value.get("expected_updated_at").is_none());
+    }
+
+    #[test]
+    fn issue_patch_payload_omits_untouched_fields() {
+        let value = patch_payload(IssuePatch {
+            title: Some("新标题".to_string()),
+            expected_updated_at: "2026-01-01T00:00:00Z".to_string(),
+            ..IssuePatch::default()
+        });
+        assert_eq!(value["title"], "新标题");
+        assert!(value.get("state").is_none());
+        assert!(value.get("assignees").is_none());
+    }
+
+    #[test]
+    fn issue_patch_payload_clears_assignees_with_empty_array() {
+        let value = patch_payload(IssuePatch {
+            assignee: Some(None),
+            expected_updated_at: "2026-01-01T00:00:00Z".to_string(),
+            ..IssuePatch::default()
+        });
+        assert_eq!(value["assignees"], serde_json::json!([]));
     }
 
     #[test]

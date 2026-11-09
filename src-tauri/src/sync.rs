@@ -133,6 +133,8 @@ impl SyncEngine {
             match existing {
                 Some(item_id) => {
                     // 只覆盖 GitHub 侧字段；`items.status` 属于本地状态机。
+                    // 远端 `closed` 写回 `github_state` 与 `github_updated_at`，
+                    // 任务状态保持不变。
                     tx.execute(
                         "UPDATE items
                          SET title = ?2,
@@ -220,14 +222,18 @@ impl SyncEngine {
     /// 本地编辑已发布的 issue。
     ///
     /// 先读取远端当前 `updated_at`，与本地保存值不一致时返回
-    /// [`REMOTE_CHANGED`]，绝不覆盖别人的修改。
+    /// [`REMOTE_CHANGED`]，绝不覆盖别人的修改。`assignee` / `state` 为 `None`
+    /// 时保持远端不变；成功后把远端返回的 GitHub 侧字段（含关闭后的
+    /// `github_state`）回写本地，本地任务状态机不受影响。
     pub fn update_remote_issue(
         &self,
         item_id: &str,
         title: Option<String>,
         body: Option<String>,
+        assignee: Option<String>,
+        state: Option<String>,
     ) -> Result<(), String> {
-        if title.is_none() && body.is_none() {
+        if title.is_none() && body.is_none() && assignee.is_none() && state.is_none() {
             return Ok(());
         }
 
@@ -260,8 +266,9 @@ impl SyncEngine {
         let patch = IssuePatch {
             title,
             body,
-            state: None,
-            assignee: None,
+            state,
+            // 前端只实现设置指派人，没有移除入口。
+            assignee: assignee.map(Some),
             expected_updated_at: remote.updated_at,
         };
         let updated = self
@@ -281,11 +288,18 @@ impl SyncEngine {
                 "UPDATE items
                  SET title = ?2,
                      body = ?3,
-                     github_updated_at = ?4,
+                     github_state = ?4,
+                     github_updated_at = ?5,
                      ghost = 0,
                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
                  WHERE id = ?1",
-                params![item_id, updated.title, updated.body, updated.updated_at],
+                params![
+                    item_id,
+                    updated.title,
+                    updated.body,
+                    updated.state,
+                    updated.updated_at
+                ],
             )
             .map_err(db_err)?;
         Ok(())
@@ -528,6 +542,9 @@ mod tests {
             if let Some(state) = &patch.state {
                 issue.state = state.clone();
             }
+            if let Some(assignee) = &patch.assignee {
+                issue.assignee = assignee.clone();
+            }
             issue.updated_at = REMOTE_UPDATED.to_string();
             Ok(issue.clone())
         }
@@ -648,6 +665,16 @@ mod tests {
                     row.get(4)?,
                 ))
             },
+        )
+        .unwrap()
+    }
+
+    fn github_updated_at(conn: &Connection, project_id: &str, number: i64) -> String {
+        conn.query_row(
+            "SELECT github_updated_at FROM items
+             WHERE project_id = ?1 AND github_number = ?2",
+            params![project_id, number],
+            |row| row.get(0),
         )
         .unwrap()
     }
@@ -896,7 +923,7 @@ mod tests {
             .unwrap();
 
         let err = engine
-            .update_remote_issue(&item_id, Some("本地标题".to_string()), None)
+            .update_remote_issue(&item_id, Some("本地标题".to_string()), None, None, None)
             .unwrap_err();
         assert_eq!(err, REMOTE_CHANGED);
         assert!(ops.patches().is_empty());
@@ -930,7 +957,7 @@ mod tests {
             .unwrap();
 
         engine
-            .update_remote_issue(&item_id, Some("本地新标题".to_string()), None)
+            .update_remote_issue(&item_id, Some("本地新标题".to_string()), None, None, None)
             .unwrap();
 
         let patches = ops.patches();
@@ -953,6 +980,181 @@ mod tests {
             )
             .unwrap();
         assert_eq!(updated_at, REMOTE_UPDATED);
+    }
+
+    #[test]
+    fn remote_update_sets_assignee_and_close_state() {
+        let db = Arc::new(Mutex::new(open_db()));
+        let project_id = project_with_github(&db.lock().unwrap());
+        let ops = FakeOps::new(vec![issue(
+            7,
+            "远端标题",
+            "远端正文",
+            "open",
+            "2026-01-01T00:00:00Z",
+        )]);
+        let engine = engine(&db, &ops);
+        engine.sync_project(&project_id).unwrap();
+
+        let item_id: String = db
+            .lock()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT id FROM items WHERE project_id = ?1 AND github_number = 7",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        engine
+            .update_remote_issue(
+                &item_id,
+                None,
+                None,
+                Some("octocat".to_string()),
+                Some("closed".to_string()),
+            )
+            .unwrap();
+
+        let patches = ops.patches();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].0, 7);
+        assert_eq!(patches[0].1.expected_updated_at, "2026-01-01T00:00:00Z");
+        let assignee = patches[0].1.assignee.clone().flatten();
+        assert_eq!(assignee.as_deref(), Some("octocat"));
+        assert_eq!(patches[0].1.state.as_deref(), Some("closed"));
+        // 未编辑的字段不进入 patch。
+        assert!(patches[0].1.title.is_none());
+        assert!(patches[0].1.body.is_none());
+
+        let (title, body, status, github_state, ghost) =
+            item_by_number(db.lock().unwrap().conn(), &project_id, 7);
+        assert_eq!(title, "远端标题");
+        assert_eq!(body, "远端正文");
+        // 关闭只改 GitHub 侧状态，本地任务状态机不动。
+        assert_eq!(status, "open");
+        assert_eq!(github_state.as_deref(), Some("closed"));
+        assert!(!ghost);
+        let updated_at: String = db
+            .lock()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT github_updated_at FROM items WHERE id = ?1",
+                params![item_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_at, REMOTE_UPDATED);
+    }
+
+    #[test]
+    fn stale_local_close_is_rejected() {
+        let db = Arc::new(Mutex::new(open_db()));
+        let project_id = project_with_github(&db.lock().unwrap());
+        let ops = FakeOps::new(vec![issue(
+            7,
+            "远端标题",
+            "远端正文",
+            "open",
+            "2026-01-02T00:00:00Z",
+        )]);
+        let engine = engine(&db, &ops);
+        engine.sync_project(&project_id).unwrap();
+
+        let item_id: String = db
+            .lock()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT id FROM items WHERE project_id = ?1 AND github_number = 7",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // 模拟本地时间戳落后于远端。
+        db.lock()
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE items SET github_updated_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+                params![item_id],
+            )
+            .unwrap();
+
+        let err = engine
+            .update_remote_issue(
+                &item_id,
+                None,
+                None,
+                Some("octocat".to_string()),
+                Some("closed".to_string()),
+            )
+            .unwrap_err();
+        assert_eq!(err, REMOTE_CHANGED);
+        // 冲突时绝不发 PATCH，也不改本地 GitHub 侧状态。
+        assert!(ops.patches().is_empty());
+        let (_, _, _, github_state, ghost) =
+            item_by_number(db.lock().unwrap().conn(), &project_id, 7);
+        assert_eq!(github_state.as_deref(), Some("open"));
+        assert!(!ghost);
+    }
+
+    #[test]
+    fn remote_close_writes_back_github_state() {
+        let db = Arc::new(Mutex::new(open_db()));
+        let project_id = project_with_github(&db.lock().unwrap());
+        let ops = FakeOps::new(vec![issue(
+            7,
+            "标题",
+            "正文",
+            "open",
+            "2026-01-01T00:00:00Z",
+        )]);
+        let engine = engine(&db, &ops);
+        engine.sync_project(&project_id).unwrap();
+
+        ops.set_issues(vec![issue(
+            7,
+            "标题",
+            "正文",
+            "closed",
+            "2026-03-01T00:00:00Z",
+        )]);
+        engine.sync_project(&project_id).unwrap();
+
+        {
+            let db = db.lock().unwrap();
+            let (_, _, status, github_state, ghost) = item_by_number(db.conn(), &project_id, 7);
+            assert_eq!(status, "open");
+            assert_eq!(github_state.as_deref(), Some("closed"));
+            assert!(!ghost);
+            let updated_at = github_updated_at(db.conn(), &project_id, 7);
+            assert_eq!(updated_at, "2026-03-01T00:00:00Z");
+        }
+
+        // 远端消失再以 closed 重新出现：ghost 清除，关闭状态与时间戳一并回写。
+        ops.set_issues(Vec::new());
+        engine.sync_project(&project_id).unwrap();
+        let (_, _, _, _, ghost) = item_by_number(db.lock().unwrap().conn(), &project_id, 7);
+        assert!(ghost);
+
+        ops.set_issues(vec![issue(
+            7,
+            "标题",
+            "正文",
+            "closed",
+            "2026-03-02T00:00:00Z",
+        )]);
+        engine.sync_project(&project_id).unwrap();
+        let db = db.lock().unwrap();
+        let (_, _, status, github_state, ghost) = item_by_number(db.conn(), &project_id, 7);
+        assert_eq!(status, "open");
+        assert_eq!(github_state.as_deref(), Some("closed"));
+        assert!(!ghost);
+        let updated_at = github_updated_at(db.conn(), &project_id, 7);
+        assert_eq!(updated_at, "2026-03-02T00:00:00Z");
     }
 
     #[test]

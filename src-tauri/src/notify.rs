@@ -5,8 +5,9 @@
 
 use std::sync::OnceLock;
 
-use tauri::AppHandle;
-use tauri_plugin_notification::NotificationExt;
+use serde::Serialize;
+use tauri::{AppHandle, Emitter};
+use tauri_plugin_notification::{ActionPerformed, NotificationExt};
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
 
@@ -14,29 +15,81 @@ static APP: OnceLock<AppHandle> = OnceLock::new();
 const MAX_TITLE_CHARS: usize = 80;
 /// 通知正文里决策原因最多保留的字符数（含省略号）。
 const MAX_REASON_CHARS: usize = 160;
+/// 通知点击上报里携带任务 id 的 extra 键。
+const TASK_ID_EXTRA_KEY: &str = "taskId";
+/// 点击通知后发给前端的任务跳转事件名。
+const NAVIGATE_EVENT: &str = "navigate-task";
+
+/// 发给前端的任务跳转事件载荷。
+#[derive(Clone, Serialize)]
+struct NavigateTask<'a> {
+    task_id: &'a str,
+}
 
 /// 保存主窗口的 `AppHandle`，之后后台线程用它发送系统通知。
 ///
-/// 重复调用（例如窗口重建）沿用首个句柄即可。
+/// 同时注册通知点击回调：点击通知会显示主窗口，并把任务 id 转发给前端。
+/// 重复调用（例如窗口重建）沿用首个句柄与已注册的回调即可。
 pub fn init(app: AppHandle) {
-    let _ = APP.set(app);
+    if APP.set(app.clone()).is_err() {
+        return;
+    }
+    if let Err(err) = app.notification().on_action(on_action) {
+        eprintln!("注册系统通知点击回调失败：{err}");
+    }
 }
 
 /// 任务进入终态（合并 / 需要决策 / 失败 / 中止）后通知用户。
-pub fn task_finished(title: &str, status: &str) {
-    send(status_title(status), &task_body(title, status));
+///
+/// `task_id` 随通知一起保存，用户点击通知时据此打开对应任务。
+pub fn task_finished(title: &str, status: &str, task_id: &str) {
+    send(status_title(status), &task_body(title, status), task_id);
 }
 
 /// 打开人工决策（Agent 审批等）后提醒用户处理。
-pub fn decision(reason: &str) {
-    send("需要决策", &decision_body(reason));
+pub fn decision(reason: &str, task_id: &str) {
+    send("需要决策", &decision_body(reason), task_id);
 }
 
-fn send(title: &str, body: &str) {
+/// 通知被点击：显示主窗口并把任务 id 转发给前端。
+fn on_action(performed: &ActionPerformed) {
+    let Some(task_id) = tapped_task_id(performed) else {
+        return;
+    };
     let Some(app) = APP.get() else {
         return;
     };
-    if let Err(err) = app.notification().builder().title(title).body(body).show() {
+    crate::show_main_window(app);
+    if let Err(err) = app.emit(NAVIGATE_EVENT, NavigateTask { task_id }) {
+        eprintln!("发送任务跳转事件失败：{err}");
+    }
+}
+
+/// 只处理点击通知正文（`tap`），且通知没有携带任务 id 时忽略。
+fn tapped_task_id(performed: &ActionPerformed) -> Option<&str> {
+    if performed.action_id() != "tap" {
+        return None;
+    }
+    let task_id = performed
+        .notification()?
+        .extra()
+        .get(TASK_ID_EXTRA_KEY)?
+        .as_str()?;
+    (!task_id.is_empty()).then_some(task_id)
+}
+
+fn send(title: &str, body: &str, task_id: &str) {
+    let Some(app) = APP.get() else {
+        return;
+    };
+    if let Err(err) = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .extra(TASK_ID_EXTRA_KEY, task_id)
+        .show()
+    {
         // 用户拒绝通知权限、平台不支持等情况都不应影响任务流程。
         eprintln!("发送系统通知失败：{err}");
     }
@@ -103,6 +156,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauri_plugin_notification::ActionPerformed;
 
     #[test]
     fn terminal_statuses_map_to_titles() {
@@ -162,10 +216,37 @@ mod tests {
     }
 
     #[test]
+    fn notification_tap_yields_task_id() {
+        let tapped: ActionPerformed = serde_json::from_value(serde_json::json!({
+            "actionId": "tap",
+            "inputValue": null,
+            "notification": { "id": 1, "extra": { "taskId": "task-1" } },
+        }))
+        .expect("action payload");
+        assert_eq!(tapped_task_id(&tapped), Some("task-1"));
+
+        let dismissed: ActionPerformed = serde_json::from_value(serde_json::json!({
+            "actionId": "dismiss",
+            "inputValue": null,
+            "notification": { "id": 2, "extra": { "taskId": "task-2" } },
+        }))
+        .expect("action payload");
+        assert_eq!(tapped_task_id(&dismissed), None);
+
+        let without_task: ActionPerformed = serde_json::from_value(serde_json::json!({
+            "actionId": "tap",
+            "inputValue": null,
+            "notification": { "id": 3 },
+        }))
+        .expect("action payload");
+        assert_eq!(tapped_task_id(&without_task), None);
+    }
+
+    #[test]
     fn sending_before_init_is_a_no_op() {
         // 测试进程没有 Tauri 运行时：未初始化时必须静默返回而不是 panic。
-        task_finished("修复登录崩溃", "merged");
-        task_finished("修复登录崩溃", "failed");
-        decision("执行命令");
+        task_finished("修复登录崩溃", "merged", "task-1");
+        task_finished("修复登录崩溃", "failed", "task-2");
+        decision("执行命令", "task-3");
     }
 }
