@@ -28,7 +28,7 @@
 
 ## 关键验证
 
-- `cargo test --lib`：299 passed，1 ignored（需真实 OMP 的 live 规划测试）
+- `cargo test --lib`：301 passed，1 ignored（需真实 OMP 的 live 规划测试）
 - `npm run build`：通过
 - `npm run tauri build`：通过，产物 `temli.app`（7.05 MiB）与 `temli_0.1.0_aarch64.dmg`（3.54 MiB）
 - `cargo build`：0 warning（M13 死代码清零）
@@ -76,7 +76,7 @@
 ## 验证命令
 
 ```bash
-cd src-tauri && cargo test --lib          # 299 passed, 1 ignored
+cd src-tauri && cargo test --lib          # 301 passed, 1 ignored
 npm run build                             # 前端类型检查 + 构建
 npm run tauri build                       # release .app + .dmg
 cargo test --lib live_plan_generation_with_omp -- --ignored --nocapture
