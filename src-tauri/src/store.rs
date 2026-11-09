@@ -202,6 +202,24 @@ pub struct ReviewRow {
     pub test_diff: Vec<String>,
 }
 
+/// 审查页列表项：review 关联到 run / task，并汇总该 run 的验收证据通过情况
+/// （只统计 `criterion_id IS NOT NULL` 的证据，artifact / review 辅助证据不计入，
+/// 通过数按 `exit_code = 0` 计）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewListItem {
+    pub run_id: String,
+    pub task_id: String,
+    pub task_title: String,
+    pub verdict: String,
+    pub summary: Option<String>,
+    pub risk_flags: Vec<String>,
+    pub test_diff: Vec<String>,
+    pub created_at: String,
+    pub evidence_total: i64,
+    pub evidence_passed: i64,
+    pub pr_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionRow {
     pub id: String,
@@ -1112,6 +1130,38 @@ pub fn list_project_issues(
     rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
 }
 
+/// 项目下最近的审查列表，按审查时间倒序，最多 100 条。
+///
+/// 证据统计只统计该次 run 的验收证据（`criterion_id IS NOT NULL`）：artifact /
+/// review 这类辅助证据不挂在验收标准上，不计入分母。通过数在同一集合上按
+/// `exit_code = 0` 计，未取到 exit code 的证据不算通过。
+pub fn list_reviews(conn: &Connection, project_id: &str) -> Result<Vec<ReviewListItem>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT rev.run_id, t.id, i.title, rev.verdict, rev.summary,
+                    rev.risk_flags_json, rev.test_diff_json, rev.created_at,
+                    (SELECT COUNT(*) FROM evidence e
+                     WHERE e.run_id = rev.run_id AND e.criterion_id IS NOT NULL),
+                    (SELECT COALESCE(SUM(e.exit_code = 0), 0)
+                     FROM evidence e
+                     WHERE e.run_id = rev.run_id AND e.criterion_id IS NOT NULL),
+                    r.pr_url
+             FROM reviews rev
+             JOIN runs r ON r.id = rev.run_id
+             JOIN tasks t ON t.id = r.task_id
+             JOIN items i ON i.id = t.item_id
+             WHERE i.project_id = ?1
+             ORDER BY rev.created_at DESC, rev.rowid DESC
+             LIMIT 100",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![project_id], read_review_list_item)
+        .map_err(db_err)?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+}
+
 fn query_task_summaries(
     conn: &Connection,
     project_id: Option<&str>,
@@ -1848,6 +1898,24 @@ fn read_review_row(row: &Row<'_>) -> rusqlite::Result<ReviewRow> {
     })
 }
 
+fn read_review_list_item(row: &Row<'_>) -> rusqlite::Result<ReviewListItem> {
+    let risk_flags_json: String = row.get(5)?;
+    let test_diff_json: String = row.get(6)?;
+    Ok(ReviewListItem {
+        run_id: row.get(0)?,
+        task_id: row.get(1)?,
+        task_title: row.get(2)?,
+        verdict: row.get(3)?,
+        summary: row.get(4)?,
+        risk_flags: parse_string_list(&risk_flags_json).map_err(|e| invalid_value(5, e))?,
+        test_diff: parse_string_list(&test_diff_json).map_err(|e| invalid_value(6, e))?,
+        created_at: row.get(7)?,
+        evidence_total: row.get(8)?,
+        evidence_passed: row.get(9)?,
+        pr_url: row.get(10)?,
+    })
+}
+
 fn read_decision_row(row: &Row<'_>) -> rusqlite::Result<DecisionRow> {
     Ok(DecisionRow {
         id: row.get(0)?,
@@ -2136,6 +2204,20 @@ mod tests {
             exit_code: Some(exit_code),
             duration_ms: Some(42),
             output_path,
+        }
+    }
+
+    /// 不挂验收标准的辅助证据：artifact / review 两类，退出码为 0 也不该计入
+    /// 验收证据的通过数。
+    fn auxiliary_evidence(run_id: &str, kind: &str) -> NewEvidence {
+        NewEvidence {
+            run_id: run_id.to_string(),
+            criterion_id: None,
+            kind: kind.into(),
+            cmd: None,
+            exit_code: Some(0),
+            duration_ms: Some(7),
+            output_path: None,
         }
     }
 
@@ -3529,5 +3611,96 @@ mod tests {
 
         assert!(set_project_require_checks(conn, "missing-project", true).is_err());
         assert!(project_require_checks(conn, "missing-project").is_err());
+    }
+
+    #[test]
+    fn list_reviews_orders_by_created_at_and_counts_evidence() {
+        let db = open_db();
+        let project_id = project(&db);
+        let conn = db.conn();
+
+        let task = create_task(conn, new_task(&project_id, criteria())).unwrap();
+
+        // 第一次运行：审查通过、无风险，1 条证据通过。
+        let pass_run = start_task_run(&db, &task.id);
+        set_review(
+            conn,
+            NewReview {
+                run_id: pass_run.id.clone(),
+                verdict: "pass".into(),
+                summary: Some("证据齐全".into()),
+                risk_flags: vec![],
+                test_diff: vec![],
+            },
+        )
+        .unwrap();
+        add_evidence(conn, evidence(&pass_run.id, "c1", 0)).unwrap();
+
+        // 第二次运行：待人工、带风险标记，2 条证据其中 1 条失败。
+        let human_run = start_task_run(&db, &task.id);
+        set_review(
+            conn,
+            NewReview {
+                run_id: human_run.id.clone(),
+                verdict: "needs_human".into(),
+                summary: Some("测试断言被放宽".into()),
+                risk_flags: vec!["test_weakened".into()],
+                test_diff: vec!["tests/gate.rs +1/-1".into()],
+            },
+        )
+        .unwrap();
+        add_evidence(conn, evidence(&human_run.id, "c1", 0)).unwrap();
+        add_evidence(conn, evidence(&human_run.id, "c2", 1)).unwrap();
+
+        // artifact / review 辅助证据的 criterion_id 为 NULL：退出码为 0 也不计入
+        // 验收证据的分母或通过数。
+        for (run_id, kind) in [
+            (pass_run.id.as_str(), "artifact"),
+            (pass_run.id.as_str(), "review"),
+            (human_run.id.as_str(), "artifact"),
+            (human_run.id.as_str(), "review"),
+        ] {
+            add_evidence(conn, auxiliary_evidence(run_id, kind)).unwrap();
+        }
+
+        // 固定时间戳，避免两条 review 落在同一毫秒导致顺序不稳定。
+        for (run_id, created_at) in [
+            (pass_run.id.as_str(), "2025-01-01T00:00:00.000Z"),
+            (human_run.id.as_str(), "2025-01-02T00:00:00.000Z"),
+        ] {
+            conn.execute(
+                "UPDATE reviews SET created_at = ?2 WHERE run_id = ?1",
+                params![run_id, created_at],
+            )
+            .unwrap();
+        }
+
+        let rows = list_reviews(conn, &project_id).unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let latest = &rows[0];
+        assert_eq!(latest.run_id, human_run.id);
+        assert_eq!(latest.task_id, task.id);
+        assert_eq!(latest.task_title, "实现证据门");
+        assert_eq!(latest.verdict, "needs_human");
+        assert_eq!(latest.summary.as_deref(), Some("测试断言被放宽"));
+        assert_eq!(latest.risk_flags, vec!["test_weakened".to_string()]);
+        assert_eq!(latest.test_diff, vec!["tests/gate.rs +1/-1".to_string()]);
+        assert_eq!(latest.created_at, "2025-01-02T00:00:00.000Z");
+        // 只统计验收证据：2 条挂验收标准的证据，额外 2 条辅助证据被排除。
+        assert_eq!(latest.evidence_total, 2);
+        assert_eq!(latest.evidence_passed, 1);
+        assert_eq!(latest.pr_url, None);
+
+        let previous = &rows[1];
+        assert_eq!(previous.run_id, pass_run.id);
+        assert_eq!(previous.verdict, "pass");
+        assert!(previous.risk_flags.is_empty());
+        assert!(previous.test_diff.is_empty());
+        // 全绿 run：辅助证据退出码为 0 也不进入统计，因此 total == passed。
+        assert_eq!(previous.evidence_total, 1);
+        assert_eq!(previous.evidence_passed, 1);
+
+        assert!(list_reviews(conn, "missing-project").unwrap().is_empty());
     }
 }

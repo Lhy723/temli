@@ -1081,7 +1081,7 @@ export function TasksPanel({
   return (
     <div className="relative flex h-full min-h-0 gap-3">
       <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 pb-2">
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 pb-3">
           <div className="flex items-center gap-2">
             <span className="flex items-center gap-1.5 text-ui-sm text-[var(--muted)]">
               <CircleDot size={14} />
@@ -1096,11 +1096,11 @@ export function TasksPanel({
                 {pendingIssues.length} 个 issue 待创建
               </span>
             )}
-            <div className="flex items-center rounded-md border border-[var(--border)] p-0.5">
+            <div className="flex h-8 items-center rounded-lg border border-[var(--border)] p-0.5">
               <Button
                 variant={view === "board" ? "secondary" : "ghost"}
                 size="sm"
-                className="h-6 gap-1 px-2 text-ui-sm"
+                className="h-7 gap-1 px-2 text-ui-sm"
                 aria-pressed={view === "board"}
                 onPress={() => setView("board")}
               >
@@ -1110,7 +1110,7 @@ export function TasksPanel({
               <Button
                 variant={view === "table" ? "secondary" : "ghost"}
                 size="sm"
-                className="h-6 gap-1 px-2 text-ui-sm"
+                className="h-7 gap-1 px-2 text-ui-sm"
                 aria-pressed={view === "table"}
                 onPress={() => setView("table")}
               >
@@ -1119,52 +1119,61 @@ export function TasksPanel({
               </Button>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <Switch
-              size="sm"
-              isSelected={autoMerge === true}
-              isDisabled={autoMerge === null || autoMergeSaving}
-              onChange={(enabled) => void saveAutoMerge(enabled)}
-              className="text-ui-sm text-[var(--muted)]"
+          <div className="flex flex-wrap items-center gap-2">
+            <div
+              className="flex h-8 items-center gap-3 rounded-lg bg-[var(--background-secondary)] px-2.5"
+              title="要求 CI checks：无 checks 时阻止自动合并 · 自动更新文档：合并后创建文档任务"
             >
-              <Switch.Content>
-                <Switch.Control>
-                  <Switch.Thumb />
-                </Switch.Control>
-                自动合并
-              </Switch.Content>
-            </Switch>
-            <Switch
-              size="sm"
-              isSelected={requireChecks === true}
-              isDisabled={requireChecks === null || requireChecksSaving}
-              onChange={(enabled) => void saveRequireChecks(enabled)}
-              className="text-ui-sm text-[var(--muted)]"
-            >
-              <Switch.Content>
-                <Switch.Control>
-                  <Switch.Thumb />
-                </Switch.Control>
-                要求 CI checks
-              </Switch.Content>
-              <Description>无 checks 时阻止自动合并</Description>
-            </Switch>
-            <Switch
-              size="sm"
-              isSelected={autoDocs === true}
-              isDisabled={autoDocs === null || autoDocsSaving}
-              onChange={(enabled) => void saveAutoDocs(enabled)}
-              className="text-ui-sm text-[var(--muted)]"
-            >
-              <Switch.Content>
-                <Switch.Control>
-                  <Switch.Thumb />
-                </Switch.Control>
-                自动更新文档
-              </Switch.Content>
-              <Description>合并后创建文档任务</Description>
-            </Switch>
-            <div className="flex items-center gap-1 text-ui-sm text-[var(--muted)]">
+              <Switch
+                size="sm"
+                isSelected={autoMerge === true}
+                isDisabled={autoMerge === null || autoMergeSaving}
+                onChange={(enabled) => void saveAutoMerge(enabled)}
+                className="text-ui-sm text-[var(--muted)]"
+              >
+                <Switch.Content>
+                  <Switch.Control>
+                    <Switch.Thumb />
+                  </Switch.Control>
+                  自动合并
+                </Switch.Content>
+              </Switch>
+              <Switch
+                size="sm"
+                isSelected={requireChecks === true}
+                isDisabled={requireChecks === null || requireChecksSaving}
+                onChange={(enabled) => void saveRequireChecks(enabled)}
+                className="text-ui-sm text-[var(--muted)]"
+              >
+                <Switch.Content>
+                  <Switch.Control>
+                    <Switch.Thumb />
+                  </Switch.Control>
+                  要求 CI checks
+                </Switch.Content>
+                <Description className="sr-only">
+                  无 checks 时阻止自动合并
+                </Description>
+              </Switch>
+              <Switch
+                size="sm"
+                isSelected={autoDocs === true}
+                isDisabled={autoDocs === null || autoDocsSaving}
+                onChange={(enabled) => void saveAutoDocs(enabled)}
+                className="text-ui-sm text-[var(--muted)]"
+              >
+                <Switch.Content>
+                  <Switch.Control>
+                    <Switch.Thumb />
+                  </Switch.Control>
+                  自动更新文档
+                </Switch.Content>
+                <Description className="sr-only">
+                  合并后创建文档任务
+                </Description>
+              </Switch>
+            </div>
+            <div className="flex h-8 items-center gap-1.5 rounded-lg bg-[var(--background-secondary)] px-2 text-ui-sm text-[var(--muted)]">
               <span className="shrink-0">并发</span>
               <Input
                 aria-label="项目并发上限"
@@ -1177,7 +1186,7 @@ export function TasksPanel({
                   setConcurrencyInput(e.target.value);
                   setConcurrencyError(null);
                 }}
-                className="h-7 w-16 text-ui"
+                className="h-7 w-14 text-ui"
                 disabled={concurrency === null || concurrencySaving}
               />
               <span className="shrink-0">当前 {concurrency ?? "…"}</span>
@@ -1196,7 +1205,7 @@ export function TasksPanel({
             <Button
               variant="secondary"
               size="sm"
-              className="h-7 gap-1 px-2.5 text-ui"
+              className="h-8 gap-1 px-3 text-ui"
               aria-pressed={showPlan}
               onPress={() => {
                 setShowPlan((prev) => !prev);
@@ -1210,7 +1219,7 @@ export function TasksPanel({
             <Button
               variant="primary"
               size="sm"
-              className="h-7 gap-1 px-2.5 text-ui"
+              className="h-8 gap-1 px-3 text-ui"
               onPress={() => {
                 setShowCreate((prev) => !prev);
                 setShowPlan(false);
@@ -1225,37 +1234,37 @@ export function TasksPanel({
 
         {(concurrencyError ||
           (concurrencyDirty && !concurrencyValid)) && (
-          <p role="alert" className="mb-2 text-ui-sm text-[var(--danger)]">
+          <p role="alert" className="mb-1 text-ui-sm text-[var(--danger)]">
             {concurrencyError ?? "并发上限需为 1–16 的整数。"}
           </p>
         )}
 
         {autoMergeError && (
-          <p role="alert" className="mb-2 text-ui-sm text-[var(--danger)]">
+          <p role="alert" className="mb-1 text-ui-sm text-[var(--danger)]">
             {autoMergeError}
           </p>
         )}
 
         {requireChecksError && (
-          <p role="alert" className="mb-2 text-ui-sm text-[var(--danger)]">
+          <p role="alert" className="mb-1 text-ui-sm text-[var(--danger)]">
             {requireChecksError}
           </p>
         )}
 
         {autoDocsError && (
-          <p role="alert" className="mb-2 text-ui-sm text-[var(--danger)]">
+          <p role="alert" className="mb-1 text-ui-sm text-[var(--danger)]">
             {autoDocsError}
           </p>
         )}
 
         {error && (
-          <p role="alert" className="mb-2 text-ui-sm text-[var(--danger)]">
+          <p role="alert" className="mb-1 text-ui-sm text-[var(--danger)]">
             {error}
           </p>
         )}
 
         {issuesError && (
-          <p role="alert" className="mb-2 text-ui-sm text-[var(--danger)]">
+          <p role="alert" className="mb-1 text-ui-sm text-[var(--danger)]">
             issue 加载失败：{issuesError}
           </p>
         )}
@@ -1296,14 +1305,15 @@ export function TasksPanel({
                   size={20}
                   className="text-[var(--muted)] opacity-70"
                 />
-                <p className="text-ui text-[var(--muted)]">
-                  还没有任务。新建一个任务开始执行。
+                <p className="text-ui font-medium">还没有任务</p>
+                <p className="text-ui-sm text-[var(--muted)]">
+                  新建一个任务开始执行。
                 </p>
                 {!showCreate && (
                   <Button
                     variant="secondary"
                     size="sm"
-                    className="h-7 px-3 text-ui"
+                    className="mt-1 h-8 px-3 text-ui"
                     onPress={() => {
                       setShowCreate(true);
                       setShowPlan(false);
@@ -1333,14 +1343,14 @@ export function TasksPanel({
             )}
 
           {!loading && view === "table" && pendingIssues.length > 0 && (
-            <div className="mb-2 flex items-center justify-between gap-2 rounded-md border border-dashed border-[var(--border)] px-2 py-1.5">
+            <div className="mb-3 flex items-center justify-between gap-2 rounded-[10px] border border-dashed border-[var(--border)] px-3 py-2">
               <p className="text-ui-sm text-[var(--muted)]">
                 另有 {pendingIssues.length} 个 issue 尚未创建任务。
               </p>
               <Button
                 variant="secondary"
                 size="sm"
-                className="h-6 gap-1 px-2 text-ui-sm"
+                className="h-7 gap-1 px-2.5 text-ui-sm"
                 onPress={() => setView("board")}
               >
                 <LayoutGrid size={13} />
@@ -1467,32 +1477,32 @@ function TaskBoard({
   }
 
   return (
-    <div className="flex min-w-0 flex-col gap-1.5 pb-2">
+    <div className="flex min-w-0 flex-col gap-3">
       {issuesLoading && (
-        <div className="rounded-md border border-dashed border-[var(--border)] px-2 py-1.5">
+        <div className="rounded-[10px] border border-dashed border-[var(--border)] px-3 py-2">
           <p className="text-ui-sm text-[var(--muted)]">issue 加载中…</p>
         </div>
       )}
       {/* 窄窗口下四列不折行：列容器横向滚动，列自身保持固定宽度。 */}
-      <div className="flex min-h-full min-w-0 items-start gap-2 overflow-x-auto">
+      <div className="flex min-h-full min-w-0 items-start gap-3 overflow-x-auto pb-1">
         {columns.map((column) => (
           <section
             key={column.key}
             aria-label={column.title}
-            className="flex w-[224px] min-w-[200px] shrink-0 flex-col gap-1.5"
+            className="flex w-[280px] shrink-0 flex-col gap-2"
           >
-            <div className="flex items-center justify-between px-0.5">
+            <div className="flex h-8 items-center justify-between px-1">
               <span className="text-ui-sm font-medium">{column.title}</span>
-              <span className="text-label text-[var(--muted)]">
+              <span className="rounded-full bg-[var(--background-tertiary)] px-1.5 py-0.5 text-label leading-none tabular-nums text-[var(--muted)]">
                 {column.tasks.length + column.issues.length}
               </span>
             </div>
             {column.tasks.length === 0 && column.issues.length === 0 ? (
-              <p className="rounded-md border border-dashed border-[var(--border)] px-2 py-3 text-center text-ui-sm text-[var(--muted)]">
+              <p className="rounded-[10px] border border-dashed border-[var(--border)] px-3 py-6 text-center text-ui-sm text-[var(--muted)]">
                 暂无任务
               </p>
             ) : (
-              <div className="grid gap-1.5">
+              <div className="grid gap-2">
                 {column.issues.map((issue) => (
                   <IssueCard
                     key={`issue-${issue.id}`}
@@ -1555,17 +1565,19 @@ function TaskCard({
           onSelect(task.id);
         }
       }}
-      className={`anim-fast min-w-0 cursor-pointer rounded-md border bg-[var(--background)] px-2 py-1.5 hover:bg-[var(--background-secondary)] ${
-        selected ? "border-[var(--accent)]" : "border-[var(--border)]"
+      className={`lift-hover min-w-0 cursor-pointer rounded-[10px] border bg-[var(--background)] p-3 ${
+        selected
+          ? "border-[var(--accent)]"
+          : "border-[var(--border)] hover:border-[var(--border-secondary)]"
       }`}
     >
       <p
-        className="line-clamp-2 break-words text-ui-sm font-medium"
+        className="line-clamp-2 break-words text-ui font-medium leading-[1.4]"
         title={task.title}
       >
         {task.title}
       </p>
-      <div className="mt-1 flex flex-wrap items-center gap-1">
+      <div className="mt-2 flex flex-wrap items-center gap-1.5">
         <Chip size="sm" variant="soft" color={statusTone(task.status)}>
           {statusLabel(task.status)}
         </Chip>
@@ -1581,10 +1593,10 @@ function TaskCard({
           验收 {task.criterion_count}
         </span>
       </div>
-      <div className="mt-1 flex flex-wrap items-center gap-1">
+      <div className="mt-2 flex flex-wrap items-center gap-1.5">
         {issue && issue.github_number != null && (
           <span
-            className="rounded border border-[var(--border)] px-1 font-mono text-label text-[var(--muted)]"
+            className="rounded bg-[var(--background-tertiary)] px-1.5 py-0.5 font-mono text-label leading-none text-[var(--muted)]"
             title={issue.title}
           >
             #{issue.github_number}
@@ -1610,20 +1622,20 @@ function TaskCard({
           </Chip>
         )}
         <span
-          className="rounded border border-[var(--border)] px-1 text-label text-[var(--muted)]"
+          className="rounded bg-[var(--background-tertiary)] px-1.5 py-0.5 text-label leading-none text-[var(--muted)]"
           title="开发适配器"
         >
           开发 {developer ?? "默认"}
         </span>
         <span
-          className="rounded border border-[var(--border)] px-1 text-label text-[var(--muted)]"
+          className="rounded bg-[var(--background-tertiary)] px-1.5 py-0.5 text-label leading-none text-[var(--muted)]"
           title="审查适配器（未设置时跟随开发者）"
         >
           审查 {reviewer ?? "默认"}
         </span>
         {task.model && (
           <span
-            className="rounded border border-[var(--border)] px-1 text-label text-[var(--muted)]"
+            className="rounded bg-[var(--background-tertiary)] px-1.5 py-0.5 text-label leading-none text-[var(--muted)]"
             title="任务级模型覆盖"
           >
             模型 {task.model}
@@ -1650,16 +1662,16 @@ function IssueCard({
   onUpdateIssue: (input: UpdateIssueInput) => Promise<string | null>;
 }) {
   return (
-    <div className="min-w-0 rounded-md border border-dashed border-[var(--border)] bg-[var(--background)] px-2 py-1.5">
+    <div className="min-w-0 rounded-[10px] border border-dashed border-[var(--border)] bg-[var(--background)] p-3">
       <p
-        className="line-clamp-2 break-words text-ui-sm font-medium"
+        className="line-clamp-2 break-words text-ui font-medium leading-[1.4]"
         title={issue.title}
       >
         {issue.title}
       </p>
-      <div className="mt-1 flex flex-wrap items-center gap-1">
+      <div className="mt-2 flex flex-wrap items-center gap-1.5">
         {issue.github_number != null && (
-          <span className="rounded border border-[var(--border)] px-1 font-mono text-label text-[var(--muted)]">
+          <span className="rounded bg-[var(--background-tertiary)] px-1.5 py-0.5 font-mono text-label leading-none text-[var(--muted)]">
             GitHub #{issue.github_number}
           </span>
         )}
@@ -1680,14 +1692,14 @@ function IssueCard({
       <Button
         variant="secondary"
         size="sm"
-        className="mt-1.5 h-6 w-full px-2 text-ui-sm"
+        className="mt-2 h-7 w-full px-3 text-ui"
         isDisabled={creating || disabled}
         onPress={onCreate}
       >
         {creating ? "创建中…" : "创建任务"}
       </Button>
       {issue.github_number != null && !issue.ghost && (
-        <div className="mt-1.5 border-t border-[var(--border)] pt-1.5">
+        <div className="mt-2 border-t border-[var(--border)] pt-2">
           <IssueEditControls
             issue={issue}
             compact
@@ -1729,8 +1741,8 @@ function IssueEditControls({
   // 后端不返回 issue 正文，输入框留空表示只改其它字段，不覆盖远端正文。
   const bodyDirty = body.trim().length > 0;
   const closed = issue.github_state === "closed";
-  const buttonClass = compact ? "h-6 px-2 text-label" : "h-7 px-2.5 text-ui";
-  const fieldClass = compact ? "text-ui-sm" : "text-ui";
+  const buttonClass = compact ? "h-7 px-2 text-label" : "h-8 px-3 text-ui";
+  const fieldClass = compact ? "h-7 text-ui-sm" : "h-8 text-ui";
   const errorClass = compact ? "text-label" : "text-ui-sm";
 
   function openEditor() {
@@ -1846,7 +1858,7 @@ function IssueEditControls({
               }}
               disabled={saving !== null}
               fullWidth
-              className={fieldClass}
+              className={compact ? "text-ui-sm" : "text-ui"}
             />
           </label>
           <div className="flex justify-end gap-1">
@@ -1932,9 +1944,9 @@ function TaskTable({
     "grid-cols-[minmax(0,1fr)_78px_48px_48px_84px]";
 
   return (
-    <div className="overflow-hidden rounded-md border border-[var(--border)]">
+    <div className="overflow-hidden rounded-[10px] border border-[var(--border)]">
       <div
-        className={`text-ui-sm grid ${columns} gap-2 border-b border-[var(--border)] bg-[var(--background-secondary)] px-3 py-1.5 text-[var(--muted)]`}
+        className={`text-label grid ${columns} gap-2 border-b border-[var(--border)] bg-[var(--background-secondary)] px-3 py-2 font-medium uppercase tracking-[0.06em] text-[var(--muted)]`}
       >
         <span>名称</span>
         <span>状态</span>
@@ -1947,7 +1959,7 @@ function TaskTable({
           key={task.id}
           type="button"
           onClick={() => onSelect(task.id)}
-          className={`text-ui anim-fast grid ${columns} h-9 w-full items-center gap-2 border-b border-[var(--border)] px-3 text-left last:border-b-0 hover:bg-[var(--background-secondary)] ${
+          className={`text-ui anim-fast grid ${columns} h-10 w-full items-center gap-2 border-b border-[var(--border)] px-3 text-left last:border-b-0 hover:bg-[var(--background-secondary)] ${
             selectedId === task.id ? "bg-[var(--background-secondary)]" : ""
           }`}
         >
@@ -2009,9 +2021,11 @@ function CreateTaskForm({
   }
 
   return (
-    <Card className="mb-2">
+    <Card className="mb-3 max-w-[720px] rounded-[10px] p-3.5">
       <Card.Header>
-        <Card.Title className="text-ui font-medium">新建任务</Card.Title>
+        <Card.Title className="text-[15px] font-medium leading-[1.4]">
+          新建任务
+        </Card.Title>
         <Card.Description className="text-ui-sm">
           描述目标与约束，验收标准由规划 Agent 生成。
         </Card.Description>
@@ -2024,6 +2038,7 @@ function CreateTaskForm({
             placeholder="例如：为登录页补充失败态测试"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
+            className="h-8 text-ui"
           />
         </label>
         <label className="text-ui-sm grid gap-1 text-[var(--muted)]">
@@ -2034,6 +2049,7 @@ function CreateTaskForm({
             placeholder="说明要做什么、为什么，以及需要注意的约束。"
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
+            className="text-ui"
           />
         </label>
         {error && (
@@ -2046,7 +2062,7 @@ function CreateTaskForm({
         <Button
           variant="ghost"
           size="sm"
-          className="h-7 px-2.5 text-ui"
+          className="h-8 px-3 text-ui"
           onPress={onCancel}
           isDisabled={busy}
         >
@@ -2055,7 +2071,7 @@ function CreateTaskForm({
         <Button
           variant="primary"
           size="sm"
-          className="h-7 px-2.5 text-ui"
+          className="h-8 px-3 text-ui"
           onPress={submit}
           isDisabled={busy || !title.trim() || !prompt.trim()}
         >
@@ -2121,9 +2137,11 @@ function PlanPanel({
   const issueCount = draft?.issues.length ?? 0;
 
   return (
-    <Card className="mb-2">
+    <Card className="mb-3 max-w-[720px] rounded-[10px] p-3.5">
       <Card.Header>
-        <Card.Title className="text-ui font-medium">规划任务</Card.Title>
+        <Card.Title className="text-[15px] font-medium leading-[1.4]">
+          规划任务
+        </Card.Title>
         <Card.Description className="text-ui-sm">
           描述一个想法，规划 Agent 会拆成带验收标准与依赖的任务。
         </Card.Description>
@@ -2135,6 +2153,7 @@ function PlanPanel({
             aria-label="规划想法"
             rows={3}
             placeholder="例如：让项目支持按计划批量拆分任务并自动建立依赖。"
+            className="text-ui"
             value={idea}
             onChange={(e) => {
               setIdea(e.target.value);
@@ -2148,7 +2167,7 @@ function PlanPanel({
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 px-2.5 text-ui"
+            className="h-8 px-3 text-ui"
             onPress={onCancel}
             isDisabled={busy}
           >
@@ -2157,7 +2176,7 @@ function PlanPanel({
           <Button
             variant="secondary"
             size="sm"
-            className="h-7 px-2.5 text-ui"
+            className="h-8 px-3 text-ui"
             onPress={() => void generate()}
             isDisabled={busy || !idea.trim()}
           >
@@ -2171,7 +2190,7 @@ function PlanPanel({
         )}
         {draft && draft.issues.length > 0 && (
           <div className="grid gap-2">
-            <div className="max-h-72 overflow-auto rounded-md border border-[var(--border)]">
+            <div className="max-h-72 overflow-auto rounded-[10px] border border-[var(--border)]">
               {draft.issues.map((issue, index) => (
                 <div
                   key={`${index}-${issue.title}`}
@@ -2252,7 +2271,7 @@ function PlanPanel({
               <Button
                 variant="primary"
                 size="sm"
-                className="h-7 px-2.5 text-ui"
+                className="h-8 px-3 text-ui"
                 onPress={() => void create()}
                 isDisabled={busy || issueCount === 0}
               >
@@ -2497,61 +2516,61 @@ function DetailPane({
   }
 
   return (
-    <aside className="absolute inset-y-0 right-0 z-10 flex h-full w-[400px] max-w-full shrink-0 flex-col overflow-hidden rounded-md border border-[var(--border)] bg-[var(--background)] shadow-[0_8px_24px_rgba(0,0,0,0.12)] xl:static xl:w-[380px] xl:shadow-none">
-      <header className="shrink-0 border-b border-[var(--border)] px-3 py-2">
+    <aside className="absolute inset-y-0 right-0 z-10 flex h-full w-[400px] max-w-full shrink-0 flex-col overflow-hidden rounded-[10px] border border-[var(--border)] bg-[var(--background)] shadow-[0_8px_24px_rgba(0,0,0,0.12)] xl:static xl:w-[380px] xl:shadow-none">
+      <header className="shrink-0 border-b border-[var(--border)] px-3.5 py-3">
         <div className="flex items-start gap-2">
-        <div className="min-w-0 flex-1">
-          <p className="truncate text-ui font-medium">
-            {detail ? detail.task.title : "任务详情"}
-          </p>
-          {detail && (
-            <div className="mt-1 flex items-center gap-1.5 text-ui-sm text-[var(--muted)]">
-              <Chip
-                size="sm"
-                variant="soft"
-                color={statusTone(detail.task.status)}
-              >
-                {statusLabel(detail.task.status)}
-              </Chip>
-              <span>尝试 {detail.task.attempts}</span>
-              <span>{formatDate(detail.task.created_at)}</span>
-            </div>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-ui font-medium">
+              {detail ? detail.task.title : "任务详情"}
+            </p>
+            {detail && (
+              <div className="mt-1 flex items-center gap-1.5 text-ui-sm text-[var(--muted)]">
+                <Chip
+                  size="sm"
+                  variant="soft"
+                  color={statusTone(detail.task.status)}
+                >
+                  {statusLabel(detail.task.status)}
+                </Chip>
+                <span>尝试 {detail.task.attempts}</span>
+                <span>{formatDate(detail.task.created_at)}</span>
+              </div>
+            )}
+          </div>
+          {detail && canCancel && (
+            <Button
+              variant="danger-soft"
+              size="sm"
+              className="h-7 shrink-0 gap-1 px-2 text-ui"
+              onPress={onCancel}
+              isDisabled={cancelling}
+            >
+              <CircleStop size={14} />
+              {cancelling ? "取消中…" : "取消"}
+            </Button>
           )}
-        </div>
-        {detail && canCancel && (
+          {detail && (
+            <Button
+              variant="primary"
+              size="sm"
+              className="h-8 shrink-0 gap-1 px-3 text-ui"
+              onPress={onStart}
+              isDisabled={startDisabled}
+            >
+              <Play size={14} />
+              {busy ? "启动中…" : "开始执行"}
+            </Button>
+          )}
           <Button
-            variant="danger-soft"
+            isIconOnly
+            variant="ghost"
             size="sm"
-            className="h-7 shrink-0 gap-1 px-2.5 text-ui"
-            onPress={onCancel}
-            isDisabled={cancelling}
+            className="h-7 w-7 shrink-0 rounded-lg"
+            aria-label="关闭详情"
+            onPress={onClose}
           >
-            <CircleStop size={14} />
-            {cancelling ? "取消中…" : "取消"}
+            <X size={14} />
           </Button>
-        )}
-        {detail && (
-          <Button
-            variant="primary"
-            size="sm"
-            className="h-7 shrink-0 gap-1 px-2.5 text-ui"
-            onPress={onStart}
-            isDisabled={startDisabled}
-          >
-            <Play size={14} />
-            {busy ? "启动中…" : "开始执行"}
-          </Button>
-        )}
-        <Button
-          isIconOnly
-          variant="ghost"
-          size="sm"
-          className="h-7 w-7 shrink-0"
-          aria-label="关闭详情"
-          onPress={onClose}
-        >
-          <X size={14} />
-        </Button>
         </div>
         {detail && (
           <div className="mt-1.5 grid gap-1">
@@ -2768,6 +2787,7 @@ function DetailPane({
                   }}
                   disabled={modelSaving}
                   fullWidth
+                  className="h-7 text-ui"
                 />
               </div>
               <Button
@@ -2814,7 +2834,7 @@ function DetailPane({
           {loading ? "加载中…" : "未找到任务详情。"}
         </p>
       ) : (
-        <div className="min-h-0 flex-1 overflow-auto px-3 py-3">
+        <div className="min-h-0 flex-1 overflow-auto px-3.5 py-3.5">
           <div className="grid gap-4">
             <div>
               <p className="text-label font-medium uppercase tracking-wide text-[var(--muted)]">
@@ -2861,7 +2881,7 @@ function DetailPane({
               {issuesLoading && !issue ? (
                 <Muted>正在加载 GitHub 关联…</Muted>
               ) : issue && issue.github_number != null ? (
-                <div className="grid gap-1 rounded-md border border-[var(--border)] px-2 py-1.5">
+                <div className="grid gap-1 rounded-lg border border-[var(--border)] px-2.5 py-2">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="font-mono text-ui-sm">
                       #{issue.github_number}
@@ -2925,7 +2945,7 @@ function DetailPane({
                     {blockers.length === 0 ? (
                       <Muted>没有前置任务。</Muted>
                     ) : (
-                      <div className="overflow-hidden rounded-md border border-[var(--border)]">
+                      <div className="overflow-hidden rounded-[10px] border border-[var(--border)]">
                         {blockers.map((task) => (
                           <DependencyRow
                             key={task.id}
@@ -2944,7 +2964,7 @@ function DetailPane({
                     {blocks.length === 0 ? (
                       <Muted>没有下游任务。</Muted>
                     ) : (
-                      <div className="overflow-hidden rounded-md border border-[var(--border)]">
+                      <div className="overflow-hidden rounded-[10px] border border-[var(--border)]">
                         {blocks.map((task) => (
                           <DependencyRow key={task.id} task={task} />
                         ))}
@@ -3042,7 +3062,7 @@ function DetailPane({
                   {contextItems.length === 0 ? (
                     <Muted>没有关联的笔记或文档。</Muted>
                   ) : (
-                    <div className="overflow-hidden rounded-md border border-[var(--border)]">
+                    <div className="overflow-hidden rounded-[10px] border border-[var(--border)]">
                       {contextItems.map((item) => (
                         <div
                           key={`${item.kind}:${item.id}`}
@@ -3160,7 +3180,7 @@ function DetailPane({
                 icon={<Inbox size={14} />}
                 count={openDecisions.length}
               >
-                <div className="overflow-hidden rounded-md border border-[var(--border)]">
+                <div className="overflow-hidden rounded-[10px] border border-[var(--border)]">
                   {openDecisions.map((decision) => (
                     <div
                       key={decision.id}
@@ -3185,7 +3205,7 @@ function DetailPane({
                         <Button
                           variant="primary"
                           size="sm"
-                          className="h-7 px-2.5 text-ui"
+                          className="h-8 px-3 text-ui"
                           onPress={() =>
                             onResolveDecision(decision.id, "allow")
                           }
@@ -3198,7 +3218,7 @@ function DetailPane({
                         <Button
                           variant="danger-soft"
                           size="sm"
-                          className="h-7 px-2.5 text-ui"
+                          className="h-8 px-3 text-ui"
                           onPress={() =>
                             onResolveDecision(decision.id, "deny")
                           }
@@ -3221,7 +3241,7 @@ function DetailPane({
               {detail.criteria.length === 0 ? (
                 <Muted>暂无验收标准。</Muted>
               ) : (
-                <div className="overflow-hidden rounded-md border border-[var(--border)]">
+                <div className="overflow-hidden rounded-[10px] border border-[var(--border)]">
                   {detail.criteria.map((criterion) => (
                     <div
                       key={criterion.id}
@@ -3267,7 +3287,7 @@ function DetailPane({
                   {detail.runs.map((run) => (
                     <div
                       key={run.id}
-                      className="rounded-md border border-[var(--border)] px-2 py-1.5"
+                      className="rounded-lg border border-[var(--border)] px-2.5 py-2"
                     >
                       <div className="flex items-center gap-1.5">
                         <Chip
@@ -3364,7 +3384,7 @@ function DetailPane({
               {detail.evidence.length === 0 ? (
                 <Muted>暂无证据。</Muted>
               ) : (
-                <div className="overflow-hidden rounded-md border border-[var(--border)]">
+                <div className="overflow-hidden rounded-[10px] border border-[var(--border)]">
                   {detail.evidence.map((item) => (
                     <div
                       key={item.id}
@@ -3414,7 +3434,7 @@ function DetailPane({
               {!review ? (
                 <Muted>尚未审查。</Muted>
               ) : (
-                <div className="grid gap-2 rounded-md border border-[var(--border)] px-2 py-1.5">
+                <div className="grid gap-2 rounded-lg border border-[var(--border)] px-2.5 py-2">
                   <div className="flex items-center gap-1.5">
                     <Chip
                       size="sm"
@@ -3479,7 +3499,7 @@ function DetailPane({
                   {events.map((event) => (
                     <div
                       key={event.id}
-                      className="rounded-md border border-[var(--border)] px-2 py-1"
+                      className="rounded-lg border border-[var(--border)] px-2 py-1"
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span className="min-w-0 truncate text-ui-sm">
@@ -3560,9 +3580,9 @@ function Section({
   children: ReactNode;
 }) {
   return (
-    <section className="grid gap-1.5">
+    <section className="grid gap-2">
       <div className="flex items-center justify-between gap-2">
-        <h3 className="flex items-center gap-1.5 text-label font-medium uppercase tracking-wide text-[var(--muted)]">
+        <h3 className="flex items-center gap-1.5 text-label font-medium uppercase tracking-[0.06em] text-[var(--muted)]">
           {icon}
           {title}
         </h3>
