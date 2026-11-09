@@ -248,6 +248,14 @@ export type AppSettings = {
   version: string;
 };
 
+/** 本地开发者 API 状态；未启用时 token / base_url 可能为空。 */
+export type DevStatus = {
+  enabled: boolean;
+  port: number;
+  token: string | null;
+  base_url: string | null;
+};
+
 export type NoteMeta = {
   id: string;
   title: string;
@@ -669,6 +677,19 @@ export function setDefaultAgent(agent: string | null): Promise<void> {
 
 export function setWorktreeRetentionDays(days: number): Promise<void> {
   return invoke<void>("set_worktree_retention_days", { days });
+}
+
+export function getDevStatus(): Promise<DevStatus> {
+  return invoke<DevStatus>("get_dev_status");
+}
+
+export function setDevMode(enabled: boolean, port: number): Promise<DevStatus> {
+  return invoke<DevStatus>("set_dev_mode", { enabled, port });
+}
+
+/** 读取应用日志尾部；lines 为最近行数。 */
+export function readAppLog(lines: number): Promise<string[]> {
+  return invoke<string[]>("read_app_log", { lines });
 }
 
 export function setTaskAgents(input: SetTaskAgentsInput): Promise<void> {

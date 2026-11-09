@@ -2,6 +2,19 @@
 
 本文件记录 temli 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.0] - 2026-11-10
+
+### Added
+
+- **开发者模式**（设置 → 开发者，默认关闭）：开关与端口配置；开启后显示本地 API 地址与 Bearer token。
+- **本地调试 HTTP API**（仅 `127.0.0.1`）：`/health`、`/summary`、`/tasks`、`/plans`、任务启动/取消、计划启动/阶段验收、`/logs` 日志尾部；除 `/health` 外均需 Bearer token。
+- **设置页调试工具**：日志尾部查看（200 行）、IPC 控制台（任意已注册命令 + JSON 参数，显示返回/错误）。
+- `docs/dev-mode.md`：接口说明与 curl 示例。
+
+### Changed
+
+- 新增依赖 `tiny_http`（轻量同步 HTTP 服务）。
+
 ## [0.5.1] - 2026-11-10
 
 ### Fixed
