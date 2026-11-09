@@ -1,6 +1,6 @@
 # TASKS
 
-更新时间：2026-11-09　当前状态：M0–M16 完成，0.1.1 已发布（tag `v0.1.1`，GitHub Release 挂 DMG）
+更新时间：2026-11-09　当前状态：M0–M17 完成，0.2.0 已发布（tag `v0.2.0`，GitHub Release 挂 DMG）
 
 ## 里程碑
 
@@ -21,7 +21,7 @@
 - [x] M14 发布 0.1.0：CI workflow（PR #52）、CHANGELOG 定稿、`release/0.1.0` → `main`（PR #53）、tag `v0.1.0`、GitHub Release 挂 DMG、回合并 develop（PR #55）
 - [x] M15 应用图标：深炭底 + 琥珀对勾（证据门/已验证语义），全平台图标集重新生成；菜单栏用模板图标（随浅色/深色反色）（PR #57）
 - [x] M16 0.1.1 补丁发布：修复 .app 未被 ad-hoc 签名导致 DMG 自动安装报「无法安装」（`signingIdentity = "-"`，`codesign -v` 通过）；CI 时序测试稳定化（PR #61）；`release/0.1.1` → main（PR #62）→ tag `v0.1.1` + GitHub Release（PR #59/#61 后基于 main 重建）
-- [x] M17 真实页面 + 界面统一：审查页（证据/审查报告列表，`list_reviews` 后端）、Agent 页（适配器能力/角色总览）；字号/间距/控件高度/圆角统一、tab 与侧栏选中态一致、看板列宽与卡片密度、120–160ms 动效 + reduced-motion（PR #TBD）
+- [x] M17 真实页面 + 界面统一：审查页（证据/审查报告列表，`list_reviews` 后端）、Agent 页（适配器能力/角色总览）；字号/间距/控件高度/圆角统一、tab 与侧栏选中态一致、看板列宽与卡片密度、120–160ms 动效 + reduced-motion（PR #64）
 
 ## 关键验证
 
