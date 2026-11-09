@@ -1,5 +1,6 @@
 mod agent;
 mod db;
+mod dev_api;
 mod evidence;
 mod github;
 mod gitops;
@@ -1632,6 +1633,9 @@ pub fn run() {
                 sync,
             });
 
+            // 开发者模式默认关闭；开启时自动起本地 API，失败只写日志不阻断启动。
+            dev_api::autostart(app.handle());
+
             setup_tray(app)?;
             Ok(())
         })
@@ -1712,7 +1716,10 @@ pub fn run() {
             global_search,
             link_context,
             unlink_context,
-            list_context
+            list_context,
+            dev_api::get_dev_status,
+            dev_api::set_dev_mode,
+            dev_api::read_app_log
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

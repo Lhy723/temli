@@ -20,6 +20,21 @@ pub const SETTING_DEFAULT_AGENT: &str = "default_agent";
 /// 全局设置键：孤儿 worktree 的保留天数。
 pub const SETTING_WORKTREE_RETENTION_DAYS: &str = "worktree_retention_days";
 
+/// 全局设置键：开发者模式开关，`"1"` 启用，其余值（含缺失）关闭。
+pub const SETTING_DEV_MODE: &str = "dev_mode";
+
+/// 全局设置键：开发者 API 监听端口。
+pub const SETTING_DEV_PORT: &str = "dev_port";
+
+/// 全局设置键：开发者 API 的 Bearer token。
+pub const SETTING_DEV_API_TOKEN: &str = "dev_api_token";
+
+/// 开发者 API 默认端口。
+pub const DEFAULT_DEV_PORT: u16 = 3789;
+
+/// 开发者 API 允许的最小端口；1024 以下为特权端口，不监听。
+pub const MIN_DEV_PORT: u16 = 1024;
+
 /// 保留天数缺失或非法时的回退值。
 pub const DEFAULT_WORKTREE_RETENTION_DAYS: u32 = 7;
 
@@ -1117,6 +1132,55 @@ pub fn worktree_retention_days(conn: &Connection) -> u32 {
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .unwrap_or(DEFAULT_WORKTREE_RETENTION_DAYS)
         .clamp(1, 90)
+}
+
+/// 开发者模式是否开启；只有精确的 `"1"` 视为开启。
+pub fn dev_mode_enabled(conn: &Connection) -> bool {
+    get_setting(conn, SETTING_DEV_MODE)
+        .ok()
+        .flatten()
+        .is_some_and(|raw| raw.trim() == "1")
+}
+
+/// 开发者 API 端口：缺失或非法时回退默认端口。
+pub fn dev_port(conn: &Connection) -> u16 {
+    get_setting(conn, SETTING_DEV_PORT)
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|port| *port >= MIN_DEV_PORT)
+        .unwrap_or(DEFAULT_DEV_PORT)
+}
+
+/// 读取开发者 API token；不存在时生成 UUID v4 并持久化。
+pub fn ensure_dev_api_token(conn: &Connection) -> Result<String, String> {
+    if let Some(token) = get_setting(conn, SETTING_DEV_API_TOKEN)?
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+    {
+        return Ok(token);
+    }
+    let token = Uuid::new_v4().to_string();
+    set_setting(conn, SETTING_DEV_API_TOKEN, &token)?;
+    Ok(token)
+}
+
+/// 全库任务按状态计数，按状态名排序；没有任务时返回空列表。
+pub fn task_status_counts(conn: &Connection) -> Result<Vec<(String, u32)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT i.status, COUNT(*)
+             FROM tasks t JOIN items i ON i.id = t.item_id
+             GROUP BY i.status
+             ORDER BY i.status ASC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })
+        .map_err(db_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
 }
 
 /// 项目的并发上限；列为 NULL 时回落为 1。
