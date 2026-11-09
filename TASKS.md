@@ -24,7 +24,7 @@
 - [x] M17 真实页面 + 界面统一：审查页（证据/审查报告列表，`list_reviews` 后端）、Agent 页（适配器能力/角色总览）；字号/间距/控件高度/圆角统一、tab 与侧栏选中态一致、看板列宽与卡片密度、120–160ms 动效 + reduced-motion（PR #64）
 - [x] M18 基础设施：设置存储（迁移 v10 `app_settings`）+ 设置页；单实例守卫；持久日志（轮换/panic hook）；默认 Agent 优先级 env > 设置 > omp；孤儿 worktree 窗口可配；CI 增加 clippy `-D warnings` 与 tag 自动发布 workflow（PR #67）
 - [x] M19 Vault 对齐 Obsidian：标签（migration v11）、附件（选择/粘贴/拖入）、模板变量、日记、属性面板、大纲、⌘O 快速切换、`[[` 补全、别名解析、重命名同步改链接；对照矩阵见 `docs/vault-alignment.md`（PR #72；补丁 #75/#76）
-- [x] M20 借鉴 Kitestring：计划（Plan）与阶段门（locked/active/review/passed，验收解锁下一阶段）；任务 `nextActor`（待你/Agent）；迁移 v12；对照与非目标见 `docs/kitestring-borrowing.md`（PR #TBD）
+- [x] M20 借鉴 Kitestring：计划（Plan）与阶段门（locked/active/review/passed，验收解锁下一阶段）；任务 `nextActor`（待你/Agent）；迁移 v12；对照与非目标见 `docs/kitestring-borrowing.md`（PR #78）
 
 ## 关键验证
 
