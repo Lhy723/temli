@@ -1279,7 +1279,7 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     }
     let quad_count = bytes.len() / 4;
     let mut output = Vec::with_capacity(quad_count * 3);
-    for (quad_index, quad) in bytes.chunks_exact(4).enumerate() {
+    for (quad_index, quad) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let last_quad = quad_index + 1 == quad_count;
         let mut values = [0u8; 4];
         let mut padding = 0usize;
