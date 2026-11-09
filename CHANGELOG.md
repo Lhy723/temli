@@ -2,6 +2,17 @@
 
 本文件记录 temli 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0] - 2026-11-09
+
+### Added
+
+- 审查页：按项目列出证据与独立审查报告（verdict、风险标记、证据通过率、可展开摘要与测试改动）。
+- Agent 页：适配器能力与角色总览（developer/reviewer、审批/取消/成本能力），以及任务级适配器与模型选择说明。
+
+### Changed
+
+- 界面统一：字号/间距/控件高度/圆角规范，顶部 tab 与侧栏选中态一致，看板列宽与卡片密度对齐；过渡动画限定 120–160ms 并尊重 `prefers-reduced-motion`。
+
 ## [0.1.1] - 2026-11-09
 
 ### Added
