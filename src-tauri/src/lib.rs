@@ -3,6 +3,7 @@ mod db;
 mod evidence;
 mod github;
 mod gitops;
+mod logging;
 mod notify;
 mod orchestrator;
 mod planner;
@@ -26,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use store::{Criterion, DecisionRow, EventRow, TaskDetail, TaskSummary};
 use tauri::{
@@ -35,15 +36,31 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 
+/// 运行时可变的默认适配器 id；AppState 与调度线程的 RunContext 共享同一份。
+type SharedDefaultAgent = Arc<RwLock<String>>;
+
 struct AppState {
     db: Arc<Mutex<Db>>,
     adapters: Arc<AdapterRegistry>,
     /// 未在任务上单独指定适配器时使用的默认适配器 id。
-    default_agent: String,
+    ///
+    /// 与调度线程共享；设置页保存后立即生效（`TEMLI_AGENT` 存在时保持环境变量优先）。
+    default_agent: SharedDefaultAgent,
+    /// 启动时的 `app_data_dir` 路径字符串，供设置页展示。
+    data_dir: String,
     /// 任务队列的唯一入口；所有执行都在调度线程内串行进行。
     scheduler: Arc<Scheduler>,
     /// GitHub issue 后台同步。
     sync: Arc<sync::SyncEngine>,
+}
+
+/// 设置页读取的全局应用设置。
+#[derive(Debug, Clone, Serialize)]
+struct AppSettings {
+    default_agent: Option<String>,
+    worktree_retention_days: u32,
+    data_dir: String,
+    version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,6 +337,141 @@ fn set_project_concurrency(
     store::set_project_concurrency(db.conn(), &input.project_id, input.limit)
 }
 
+#[tauri::command]
+fn get_app_settings(state: State<AppState>) -> Result<AppSettings, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    Ok(AppSettings {
+        default_agent: store::get_setting(db.conn(), store::SETTING_DEFAULT_AGENT)?,
+        worktree_retention_days: store::worktree_retention_days(db.conn()),
+        data_dir: state.data_dir.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
+}
+
+/// 校验适配器 id 已注册；未知 id 直接拒绝，避免写入无法运行的默认设置。
+fn ensure_adapter_registered(adapters: &AdapterRegistry, agent: &str) -> Result<(), String> {
+    if adapters
+        .manifests()
+        .iter()
+        .any(|manifest| manifest.id == agent)
+    {
+        Ok(())
+    } else {
+        Err(format!("适配器未注册：{agent}"))
+    }
+}
+
+/// 写入默认适配器设置；`None` 删除该键，回到启动默认值。
+fn apply_default_agent(
+    conn: &rusqlite::Connection,
+    adapters: &AdapterRegistry,
+    agent: Option<&str>,
+) -> Result<(), String> {
+    match agent {
+        Some(id) => {
+            ensure_adapter_registered(adapters, id)?;
+            store::set_setting(conn, store::SETTING_DEFAULT_AGENT, id)
+        }
+        None => store::delete_setting(conn, store::SETTING_DEFAULT_AGENT),
+    }
+}
+
+/// 环境变量与设置都不可用时的兜底适配器。
+const FALLBACK_DEFAULT_AGENT: &str = "omp";
+
+#[tauri::command]
+fn set_default_agent(state: State<AppState>, agent: Option<String>) -> Result<(), String> {
+    {
+        let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+        apply_default_agent(db.conn(), &state.adapters, agent.as_deref())?;
+    }
+
+    let env_agent = std::env::var("TEMLI_AGENT").ok();
+    let note = match runtime_default_agent(env_agent.as_deref(), agent.as_deref()) {
+        Some(runtime) => {
+            *state
+                .default_agent
+                .write()
+                .map_err(|_| "默认适配器锁被占用".to_string())? = runtime;
+            "已立即生效"
+        }
+        None => "TEMLI_AGENT 优先，运行时保持不变",
+    };
+    logging::log(format!(
+        "默认 agent 设置变更：{}（{note}）",
+        agent.as_deref().unwrap_or("<未设置>")
+    ));
+    Ok(())
+}
+
+/// 设置保存成功后运行时默认适配器应切换到的值。
+///
+/// `TEMLI_AGENT`（去空白后非空）存在时由环境变量锁定运行值，返回 `None` 表示
+/// 不覆盖；否则跟随设置，清空设置回落到 `omp`。
+fn runtime_default_agent(env_agent: Option<&str>, setting_agent: Option<&str>) -> Option<String> {
+    if env_agent.map(str::trim).is_some_and(|id| !id.is_empty()) {
+        return None;
+    }
+    Some(
+        setting_agent
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(FALLBACK_DEFAULT_AGENT)
+            .to_string(),
+    )
+}
+
+/// 校验保留天数在 `1..=90` 内；越界直接报错，不静默收敛。
+fn validate_retention_days(days: u32) -> Result<(), String> {
+    if (1..=90).contains(&days) {
+        Ok(())
+    } else {
+        Err("保留天数需在 1 到 90 之间".to_string())
+    }
+}
+
+#[tauri::command]
+fn set_worktree_retention_days(state: State<AppState>, days: u32) -> Result<(), String> {
+    validate_retention_days(days)?;
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::set_setting(
+        db.conn(),
+        store::SETTING_WORKTREE_RETENTION_DAYS,
+        &days.to_string(),
+    )?;
+    logging::log(format!("worktree 保留天数变更：{days} 天"));
+    Ok(())
+}
+
+/// 启动时的默认适配器解析：`TEMLI_AGENT` > 设置项 > `"omp"`。
+///
+/// 环境变量或设置里的 id 未注册时回退 `"omp"`，并在 stderr 提示；空字符串
+/// 视为未设置。
+fn resolve_default_agent(
+    env_agent: Option<&str>,
+    setting_agent: Option<&str>,
+    manifests: &[AgentManifest],
+) -> String {
+    let registered = |id: &str| manifests.iter().any(|manifest| manifest.id == id);
+
+    if let Some(id) = env_agent.map(str::trim).filter(|id| !id.is_empty()) {
+        if registered(id) {
+            return id.to_string();
+        }
+        eprintln!("TEMLI_AGENT 指定的适配器未注册，回退到 {FALLBACK_DEFAULT_AGENT}：{id}");
+        return FALLBACK_DEFAULT_AGENT.to_string();
+    }
+
+    match setting_agent.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) if registered(id) => id.to_string(),
+        Some(id) => {
+            eprintln!("设置中的默认适配器未注册，回退到 {FALLBACK_DEFAULT_AGENT}：{id}");
+            FALLBACK_DEFAULT_AGENT.to_string()
+        }
+        None => FALLBACK_DEFAULT_AGENT.to_string(),
+    }
+}
+
 /// 规划器单次运行的硬超时（秒）；超时即取消并回退到默认验收标准。
 const PLANNER_TIMEOUT_SECS: u64 = 90;
 
@@ -505,12 +657,17 @@ fn plan_project(
             .ok_or_else(|| "项目不存在".to_string())?
     };
 
+    let default_agent = state
+        .default_agent
+        .read()
+        .map_err(|_| "默认适配器锁被占用".to_string())?
+        .clone();
     let requested = input
         .agent
         .as_deref()
         .map(str::trim)
         .filter(|agent| !agent.is_empty())
-        .unwrap_or(&state.default_agent);
+        .unwrap_or(&default_agent);
     let adapter = state
         .adapters
         .get(requested)
@@ -536,7 +693,12 @@ fn create_task(state: State<AppState>, input: CreateTaskInput) -> Result<TaskDet
     let criteria = if input.acceptance.is_empty() {
         let repo = PathBuf::from(&project.repo_path);
         let commands = evidence::discover_commands(&repo);
-        let adapter = state.adapters.get(&state.default_agent);
+        let default_agent = state
+            .default_agent
+            .read()
+            .map_err(|_| "默认适配器锁被占用".to_string())?
+            .clone();
+        let adapter = state.adapters.get(&default_agent);
         let generated = generate_acceptance(
             adapter.as_deref(),
             &repo,
@@ -815,21 +977,21 @@ fn resolve_decision(state: State<AppState>, input: ResolveDecisionInput) -> Resu
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     let decision = store::resolve_decision(db.conn(), &input.id, &input.resolution)?;
     // Agent approvals only unblock the running session; they must not move the task.
-    if decision.kind != "agent_approval" {
-        if let Some(task_id) = decision.task_id.as_deref() {
-            let current = store::get_task(db.conn(), task_id)?.task.status;
-            if matches!(
-                current,
-                store::TaskStatus::NeedsHuman | store::TaskStatus::Interrupted
-            ) {
-                let allow = matches!(input.resolution.as_str(), "allow" | "approve" | "retry");
-                let next = if allow {
-                    store::TaskStatus::Queued
-                } else {
-                    store::TaskStatus::Draft
-                };
-                store::transition(db.conn(), task_id, next)?;
-            }
+    if decision.kind != "agent_approval"
+        && let Some(task_id) = decision.task_id.as_deref()
+    {
+        let current = store::get_task(db.conn(), task_id)?.task.status;
+        if matches!(
+            current,
+            store::TaskStatus::NeedsHuman | store::TaskStatus::Interrupted
+        ) {
+            let allow = matches!(input.resolution.as_str(), "allow" | "approve" | "retry");
+            let next = if allow {
+                store::TaskStatus::Queued
+            } else {
+                store::TaskStatus::Draft
+            };
+            store::transition(db.conn(), task_id, next)?;
         }
     }
     Ok(())
@@ -1127,13 +1289,11 @@ fn list_context(
     store::task_context_meta(db.conn(), &task_id)
 }
 
-/// 登记但 run 行已消失的 worktree（例如任务行被手工清理）的保留窗口；
-/// 失败/需决策任务的 run 行仍在库，不受影响。窗口内一律保留，供排查。
-const ORPHAN_WORKTREE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-
 /// 启动时回收 worktree：先让 git 清掉失效登记，再删除项目目录下未被 git 登记的
-/// 残留目录；登记仍在但 run 行已消失的孤儿按保留窗口回收。
-fn cleanup_worktrees(db: &Db, data_dir: &Path) {
+/// 残留目录；登记仍在但 run 行已消失的孤儿按 `retention_days` 天的保留窗口回收
+/// （窗口内一律保留，供排查；失败/需决策任务的 run 行仍在库，不受影响）。
+fn cleanup_worktrees(db: &Db, data_dir: &Path, retention_days: u32) {
+    let cutoff = SystemTime::now() - Duration::from_secs(u64::from(retention_days) * 24 * 60 * 60);
     let projects = match db.list_projects() {
         Ok(projects) => projects,
         Err(err) => {
@@ -1170,11 +1330,7 @@ fn cleanup_worktrees(db: &Db, data_dir: &Path) {
             }
             let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
             if registered.contains(&canonical) {
-                if reclaim_orphan_worktree(
-                    db.conn(),
-                    &path,
-                    SystemTime::now() - ORPHAN_WORKTREE_RETENTION,
-                ) {
+                if reclaim_orphan_worktree(db.conn(), &path, cutoff) {
                     reclaimed = true;
                 }
                 continue;
@@ -1183,10 +1339,8 @@ fn cleanup_worktrees(db: &Db, data_dir: &Path) {
                 eprintln!("删除残留 worktree {} 失败：{err}", path.display());
             }
         }
-        if reclaimed {
-            if let Err(err) = gitops::prune_worktrees(repo) {
-                eprintln!("回收孤儿 worktree 后清理登记失败：{err}");
-            }
+        if reclaimed && let Err(err) = gitops::prune_worktrees(repo) {
+            eprintln!("回收孤儿 worktree 后清理登记失败：{err}");
         }
     }
 }
@@ -1277,18 +1431,35 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 单实例守卫必须在其他 plugin 之前注册：第二个进程在 plugin setup
+        // 阶段把参数交给首个实例后立即退出。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            logging::log("检测到第二个实例，激活主窗口");
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             notify::init(app.handle().clone());
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
+            logging::init(&dir);
+            logging::log(format!(
+                "启动 temli {}（数据目录 {}）",
+                env!("CARGO_PKG_VERSION"),
+                dir.display()
+            ));
+            logging::log(format!(
+                "日志文件：{}",
+                logging::path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "未启用".to_string())
+            ));
             let db = Db::open(&dir.join("temli.db")).map_err(std::io::Error::other)?;
-            if let Ok(guard) = db.conn().execute_batch("SELECT 1") {
-                let _ = guard;
-            }
+            let _ = db.conn().execute_batch("SELECT 1");
             let _ = store::interrupt_running(db.conn());
-            cleanup_worktrees(&db, &dir);
+            let retention_days = store::worktree_retention_days(db.conn());
+            cleanup_worktrees(&db, &dir, retention_days);
 
             let mut adapters = AdapterRegistry::new();
             adapters.register(Arc::new(agent::omp::OmpAdapter::new()));
@@ -1296,18 +1467,29 @@ pub fn run() {
             adapters.register(Arc::new(agent::codex::CodexAdapter::new()));
             adapters.register(Arc::new(agent::claude::ClaudeAdapter::new()));
 
-            let default_agent = std::env::var("TEMLI_AGENT").unwrap_or_else(|_| "omp".to_string());
+            let env_agent = std::env::var("TEMLI_AGENT").ok();
+            let setting_agent = store::get_setting(db.conn(), store::SETTING_DEFAULT_AGENT)
+                .ok()
+                .flatten();
+            let manifests = adapters.manifests();
+            let default_agent =
+                resolve_default_agent(env_agent.as_deref(), setting_agent.as_deref(), &manifests);
             if adapters.get(&default_agent).is_none() {
                 return Err(std::io::Error::other(format!("适配器未注册：{default_agent}")).into());
             }
+            logging::log(format!(
+                "默认 agent：{default_agent}；worktree 保留：{retention_days} 天"
+            ));
             let adapters = Arc::new(adapters);
+            let data_dir = dir.to_string_lossy().into_owned();
+            let default_agent: SharedDefaultAgent = Arc::new(RwLock::new(default_agent));
 
             let db = Arc::new(Mutex::new(db));
             let github: Arc<dyn github::GitHubOps> = Arc::new(github::GhOps::new());
             let scheduler = Scheduler::new(orchestrator::RunContext {
                 db: Arc::clone(&db),
                 adapters: Arc::clone(&adapters),
-                default_agent: default_agent.clone(),
+                default_agent: Arc::clone(&default_agent),
                 data_dir: dir,
                 running: Arc::new(Mutex::new(HashSet::new())),
                 cancels: orchestrator::CancelRegistry::new(),
@@ -1324,6 +1506,7 @@ pub fn run() {
                 db,
                 adapters,
                 default_agent,
+                data_dir,
                 scheduler,
                 sync,
             });
@@ -1333,11 +1516,11 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             // 关闭主窗口只隐藏到托盘，调度器与后台同步继续运行。
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
-                    api.prevent_close();
-                    let _ = window.hide();
-                }
+            if let WindowEvent::CloseRequested { api, .. } = event
+                && window.label() == "main"
+            {
+                api.prevent_close();
+                let _ = window.hide();
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1349,6 +1532,9 @@ pub fn run() {
             list_dependencies,
             get_project_concurrency,
             set_project_concurrency,
+            get_app_settings,
+            set_default_agent,
+            set_worktree_retention_days,
             create_task,
             create_task_from_issue,
             plan_project,
@@ -1399,23 +1585,26 @@ pub fn run() {
         .run(on_run_event);
 }
 
-/// macOS：窗口全部隐藏后点击 Dock 图标重新显示主窗口。
+/// macOS：窗口全部隐藏后点击 Dock 图标重新显示主窗口；退出时落一行日志。
 #[cfg(target_os = "macos")]
 fn on_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
-    if let tauri::RunEvent::Reopen {
-        has_visible_windows,
-        ..
-    } = event
-    {
-        if !has_visible_windows {
-            show_main_window(app);
-        }
+    match event {
+        tauri::RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } => show_main_window(app),
+        tauri::RunEvent::Exit => logging::log("应用退出"),
+        _ => {}
     }
 }
 
-/// 其他平台没有 Reopen 事件，无需额外处理。
+/// 其他平台没有 Reopen 事件，只记录退出。
 #[cfg(not(target_os = "macos"))]
-fn on_run_event(_app: &tauri::AppHandle, _event: tauri::RunEvent) {}
+fn on_run_event(_app: &tauri::AppHandle, event: tauri::RunEvent) {
+    if let tauri::RunEvent::Exit = event {
+        logging::log("应用退出");
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1956,7 +2145,7 @@ mod tests {
         fs::create_dir_all(&orphan).expect("创建孤儿目录");
         fs::write(orphan.join("leftover.txt"), "stale\n").expect("写入残留文件");
 
-        cleanup_worktrees(&fixture.db, &fixture.data_dir);
+        cleanup_worktrees(&fixture.db, &fixture.data_dir, 7);
 
         assert!(!orphan.exists(), "未登记的孤儿目录应被删除");
         assert!(!worktree.exists(), "残留 worktree 目录应被删除");
@@ -2019,7 +2208,7 @@ mod tests {
             .expect("创建在跑 run 的 worktree");
 
         // 保留窗口内：孤儿新鲜，不回收；run 行仍在的更不回收。
-        cleanup_worktrees(&fixture.db, &fixture.data_dir);
+        cleanup_worktrees(&fixture.db, &fixture.data_dir, 7);
         assert!(orphan.exists(), "窗口内的孤儿 worktree 应保留调试");
         assert!(alive.exists(), "run 行仍在的 worktree 应保留");
 
@@ -2038,6 +2227,139 @@ mod tests {
         gitops::prune_worktrees(&repo).expect("清理登记");
         let registered = gitops::list_worktrees(&repo).expect("列出 worktree");
         assert!(registered.iter().all(|path| path != &orphan));
+    }
+
+    #[test]
+    fn cleanup_worktrees_uses_retention_days_parameter() {
+        let fixture = WorktreeFixture::new("retention-days");
+        let repo = fixture.repo.canonicalize().expect("规范化仓库路径");
+        let project = fixture
+            .db
+            .insert_project(
+                RegisterProjectInput {
+                    repo_path: repo.to_string_lossy().into_owned(),
+                    name: Some("demo".to_string()),
+                    github_owner: None,
+                    github_repo: None,
+                    default_branch: Some("main".to_string()),
+                },
+                repo.clone(),
+            )
+            .expect("登记项目");
+
+        let base = gitops::rev_parse(&repo, "main").expect("读取初始提交");
+        let project_root = fixture.data_dir.join("worktrees").join(&project.id);
+        fs::create_dir_all(&project_root).expect("创建 worktree 根目录");
+        // 登记仍在、但 run 行已消失的孤儿。
+        let orphan = project_root.join("run-retention");
+        gitops::create_worktree(&repo, &orphan, "temli/cleanup-retention", &base)
+            .expect("创建孤儿 worktree");
+
+        // 默认 7 天窗口：新鲜孤儿保留。
+        cleanup_worktrees(&fixture.db, &fixture.data_dir, 7);
+        assert!(orphan.exists(), "7 天窗口内的孤儿应保留");
+
+        // 0 天窗口（测试用下界）：同一孤儿立即回收。
+        cleanup_worktrees(&fixture.db, &fixture.data_dir, 0);
+        assert!(!orphan.exists(), "0 天窗口内的孤儿应立即回收");
+    }
+
+    fn manifest(id: &str) -> AgentManifest {
+        AgentManifest {
+            id: id.to_string(),
+            name: id.to_string(),
+            version: "0.0.0".to_string(),
+            roles: vec![AgentRole::Developer],
+            capabilities: Capabilities::default(),
+        }
+    }
+
+    #[test]
+    fn resolve_default_agent_prefers_env_then_setting_then_omp() {
+        let manifests = vec![manifest("omp"), manifest("codex"), manifest("fake")];
+
+        // 优先级：环境变量 > 设置 > omp。
+        assert_eq!(
+            resolve_default_agent(Some("codex"), Some("fake"), &manifests),
+            "codex"
+        );
+        assert_eq!(
+            resolve_default_agent(None, Some("fake"), &manifests),
+            "fake"
+        );
+        assert_eq!(resolve_default_agent(None, None, &manifests), "omp");
+
+        // 空白环境变量不覆盖设置。
+        assert_eq!(
+            resolve_default_agent(Some("  "), Some("fake"), &manifests),
+            "fake"
+        );
+
+        // 未注册的 id 一律回退 omp；环境变量优先，因此不会落回设置。
+        assert_eq!(
+            resolve_default_agent(Some("missing"), Some("fake"), &manifests),
+            "omp"
+        );
+        assert_eq!(
+            resolve_default_agent(None, Some("missing"), &manifests),
+            "omp"
+        );
+    }
+
+    #[test]
+    fn runtime_default_agent_follows_setting_unless_env_pins_it() {
+        // 无环境变量：运行值跟随设置；清空设置回落 omp。
+        assert_eq!(
+            runtime_default_agent(Some("  "), Some("fake")),
+            Some("fake".to_string())
+        );
+        assert_eq!(
+            runtime_default_agent(None, Some("fake")),
+            Some("fake".to_string())
+        );
+        assert_eq!(runtime_default_agent(None, None), Some("omp".to_string()));
+
+        // 环境变量存在：设置仍持久化，但不覆盖运行值。
+        assert_eq!(runtime_default_agent(Some("codex"), Some("fake")), None);
+        assert_eq!(runtime_default_agent(Some("codex"), None), None);
+    }
+
+    #[test]
+    fn set_default_agent_rejects_unknown_adapter_and_roundtrips() {
+        let fixture = WorktreeFixture::new("agent-setting");
+        let conn = fixture.db.conn();
+        let mut adapters = AdapterRegistry::new();
+        adapters.register(Arc::new(ScriptedAdapter::new("ok")));
+
+        // 非法 id 拒绝写入。
+        let err = apply_default_agent(conn, &adapters, Some("missing")).unwrap_err();
+        assert!(err.contains("missing"), "{err}");
+        assert_eq!(
+            store::get_setting(conn, store::SETTING_DEFAULT_AGENT).unwrap(),
+            None
+        );
+
+        // 合法 id 写入；`None` 删除。
+        apply_default_agent(conn, &adapters, Some("scripted")).unwrap();
+        assert_eq!(
+            store::get_setting(conn, store::SETTING_DEFAULT_AGENT)
+                .unwrap()
+                .as_deref(),
+            Some("scripted")
+        );
+        apply_default_agent(conn, &adapters, None).unwrap();
+        assert_eq!(
+            store::get_setting(conn, store::SETTING_DEFAULT_AGENT).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn retention_days_command_range_is_validated() {
+        assert!(validate_retention_days(1).is_ok());
+        assert!(validate_retention_days(90).is_ok());
+        assert!(validate_retention_days(0).is_err());
+        assert!(validate_retention_days(91).is_err());
     }
 
     fn planned_issue(title: &str, cmd: &str, depends_on: Vec<usize>) -> planner::PlanIssue {

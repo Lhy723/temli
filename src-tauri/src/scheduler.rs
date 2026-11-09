@@ -794,7 +794,7 @@ mod tests {
             let ctx = RunContext {
                 db: Arc::new(Mutex::new(db)),
                 adapters: Arc::new(adapters),
-                default_agent,
+                default_agent: Arc::new(std::sync::RwLock::new(default_agent)),
                 data_dir: self.root.join("data"),
                 running: Arc::new(Mutex::new(HashSet::new())),
                 cancels: orchestrator::CancelRegistry::new(),

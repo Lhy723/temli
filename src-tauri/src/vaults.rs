@@ -934,7 +934,7 @@ fn set_heading(content: &str, title: &str) -> String {
     let mut replaced = false;
 
     for line in scan.split_inclusive('\n') {
-        let body = line.trim_end_matches(|character| character == '\r' || character == '\n');
+        let body = line.trim_end_matches(['\r', '\n']);
         let trimmed = body.trim();
         if first {
             first = false;
@@ -956,17 +956,17 @@ fn set_heading(content: &str, title: &str) -> String {
             out.push_str(line);
             continue;
         }
-        if !in_fence && !replaced {
-            if let Some(text) = body.trim_start().strip_prefix("# ") {
-                if !text.trim().is_empty() {
-                    let indent = &body[..body.len() - body.trim_start().len()];
-                    out.push_str(indent);
-                    out.push_str(&heading);
-                    out.push_str(&line[body.len()..]);
-                    replaced = true;
-                    continue;
-                }
-            }
+        if !in_fence
+            && !replaced
+            && let Some(text) = body.trim_start().strip_prefix("# ")
+            && !text.trim().is_empty()
+        {
+            let indent = &body[..body.len() - body.trim_start().len()];
+            out.push_str(indent);
+            out.push_str(&heading);
+            out.push_str(&line[body.len()..]);
+            replaced = true;
+            continue;
         }
         out.push_str(line);
     }
@@ -1004,21 +1004,13 @@ fn preamble_len(content: &str) -> usize {
     let mut offset = bom;
     let mut lines = rest.split_inclusive('\n');
     let first = lines.next().unwrap_or_default();
-    if first
-        .trim_end_matches(|character| character == '\r' || character == '\n')
-        .trim()
-        != "---"
-    {
+    if first.trim_end_matches(['\r', '\n']).trim() != "---" {
         return bom;
     }
     offset += first.len();
     for line in lines {
         offset += line.len();
-        if line
-            .trim_end_matches(|character| character == '\r' || character == '\n')
-            .trim()
-            == "---"
-        {
+        if line.trim_end_matches(['\r', '\n']).trim() == "---" {
             return offset;
         }
     }

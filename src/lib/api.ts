@@ -123,6 +123,17 @@ export type TaskDependencies = {
   blocks: TaskSummary[];
 };
 
+/** 项目注册信息；设置页只读取展示仓库相关字段。 */
+export type ProjectInfo = {
+  id: string;
+  name: string;
+  repo_path: string;
+  github_owner: string | null;
+  github_repo: string | null;
+  default_branch: string;
+  created_at: string;
+};
+
 export type SetProjectConcurrencyInput = {
   project_id: string;
   limit: number;
@@ -186,6 +197,14 @@ export type SetRequireChecksInput = {
 export type SetAutoDocsInput = {
   project_id: string;
   enabled: boolean;
+};
+
+/** 全局应用设置；对所有项目生效。 */
+export type AppSettings = {
+  default_agent: string | null;
+  worktree_retention_days: number;
+  data_dir: string;
+  version: string;
 };
 
 export type NoteMeta = {
@@ -375,6 +394,10 @@ export type LinkContextInput = {
   item_id: string;
 };
 
+export function listProjects(): Promise<ProjectInfo[]> {
+  return invoke<ProjectInfo[]>("list_projects");
+}
+
 export function listTasks(projectId: string): Promise<TaskSummary[]> {
   return invoke<TaskSummary[]>("list_tasks", { projectId });
 }
@@ -555,6 +578,18 @@ export function listContext(taskId: string): Promise<ContextItem[]> {
 
 export function listAdapters(): Promise<AgentManifest[]> {
   return invoke<AgentManifest[]>("list_adapters");
+}
+
+export function getAppSettings(): Promise<AppSettings> {
+  return invoke<AppSettings>("get_app_settings");
+}
+
+export function setDefaultAgent(agent: string | null): Promise<void> {
+  return invoke<void>("set_default_agent", { agent });
+}
+
+export function setWorktreeRetentionDays(days: number): Promise<void> {
+  return invoke<void>("set_worktree_retention_days", { days });
 }
 
 export function setTaskAgents(input: SetTaskAgentsInput): Promise<void> {

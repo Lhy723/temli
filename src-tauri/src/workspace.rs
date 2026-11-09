@@ -62,10 +62,10 @@ pub fn scan_docs(conn: &Connection, project: &Project) -> Result<usize, String> 
         return Err(format!("仓库目录不存在：{}", repo_root.display()));
     }
     let docs_root = repo_root.join(DOCS_DIR);
-    if let Ok(meta) = fs::symlink_metadata(&docs_root) {
-        if meta.file_type().is_symlink() {
-            return Err("docs 目录不能是符号链接".to_string());
-        }
+    if let Ok(meta) = fs::symlink_metadata(&docs_root)
+        && meta.file_type().is_symlink()
+    {
+        return Err("docs 目录不能是符号链接".to_string());
     }
     let mut files = Vec::new();
     if docs_root.is_dir() {
@@ -192,10 +192,10 @@ pub fn get_doc(conn: &Connection, doc_id: &str) -> Result<Doc, String> {
         .map_err(db_err)?
         .ok_or_else(|| format!("文档不存在：{doc_id}"))?;
 
-    if !doc.path.is_empty() {
-        if let Ok(body) = fs::read_to_string(project_path(&repo_path).join(&doc.path)) {
-            doc.body = body;
-        }
+    if !doc.path.is_empty()
+        && let Ok(body) = fs::read_to_string(project_path(&repo_path).join(&doc.path))
+    {
+        doc.body = body;
     }
     Ok(doc)
 }
