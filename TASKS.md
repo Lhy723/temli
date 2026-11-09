@@ -1,6 +1,6 @@
 # TASKS
 
-更新时间：2026-11-08　当前状态：M0–M12 全部合入 `develop`
+更新时间：2026-11-09　当前状态：M0–M13 全部完成，0.1.0 已发布（main tag v0.1.0，GitHub Release 挂 DMG）
 
 ## 里程碑
 
@@ -17,7 +17,8 @@
 - [x] M10 真实 PR + CI + 自动合并：temli-demo PR #3 checks 全绿自动合并；checks 瞬时失败重试
 - [x] M11 合并后自动文档：迁移 v9、受限文档任务、防递归、统一证据门；真实闭环 PR #4 → 文档任务 → PR #5（PR #43，Issue #42）
 - [x] M12 菜单栏常驻 + 通知：关窗隐藏、托盘显示/退出、任务终态与待决策通知（PR #45，Issue #44）
-- [x] M13 GitHub 写回闭环 + 文档任务结构化：issue 标题/正文/指派人/关闭重开写回（乐观并发）、远端关闭同步、auto_docs 字段驱动 chip、merged 即时刷新、通知点击深链、孤儿 worktree 时间窗回收、死代码清零
+- [x] M13 GitHub 写回闭环 + 文档任务结构化：issue 标题/正文/指派人/关闭重开写回（乐观并发）、远端关闭同步、auto_docs 字段驱动 chip、merged 即时刷新、通知点击深链、孤儿 worktree 时间窗回收、死代码清零（PR #51）
+- [x] M14 发布 0.1.0：CI workflow（PR #52）、CHANGELOG 定稿、`release/0.1.0` → `main`（PR #53）、tag `v0.1.0`、GitHub Release 挂 DMG、回合并 develop（PR #55）
 
 ## 关键验证
 
@@ -30,6 +31,7 @@
 - M10 真实链路：OMP 任务新增 `greet` + 测试 → PR #3 → CI `npm test` 通过 → 自动合并
 - M11 真实链路：父任务合并（PR #4）→ 自动生成 `文档：add farewell` → PR #5 合并 → `docs/guide.md` 更新；仅 1 条文档任务，无递归
 - M12 运行时（release bundle + fake 适配器）：托盘左键恢复窗口、右键菜单「显示 temli / 退出 temli」；关闭窗口后进程存活；通知授权后横幅显示「需要决策 / 任务标题 / 状态：等待人工决策」
+- 0.1.0 发布：CI 绿后 PR #53 合入 `main`，tag `v0.1.0`，GitHub Release 附件 `temli_0.1.0_aarch64.dmg`（3,703,023 字节）；DMG 已挂载验证包含 `temli.app`；develop 回合并 PR #55
 
 ## 已知遗留
 
@@ -43,16 +45,15 @@
 
 ## 下一步
 
-- [ ] 发布 0.1.0：`release/0.1.0` → PR 到 `main` → tag v0.1.0 → GitHub Release 挂 DMG（ad-hoc 签名 + README 放行说明）
-- [ ] CI：`.github/workflows/ci.yml`（macOS：`npm run build` + `cargo test --lib`）
 - [ ] 空闲时补 M13 屏上冒烟：issue 编辑/关闭/重开、通知点击深链
 - [ ] 文档工作区可编辑；Projects V2；Vault 附件/标签/模板
 - [ ] 前端 E2E（Tauri WebDriver 或 mock IPC 全流程）；通知/托盘自动化回归
+- [ ] 签名/公证（Developer ID）与 `release/*` 后续版本流程，需要时再启用
 
 ## 验证命令
 
 ```bash
-cd src-tauri && cargo test --lib          # 261 passed, 1 ignored
+cd src-tauri && cargo test --lib          # 271 passed, 1 ignored
 npm run build                             # 前端类型检查 + 构建
 npm run tauri build                       # release .app + .dmg
 cargo test --lib live_plan_generation_with_omp -- --ignored --nocapture
