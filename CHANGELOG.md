@@ -2,6 +2,22 @@
 
 本文件记录 temli 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.10.0] - 2026-11-11
+
+### Changed
+
+- **类型化错误**：新增 `AppError { code, message }`（validation / conflict / not_found / internal）；73 个返回错误的 Tauri 命令改为 `AppResult<T>`，前端 `errorText` 兼容 `{code,message}` 与字符串，用户可见文案不变。
+- 参数校验（保留天数、调试端口、空规划、未发现命令、未注册适配器）归类为 validation；项目缺失归类为 not_found。
+
+### Added
+
+- `error.rs` 单测：构造器、字符串转换、Display/Deref、字符串比较、serde 线格式。
+
+### 说明
+
+- 内部 store/orchestrator 仍返回 `Result<_, String>`，在命令边界转换；后续可逐步内移。
+- `tauri-specta` 类型生成、CI 可运行的真实后端 E2E 仍未实现（见 `docs/refactor-plan.md`）。
+
 ## [0.9.0] - 2026-11-10
 
 ### Added

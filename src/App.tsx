@@ -21,7 +21,7 @@ import { ReviewsPanel } from "./components/ReviewsPanel";
 import { PlansPanel } from "./components/PlansPanel";
 import { AgentsPanel } from "./components/AgentsPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { getTask, type GlobalHit } from "./lib/api";
+import { errorText, getTask, type GlobalHit } from "./lib/api";
 import {
   Bot,
   ChevronDown,
@@ -143,7 +143,7 @@ export default function App() {
       })
       .catch((e) => {
         setProjectsLoaded(true);
-        setError(String(e));
+        setError(errorText(e));
       });
   }, []);
 
@@ -189,7 +189,7 @@ export default function App() {
           open("my");
         })
         .catch((e) => {
-          if (!disposed && seq === request) setError(String(e));
+          if (!disposed && seq === request) setError(errorText(e));
         });
     })
       .then((stop) => {
@@ -197,7 +197,7 @@ export default function App() {
         else unlisten = stop;
       })
       .catch((e) => {
-        if (!disposed) setError(String(e));
+        if (!disposed) setError(errorText(e));
       });
     return () => {
       disposed = true;
@@ -756,7 +756,7 @@ function RegisterProject({
       });
       onRegistered(project);
     } catch (e) {
-      onError(String(e));
+      onError(errorText(e));
     } finally {
       setBusy(false);
     }
