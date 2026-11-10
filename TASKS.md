@@ -1,6 +1,6 @@
 # TASKS
 
-更新时间：2026-11-09　当前状态：M0–M24 完成，0.9.0 已发布（tag `v0.9.0`，tag 推送自动构建 Release）
+更新时间：2026-11-09　当前状态：M0–M25 完成，0.10.0 已发布（tag `v0.10.0`，tag 推送自动构建 Release）
 
 ## 里程碑
 
@@ -28,11 +28,12 @@
 - [x] M21 开发者模式 + 本地调试 API：设置页开关/端口/token；仅 127.0.0.1 的 HTTP（health/summary/tasks/plans 启停/日志），Bearer 认证；日志尾部与 IPC 控制台；`docs/dev-mode.md`（PR #84）
 - [x] M22 Kitestring 证据与阶段意见：任务证据附件（截图/文件 ≤20 MB，迁移 v13 `task_attachments`）；阶段验收意见/小结（`plan_stages.summary/summary_at`）；对照文档更新（PR #87）
 - [x] M23 可维护性重构（无行为变化）：store 拆 7 个领域模块；lib.rs 72 命令拆 8 个 commands 模块；TasksPanel/Vaults 拆为主文件 + 子组件/hooks；见 `docs/refactor-plan.md`（PR #90）
-- [x] M24 契约与 UI E2E（部分）：`check:contracts` 防漂移（CI）+ Playwright mock IPC 4 条 UI 回归（CI）+ 真实 API 用例（本地 token 驱动，CI 跳过）；清理 6 个 notes 死命令与 Workspace 笔记分支。**未完成**：CI 可运行的真实后端 E2E、`tauri-specta` 类型生成、`AppError` 类型化错误（评估记录见 `docs/refactor-plan.md`）（PR #93）
+- [x] M24 契约与 UI E2E（部分）：`check:contracts` 防漂移（CI）+ Playwright mock IPC 4 条 UI 回归（CI）+ 真实 API 用例（本地 token 驱动，CI 跳过）；清理 6 个 notes 死命令与 Workspace 笔记分支。**未完成**：CI 可运行的真实后端 E2E、`tauri-specta` 类型生成（PR #93）
+- [x] M25 类型化错误：`AppError { code, message }`（validation/conflict/not_found/internal）+ `AppResult`；73 个命令改用；前端 `errorText` 兼容对象/字符串；error.rs 单测（PR #99）
 
 ## 关键验证
 
-- `cargo test --lib`：311 passed，1 ignored（需真实 OMP 的 live 规划测试）
+- `cargo test --lib`：316 passed，1 ignored（需真实 OMP 的 live 规划测试）
 - `npm run build`：通过
 - `npm run tauri build`：通过，产物 `temli.app`（7.05 MiB）与 `temli_0.1.0_aarch64.dmg`（3.54 MiB）
 - `cargo build`：0 warning（M13 死代码清零）
@@ -54,6 +55,7 @@
 - M22 证据附件（浏览器 mock IPC）：上传 `add_task_attachment`（base64）、列表缩略图 + `read_task_attachment`、删除 `delete_task_attachment`；阶段验收意见随 `accept_stage` 传入并回显；0.7.0 DMG 3,930,729 字节，`codesign -v` 通过并安装
 - M23 重构：store 5,099 → 7 模块（最大 959 行）；lib.rs 72 命令 → 8 个 commands 模块（最大 435 行）；TasksPanel 4,015 → 760 + 15 子组件；Vaults 2,542 → 559 + 14 子组件；311 tests / clippy 0 / build / fmt；浏览器 mock 冒烟通过；0.8.0 DMG 3,932,403 字节，`codesign -v` 通过并安装
 - M24 契约与 E2E：`check:contracts` 75 定义 / 75 注册 / 74 前端调用、0 drift；清理 6 个 notes 死命令；`npm run test:e2e` 4 passed（mock IPC UI 回归）+ 2 skipped（真实 API 用例，无 token 时跳过）；真实 API 用例对运行中的应用实测 2 passed（health/401/summary/logs/tasks）；0.9.0 DMG 3,930,482 字节，`codesign -v` 通过并安装
+- M25 类型化错误：316 tests、clippy 0、build、fmt、E2E 4 passed + 2 skipped、契约 0 drift；73 命令改用 `AppResult`，前端错误提示不变；0.10.0 DMG 3,939,756 字节，`codesign -v` 通过并安装
 
 ## 基础设施缺口（M18 起补齐）
 
@@ -79,13 +81,13 @@
 - [ ] 空闲时补 M13 屏上冒烟：issue 编辑/关闭/重开、通知点击深链
 - [ ] 文档工作区可编辑；Projects V2；指派人移除
 - [ ] E2E 升级：CI 可运行的真实后端 E2E（当前真实 API 用例需本地应用 + token）；扩大任务创建/写回/通知覆盖；托盘/通知自动化回归
-- [ ] tauri-specta 类型生成 + `AppError` 类型化错误（见 docs/refactor-plan.md）
+- [ ] tauri-specta 类型生成（评估已做；需独立里程碑）
 - [ ] 签名/公证（Developer ID）与 `release/*` 后续版本流程，需要时再启用
 
 ## 验证命令
 
 ```bash
-cd src-tauri && cargo test --lib          # 311 passed, 1 ignored
+cd src-tauri && cargo test --lib          # 316 passed, 1 ignored
 npm run build                             # 前端类型检查 + 构建
 npm run tauri build                       # release .app + .dmg
 cargo test --lib live_plan_generation_with_omp -- --ignored --nocapture
