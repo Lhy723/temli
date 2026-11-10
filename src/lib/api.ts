@@ -268,22 +268,6 @@ export type DevStatus = {
   base_url: string | null;
 };
 
-export type NoteMeta = {
-  id: string;
-  title: string;
-  file_path: string;
-  updated_at: string;
-};
-
-export type Note = {
-  id: string;
-  title: string;
-  body: string;
-  file_path: string;
-  created_at: string;
-  updated_at: string;
-};
-
 export type DocMeta = {
   id: string;
   title: string;
@@ -438,24 +422,6 @@ export type ContextItem = {
   body?: string;
 };
 
-export type CreateNoteInput = {
-  project_id: string;
-  title: string;
-  body: string;
-};
-
-export type UpdateNoteInput = {
-  id: string;
-  title: string;
-  body: string;
-};
-
-export type CreateTaskFromNoteInput = {
-  note_id: string;
-  title?: string;
-  prompt?: string;
-};
-
 export type LinkContextInput = {
   task_id: string;
   item_id: string;
@@ -591,26 +557,6 @@ export function setAutoDocs(input: SetAutoDocsInput): Promise<void> {
   return invoke<void>("set_auto_docs", { input });
 }
 
-export function listNotes(projectId: string): Promise<NoteMeta[]> {
-  return invoke<NoteMeta[]>("list_notes", { projectId });
-}
-
-export function getNote(noteId: string): Promise<Note> {
-  return invoke<Note>("get_note", { noteId });
-}
-
-export function createNote(input: CreateNoteInput): Promise<Note> {
-  return invoke<Note>("create_note", { input });
-}
-
-export function updateNote(input: UpdateNoteInput): Promise<Note> {
-  return invoke<Note>("update_note", { input });
-}
-
-export function deleteNote(noteId: string): Promise<void> {
-  return invoke<void>("delete_note", { noteId });
-}
-
 export function listDocs(projectId: string): Promise<DocMeta[]> {
   return invoke<DocMeta[]>("list_docs", { projectId });
 }
@@ -632,12 +578,6 @@ export function searchWorkspace(
 
 export function globalSearch(input: GlobalSearchInput): Promise<GlobalHit[]> {
   return invoke<GlobalHit[]>("global_search", { input });
-}
-
-export function createTaskFromNote(
-  input: CreateTaskFromNoteInput,
-): Promise<TaskDetail> {
-  return invoke<TaskDetail>("create_task_from_note", { input });
 }
 
 export function createTaskFromIssue(
