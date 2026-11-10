@@ -6,7 +6,7 @@
 
 ### Added
 
-- **前端 E2E**：Playwright + Vite + mock IPC，覆盖看板、计划验收意见、设置开发者模式、Vault；CI 自动运行。
+- **前端 UI E2E（mock IPC）**：Playwright + Vite + mock IPC，覆盖看板、计划验收意见、设置开发者模式、Vault；CI 自动运行。注意：这是 UI 回归，不经过 Tauri/HTTP/DB；真实后端 E2E 仍在待办。
 - **契约防漂移**：`npm run check:contracts` 校验 Rust 命令定义、`generate_handler!` 注册与前端 `invoke` 名称一致，CI 强制执行。
 - `docs/refactor-plan.md` 补充契约/E2E 结果与 tauri-specta 评估。
 

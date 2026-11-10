@@ -25,9 +25,15 @@
 ## 契约与 E2E（2026-11-10，0.9.0）
 
 - **契约防漂移**：`scripts/check-contracts.mjs` 校验「Rust 命令定义 = generate_handler 注册 = 前端 invoke 名称」，CI 强制执行；首次运行即发现并清除了 6 个 M6 遗留的 notes 命令调用（Workspace 852→304 行，改为纯 docs 模式）。
-- **前端 E2E**：Playwright + vite + mock IPC，4 条用例（看板/计划验收/设置开发者模式/Vault），CI 运行 `npx playwright install chromium` + `npm run test:e2e`。
-- **tauri-specta 评估**：需要为 72 命令与全部 DTO 加 `Type`/`#[specta::specta]` 并接管 handler 注册，改动面与 Tauri 版本耦合较大；当前以契约 lint 覆盖「名称/注册漂移」，类型级 codegen 留作独立里程碑。
-- **类型化错误**：`Result<T, String>` 横跨 75 命令，替换会同时改动命令、前端 `errorText` 与既有错误匹配；未在本轮展开。
+- **前端 E2E（mock IPC，仅 UI 回归）**：Playwright + vite + mock IPC，4 条用例（看板/计划验收/设置开发者模式/Vault），CI 运行 `npx playwright install chromium` + `npm run test:e2e`。不经过 Tauri/HTTP/DB，不能替代集成测试。
+- **tauri-specta 评估（未实现）**：需要为 72 命令与全部 DTO 加 `Type`/`#[specta::specta]` 并接管 handler 注册，改动面与 Tauri 版本耦合较大；当前以契约 lint 覆盖「名称/注册漂移」，类型级 codegen 留作独立里程碑。
+- **类型化错误（未实现）**：`Result<T, String>` 横跨 75 命令，替换会同时改动命令、前端 `errorText` 与既有错误匹配；未在本轮展开。
+
+## 明确未覆盖
+
+- 真实后端/集成 E2E：Playwright 尚未连开发者 HTTP API 或通过真实 Tauri IPC 驱动；当前 E2E 只验证渲染与前端调用参数。
+- `tauri-specta` 类型生成与 `AppError` 类型化错误。
+
 
 ## 验收
 
