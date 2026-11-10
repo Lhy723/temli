@@ -2,6 +2,17 @@
 
 本文件记录 temli 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.0] - 2026-11-10
+
+### Added
+
+- **任务证据附件**：任务详情可上传截图/文件（≤20 MB），图片显示缩略图并可放大，支持删除；文件保存在数据目录 `attachments/<task>/`，迁移 v13 `task_attachments`。用于补充「证据，而非声称」的人工截图材料。
+- **阶段验收意见/小结**：待验收阶段可填写可选意见随验收通过落库，已通过阶段展示验收意见与时间（`plan_stages.summary/summary_at`）。
+
+### Changed
+
+- `accept_stage` 增加可选 `note` 参数；空/空白意见不写入。
+
 ## [0.6.0] - 2026-11-10
 
 ### Added

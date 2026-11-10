@@ -412,6 +412,51 @@ impl Db {
             tx.commit().map_err(|e| e.to_string())?;
         }
 
+        if current < 13 {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS task_attachments (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    file_name TEXT NOT NULL,
+                    rel_path TEXT NOT NULL,
+                    mime TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_task_attachments_task
+                    ON task_attachments(task_id, created_at);",
+            )
+            .map_err(|e| e.to_string())?;
+            // 旧测试库可能已带阶段意见列（模拟降级时保留），逐列检查避免
+            // `duplicate column name`。
+            let has_summary: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('plan_stages') WHERE name = 'summary'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if has_summary == 0 {
+                tx.execute_batch("ALTER TABLE plan_stages ADD COLUMN summary TEXT;")
+                    .map_err(|e| e.to_string())?;
+            }
+            let has_summary_at: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('plan_stages') WHERE name = 'summary_at'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if has_summary_at == 0 {
+                tx.execute_batch("ALTER TABLE plan_stages ADD COLUMN summary_at TEXT;")
+                    .map_err(|e| e.to_string())?;
+            }
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (13)", [])
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
         Ok(())
     }
 
@@ -772,7 +817,7 @@ mod tests {
                     "DROP TABLE plan_tasks;
                      DROP TABLE plan_stages;
                      DROP TABLE plans;
-                     DELETE FROM schema_migrations WHERE version = 12;",
+                     DELETE FROM schema_migrations WHERE version >= 12;",
                 )
                 .unwrap();
         }
@@ -817,5 +862,80 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM plan_tasks", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 0, "删除计划应级联删除阶段与任务引用");
+    }
+
+    #[test]
+    fn migration_v13_adds_task_attachments_and_stage_summary() {
+        let db_path = temp_dir().join("temli.db");
+
+        {
+            let db = Db::open(&db_path).unwrap();
+            // 模拟停在 schema v12 的用户库。
+            db.conn()
+                .execute_batch(
+                    "DROP TABLE task_attachments;
+                     ALTER TABLE plan_stages DROP COLUMN summary;
+                     ALTER TABLE plan_stages DROP COLUMN summary_at;
+                     DELETE FROM schema_migrations WHERE version = 13;",
+                )
+                .unwrap();
+        }
+
+        let reopened = Db::open(&db_path).unwrap();
+        let table: i64 = reopened
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'task_attachments'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "v12 库升级后应存在 task_attachments 表");
+
+        let columns: i64 = reopened
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('plan_stages')
+                 WHERE name IN ('summary','summary_at')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 2, "阶段应增加 summary / summary_at 列");
+
+        reopened
+            .conn()
+            .execute_batch(
+                "INSERT INTO projects (id, name, repo_path) VALUES ('p', 'p', '/tmp/temli-v13');
+                 INSERT INTO items (id, project_id, kind, title) VALUES ('i', 'p', 'issue', 'T');
+                 INSERT INTO tasks (id, item_id) VALUES ('t', 'i');
+                 INSERT INTO plans (id, project_id, title, goal) VALUES ('pl', 'p', 'P', 'G');
+                 INSERT INTO plan_stages (id, plan_id, seq, title) VALUES ('s', 'pl', 1, 'S');
+                 INSERT INTO task_attachments (id, task_id, file_name, rel_path, mime, size)
+                    VALUES ('a', 't', 'a.txt', 'attachments/t/abcd-a.txt', 'text/plain', 3);",
+            )
+            .unwrap();
+        let summary: Option<String> = reopened
+            .conn()
+            .query_row(
+                "SELECT summary FROM plan_stages WHERE id = 's'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(summary.is_none(), "新列默认为 NULL");
+
+        reopened
+            .conn()
+            .execute("DELETE FROM tasks WHERE id = 't'", [])
+            .unwrap();
+        let remaining: i64 = reopened
+            .conn()
+            .query_row("SELECT COUNT(*) FROM task_attachments", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0, "删除任务应级联删除附件记录");
     }
 }
