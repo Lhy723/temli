@@ -84,6 +84,8 @@ export function PlansPanel({ projectId }: { projectId: string }) {
   const [acceptingStageId, setAcceptingStageId] = useState<string | null>(
     null,
   );
+  // 按计划暂存验收意见；提交成功后清空。
+  const [acceptNotes, setAcceptNotes] = useState<Record<string, string>>({});
   const [actionError, setActionError] = useState<{
     planId: string;
     message: string;
@@ -111,6 +113,7 @@ export function PlansPanel({ projectId }: { projectId: string }) {
     setExpanded(new Set());
     setShowCreate(false);
     setActionError(null);
+    setAcceptNotes({});
     void load();
     return () => {
       request.current += 1;
@@ -143,10 +146,16 @@ export function PlansPanel({ projectId }: { projectId: string }) {
 
   async function accept(plan: Plan, stage: Stage) {
     if (acceptingStageId) return;
+    const note = (acceptNotes[plan.id] ?? "").trim();
     setAcceptingStageId(stage.id);
     setActionError(null);
     try {
-      await acceptStage(projectId, plan.id, stage.id);
+      await acceptStage(stage.id, note === "" ? undefined : note);
+      setAcceptNotes((prev) => {
+        const next = { ...prev };
+        delete next[plan.id];
+        return next;
+      });
       await load();
       setExpanded((prev) => new Set(prev).add(plan.id));
     } catch (e) {
@@ -378,6 +387,43 @@ export function PlansPanel({ projectId }: { projectId: string }) {
 
                   {isExpanded && (
                     <div className="border-t border-[var(--border)] px-3 py-2.5">
+                      {plan.status === "active" && reviewStage && (
+                        <div className="mb-2.5 grid gap-1">
+                          <label className="grid gap-1 text-label text-[var(--muted)]">
+                            验收意见（可选）
+                            <TextArea
+                              aria-label="验收意见"
+                              rows={2}
+                              maxLength={500}
+                              placeholder={`记录「${reviewStage.title}」的验收结论或备注，留空则不填写。`}
+                              value={acceptNotes[plan.id] ?? ""}
+                              onChange={(e) => {
+                                const value = e.target.value;
+                                setAcceptNotes((prev) => ({
+                                  ...prev,
+                                  [plan.id]: value,
+                                }));
+                              }}
+                              className="text-ui-sm"
+                              disabled={acceptingStageId !== null}
+                            />
+                          </label>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-label tabular-nums text-[var(--muted)]">
+                              {(acceptNotes[plan.id] ?? "").length}/500
+                            </span>
+                            <Button
+                              variant="primary"
+                              size="sm"
+                              className="h-7 px-2.5 text-ui"
+                              isDisabled={acceptingStageId !== null}
+                              onPress={() => void accept(plan, reviewStage)}
+                            >
+                              {accepting ? "验收中…" : "验收阶段"}
+                            </Button>
+                          </div>
+                        </div>
+                      )}
                       <ol className="grid gap-0">
                         {stages.map((stage, index) => {
                           const stageInfo = STAGE_STATUS[stage.status] ?? {
@@ -466,6 +512,21 @@ export function PlansPanel({ projectId }: { projectId: string }) {
                                     ))
                                   )}
                                 </div>
+                                {stage.summary && (
+                                  <div className="mt-1.5 grid gap-0.5 rounded-lg border border-[var(--border)] bg-[var(--background-secondary)] px-2 py-1.5">
+                                    <p className="text-label text-[var(--muted)]">
+                                      验收意见
+                                    </p>
+                                    <p className="whitespace-pre-wrap break-words text-ui-sm">
+                                      {stage.summary}
+                                    </p>
+                                    {stage.summary_at && (
+                                      <p className="text-label text-[var(--muted)]">
+                                        {formatDate(stage.summary_at)}
+                                      </p>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                             </li>
                           );

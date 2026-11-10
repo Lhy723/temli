@@ -980,8 +980,85 @@ fn start_plan(state: State<AppState>, plan_id: String) -> Result<store::Plan, St
 }
 
 #[tauri::command]
-fn accept_stage(state: State<AppState>, stage_id: String) -> Result<store::Plan, String> {
-    state.scheduler.accept_stage(&stage_id)
+fn accept_stage(
+    state: State<AppState>,
+    stage_id: String,
+    note: Option<String>,
+) -> Result<store::Plan, String> {
+    let plan = {
+        let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+        store::accept_stage_with_note(db.conn(), &stage_id, note.as_deref())?
+    };
+    if let Some(stage) = plan
+        .stages
+        .iter()
+        .find(|stage| stage.status == store::StageStatus::Active)
+    {
+        for task in &stage.tasks {
+            match task.status {
+                store::TaskStatus::Draft | store::TaskStatus::Ready => {
+                    if let Err(err) = state.scheduler.enqueue(&task.id) {
+                        logging::log(format!(
+                            "计划 {} 阶段 {} 的任务 {} 入队失败：{err}",
+                            plan.id, stage.id, task.id
+                        ));
+                    }
+                }
+                store::TaskStatus::Queued
+                | store::TaskStatus::Running
+                | store::TaskStatus::Verifying
+                | store::TaskStatus::Merged => {}
+                store::TaskStatus::Failed
+                | store::TaskStatus::Interrupted
+                | store::TaskStatus::NeedsHuman => {
+                    logging::log(format!(
+                        "计划 {} 阶段 {} 的任务 {} 处于 {}，不自动重新入队",
+                        plan.id, stage.id, task.id, task.status
+                    ));
+                }
+            }
+        }
+    }
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::get_plan(db.conn(), &plan.id)
+}
+
+#[tauri::command]
+fn add_task_attachment(
+    state: State<AppState>,
+    task_id: String,
+    file_name: String,
+    data_base64: String,
+) -> Result<store::Attachment, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::add_task_attachment(
+        db.conn(),
+        Path::new(&state.data_dir),
+        &task_id,
+        &file_name,
+        &data_base64,
+    )
+}
+
+#[tauri::command]
+fn list_task_attachments(
+    state: State<AppState>,
+    task_id: String,
+) -> Result<Vec<store::Attachment>, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::list_task_attachments(db.conn(), &task_id)
+}
+
+#[tauri::command]
+fn read_task_attachment(state: State<AppState>, attachment_id: String) -> Result<String, String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::read_task_attachment(db.conn(), Path::new(&state.data_dir), &attachment_id)
+}
+
+#[tauri::command]
+fn delete_task_attachment(state: State<AppState>, attachment_id: String) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
+    store::delete_task_attachment(db.conn(), Path::new(&state.data_dir), &attachment_id)
 }
 
 #[tauri::command]
@@ -1669,6 +1746,10 @@ pub fn run() {
             get_plan,
             start_plan,
             accept_stage,
+            add_task_attachment,
+            list_task_attachments,
+            read_task_attachment,
+            delete_task_attachment,
             get_task,
             start_task,
             cancel_task,

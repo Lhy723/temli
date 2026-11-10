@@ -26,10 +26,11 @@
 - [x] M19 Vault 对齐 Obsidian：标签（migration v11）、附件（选择/粘贴/拖入）、模板变量、日记、属性面板、大纲、⌘O 快速切换、`[[` 补全、别名解析、重命名同步改链接；对照矩阵见 `docs/vault-alignment.md`（PR #72；补丁 #75/#76）
 - [x] M20 借鉴 Kitestring：计划（Plan）与阶段门（locked/active/review/passed，验收解锁下一阶段）；任务 `nextActor`（待你/Agent）；迁移 v12；对照与非目标见 `docs/kitestring-borrowing.md`（PR #78；自动入队补丁 #81）
 - [x] M21 开发者模式 + 本地调试 API：设置页开关/端口/token；仅 127.0.0.1 的 HTTP（health/summary/tasks/plans 启停/日志），Bearer 认证；日志尾部与 IPC 控制台；`docs/dev-mode.md`（PR #84）
+- [x] M22 Kitestring 证据与阶段意见：任务证据附件（截图/文件 ≤20 MB，迁移 v13 `task_attachments`）；阶段验收意见/小结（`plan_stages.summary/summary_at`）；对照文档更新（PR #TBD）
 
 ## 关键验证
 
-- `cargo test --lib`：307 passed，1 ignored（需真实 OMP 的 live 规划测试）
+- `cargo test --lib`：311 passed，1 ignored（需真实 OMP 的 live 规划测试）
 - `npm run build`：通过
 - `npm run tauri build`：通过，产物 `temli.app`（7.05 MiB）与 `temli_0.1.0_aarch64.dmg`（3.54 MiB）
 - `cargo build`：0 warning（M13 死代码清零）
@@ -48,6 +49,7 @@
 - 0.4.1 补丁：浏览器 DOM drop 实测（`save_vault_attachment` 调用、插入 `![pic.png](attachments/…)`、预览读取）；`[[别名]]` 由 frontmatter `aliases/alias` 解析（flow/逗号/块列表，单测覆盖）；矩阵状态与实现对齐；Release DMG 3,811,144 字节，`codesign -v` 通过并安装
 - M20 计划阶段门（浏览器 mock IPC）：计划时间线渲染、`accept_stage` 调用、新建计划 `create_plan {stages:[{title,task_ids}]}`；单测覆盖草稿不可验收、启动→待验收→通过解锁→完成；0.5.0 DMG 3,826,337 字节；0.5.1 修复启动/验收自动入队（单测：首阶段 draft→queued、次阶段验收后 draft→queued），DMG 3,827,159 字节，`codesign -v` 通过并安装
 - M21 开发者 API（真实应用 + curl）：`/health` → `{ok:true,version:"0.5.1"}`；无 token 的 `/summary` 返回 401；带 Bearer 的 `/summary` 返回任务计数与默认 Agent；`/tasks?project_id=…` 返回任务；`/logs?lines=3` 返回日志尾部；关闭应用后端口 3789 无监听；0.6.0 DMG 3,914,613 字节，`codesign -v` 通过并安装
+- M22 证据附件（浏览器 mock IPC）：上传 `add_task_attachment`（base64）、列表缩略图 + `read_task_attachment`、删除 `delete_task_attachment`；阶段验收意见随 `accept_stage` 传入并回显；0.7.0 DMG 见发布记录
 
 ## 基础设施缺口（M18 起补齐）
 
@@ -78,7 +80,7 @@
 ## 验证命令
 
 ```bash
-cd src-tauri && cargo test --lib          # 307 passed, 1 ignored
+cd src-tauri && cargo test --lib          # 311 passed, 1 ignored
 npm run build                             # 前端类型检查 + 构建
 npm run tauri build                       # release .app + .dmg
 cargo test --lib live_plan_generation_with_omp -- --ignored --nocapture
