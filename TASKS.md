@@ -27,6 +27,7 @@
 - [x] M20 借鉴 Kitestring：计划（Plan）与阶段门（locked/active/review/passed，验收解锁下一阶段）；任务 `nextActor`（待你/Agent）；迁移 v12；对照与非目标见 `docs/kitestring-borrowing.md`（PR #78；自动入队补丁 #81）
 - [x] M21 开发者模式 + 本地调试 API：设置页开关/端口/token；仅 127.0.0.1 的 HTTP（health/summary/tasks/plans 启停/日志），Bearer 认证；日志尾部与 IPC 控制台；`docs/dev-mode.md`（PR #84）
 - [x] M22 Kitestring 证据与阶段意见：任务证据附件（截图/文件 ≤20 MB，迁移 v13 `task_attachments`）；阶段验收意见/小结（`plan_stages.summary/summary_at`）；对照文档更新（PR #87）
+- [x] M23 可维护性重构（无行为变化）：store 拆 7 个领域模块；lib.rs 72 命令拆 8 个 commands 模块；TasksPanel/Vaults 拆为主文件 + 子组件/hooks；见 `docs/refactor-plan.md`（PR #TBD）
 
 ## 关键验证
 
