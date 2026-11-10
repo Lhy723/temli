@@ -31,7 +31,7 @@
 
 ## 明确未覆盖
 
-- 真实后端/集成 E2E：Playwright 尚未连开发者 HTTP API 或通过真实 Tauri IPC 驱动；当前 E2E 只验证渲染与前端调用参数。
+- CI 可运行的真实后端 E2E：已有本地 token 驱动的 API 用例（`e2e/api.spec.ts`：health/401/summary/logs/tasks），但 CI 无 GUI，默认跳过；尚未在 CI 验证真实 IPC/HTTP。
 - `tauri-specta` 类型生成与 `AppError` 类型化错误。
 
 
