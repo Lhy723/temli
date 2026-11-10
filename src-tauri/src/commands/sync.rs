@@ -1,7 +1,7 @@
 //! GitHub issue 同步、发布与项目自动化开关相关命令。
 
-use crate::AppState;
 use crate::store;
+use crate::{AppError, AppResult, AppState};
 use serde::Deserialize;
 use tauri::State;
 
@@ -39,73 +39,76 @@ pub(crate) struct AutoDocsInput {
 }
 
 #[tauri::command]
-pub(crate) fn sync_now(state: State<AppState>, project_id: String) -> Result<(), String> {
-    state.sync.sync_project(&project_id)
+pub(crate) fn sync_now(state: State<AppState>, project_id: String) -> AppResult<()> {
+    state.sync.sync_project(&project_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn update_issue(state: State<AppState>, input: UpdateIssueInput) -> Result<(), String> {
-    state.sync.update_remote_issue(
-        &input.item_id,
-        input.title,
-        input.body,
-        input.assignee,
-        input.state,
-    )
+pub(crate) fn update_issue(state: State<AppState>, input: UpdateIssueInput) -> AppResult<()> {
+    state
+        .sync
+        .update_remote_issue(
+            &input.item_id,
+            input.title,
+            input.body,
+            input.assignee,
+            input.state,
+        )
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn publish_task(state: State<AppState>, task_id: String) -> Result<u64, String> {
-    state.sync.publish_task(&task_id)
+pub(crate) fn publish_task(state: State<AppState>, task_id: String) -> AppResult<u64> {
+    state.sync.publish_task(&task_id).map_err(AppError::from)
 }
 
 #[tauri::command]
 pub(crate) fn get_project_issues(
     state: State<AppState>,
     project_id: String,
-) -> Result<Vec<store::ProjectIssue>, String> {
+) -> AppResult<Vec<store::ProjectIssue>> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::list_project_issues(db.conn(), &project_id)
+    store::list_project_issues(db.conn(), &project_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn get_auto_merge(state: State<AppState>, project_id: String) -> Result<bool, String> {
+pub(crate) fn get_auto_merge(state: State<AppState>, project_id: String) -> AppResult<bool> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::project_auto_merge(db.conn(), &project_id)
+    store::project_auto_merge(db.conn(), &project_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn set_auto_merge(state: State<AppState>, input: AutoMergeInput) -> Result<(), String> {
+pub(crate) fn set_auto_merge(state: State<AppState>, input: AutoMergeInput) -> AppResult<()> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     store::set_project_auto_merge(db.conn(), &input.project_id, input.enabled)
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn get_require_checks(
-    state: State<AppState>,
-    project_id: String,
-) -> Result<bool, String> {
+pub(crate) fn get_require_checks(state: State<AppState>, project_id: String) -> AppResult<bool> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::project_require_checks(db.conn(), &project_id)
+    store::project_require_checks(db.conn(), &project_id).map_err(AppError::from)
 }
 
 #[tauri::command]
 pub(crate) fn set_require_checks(
     state: State<AppState>,
     input: RequireChecksInput,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     store::set_project_require_checks(db.conn(), &input.project_id, input.enabled)
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn get_auto_docs(state: State<AppState>, project_id: String) -> Result<bool, String> {
+pub(crate) fn get_auto_docs(state: State<AppState>, project_id: String) -> AppResult<bool> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::project_auto_docs(db.conn(), &project_id)
+    store::project_auto_docs(db.conn(), &project_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn set_auto_docs(state: State<AppState>, input: AutoDocsInput) -> Result<(), String> {
+pub(crate) fn set_auto_docs(state: State<AppState>, input: AutoDocsInput) -> AppResult<()> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     store::set_project_auto_docs(db.conn(), &input.project_id, input.enabled)
+        .map_err(AppError::from)
 }

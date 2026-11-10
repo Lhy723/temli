@@ -1,10 +1,10 @@
 //! 任务、决策、事件与附件相关命令。
 
-use crate::AppState;
 use crate::commands::db_err;
 use crate::commands::plans::generate_acceptance;
 use crate::evidence;
 use crate::store::{self, DecisionRow, EventRow, TaskDetail, TaskSummary};
+use crate::{AppError, AppResult, AppState};
 use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -115,20 +115,17 @@ fn list_task_events(conn: &rusqlite::Connection, task_id: &str) -> Result<Vec<Ev
 pub(crate) fn list_tasks(
     state: State<AppState>,
     project_id: String,
-) -> Result<Vec<TaskSummary>, String> {
+) -> AppResult<Vec<TaskSummary>> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::list_tasks_for_project(db.conn(), &project_id)
+    store::list_tasks_for_project(db.conn(), &project_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn create_task(
-    state: State<AppState>,
-    input: CreateTaskInput,
-) -> Result<TaskDetail, String> {
+pub(crate) fn create_task(state: State<AppState>, input: CreateTaskInput) -> AppResult<TaskDetail> {
     let project = {
         let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
         db.get_project(&input.project_id)?
-            .ok_or_else(|| "项目不存在".to_string())?
+            .ok_or_else(|| AppError::not_found("项目不存在"))?
     };
 
     let criteria = if input.acceptance.is_empty() {
@@ -148,7 +145,9 @@ pub(crate) fn create_task(
             &commands,
         );
         if generated.is_empty() {
-            return Err("未发现可执行的测试/构建命令，请手动提供验收标准".to_string());
+            return Err(AppError::validation(
+                "未发现可执行的测试/构建命令，请手动提供验收标准",
+            ));
         }
         generated
     } else {
@@ -165,7 +164,7 @@ pub(crate) fn create_task(
             criteria,
         },
     )?;
-    store::get_task(db.conn(), &task.id)
+    store::get_task(db.conn(), &task.id).map_err(AppError::from)
 }
 
 /// `create_task_from_issue` 的数据库逻辑；拆出来以便直接对 `Connection` 做单测。
@@ -265,9 +264,9 @@ pub(crate) fn convert_issue_to_task(
 pub(crate) fn create_task_from_issue(
     state: State<AppState>,
     input: CreateTaskFromIssueInput,
-) -> Result<TaskDetail, String> {
+) -> AppResult<TaskDetail> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    convert_issue_to_task(db.conn(), input)
+    convert_issue_to_task(db.conn(), input).map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -276,7 +275,7 @@ pub(crate) fn add_task_attachment(
     task_id: String,
     file_name: String,
     data_base64: String,
-) -> Result<store::Attachment, String> {
+) -> AppResult<store::Attachment> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     store::add_task_attachment(
         db.conn(),
@@ -285,74 +284,77 @@ pub(crate) fn add_task_attachment(
         &file_name,
         &data_base64,
     )
+    .map_err(AppError::from)
 }
 
 #[tauri::command]
 pub(crate) fn list_task_attachments(
     state: State<AppState>,
     task_id: String,
-) -> Result<Vec<store::Attachment>, String> {
+) -> AppResult<Vec<store::Attachment>> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::list_task_attachments(db.conn(), &task_id)
+    store::list_task_attachments(db.conn(), &task_id).map_err(AppError::from)
 }
 
 #[tauri::command]
 pub(crate) fn read_task_attachment(
     state: State<AppState>,
     attachment_id: String,
-) -> Result<String, String> {
+) -> AppResult<String> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     store::read_task_attachment(db.conn(), Path::new(&state.data_dir), &attachment_id)
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
 pub(crate) fn delete_task_attachment(
     state: State<AppState>,
     attachment_id: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     store::delete_task_attachment(db.conn(), Path::new(&state.data_dir), &attachment_id)
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn get_task(state: State<AppState>, task_id: String) -> Result<TaskDetail, String> {
+pub(crate) fn get_task(state: State<AppState>, task_id: String) -> AppResult<TaskDetail> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::get_task(db.conn(), &task_id)
+    store::get_task(db.conn(), &task_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn start_task(state: State<AppState>, task_id: String) -> Result<(), String> {
-    state.scheduler.enqueue(&task_id)
+pub(crate) fn start_task(state: State<AppState>, task_id: String) -> AppResult<()> {
+    state.scheduler.enqueue(&task_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn cancel_task(state: State<AppState>, task_id: String) -> Result<(), String> {
-    state.scheduler.cancel(&task_id)
+pub(crate) fn cancel_task(state: State<AppState>, task_id: String) -> AppResult<()> {
+    state.scheduler.cancel(&task_id).map_err(AppError::from)
 }
 
 #[tauri::command]
 pub(crate) fn list_decisions(
     state: State<AppState>,
     project_id: String,
-) -> Result<Vec<DecisionRow>, String> {
+) -> AppResult<Vec<DecisionRow>> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    list_project_decisions(db.conn(), &project_id)
+    list_project_decisions(db.conn(), &project_id).map_err(AppError::from)
 }
 
 #[tauri::command]
 pub(crate) fn list_reviews(
     state: State<AppState>,
     project_id: String,
-) -> Result<Vec<store::ReviewListItem>, String> {
+) -> AppResult<Vec<store::ReviewListItem>> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::list_reviews(db.conn(), &project_id)
+    store::list_reviews(db.conn(), &project_id).map_err(AppError::from)
 }
 
 #[tauri::command]
 pub(crate) fn resolve_decision(
     state: State<AppState>,
     input: ResolveDecisionInput,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     let decision = store::resolve_decision(db.conn(), &input.id, &input.resolution)?;
     // Agent approvals only unblock the running session; they must not move the task.
@@ -377,19 +379,13 @@ pub(crate) fn resolve_decision(
 }
 
 #[tauri::command]
-pub(crate) fn list_events(
-    state: State<AppState>,
-    task_id: String,
-) -> Result<Vec<EventRow>, String> {
+pub(crate) fn list_events(state: State<AppState>, task_id: String) -> AppResult<Vec<EventRow>> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    list_task_events(db.conn(), &task_id)
+    list_task_events(db.conn(), &task_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn set_task_agents(
-    state: State<AppState>,
-    input: SetTaskAgentsInput,
-) -> Result<(), String> {
+pub(crate) fn set_task_agents(state: State<AppState>, input: SetTaskAgentsInput) -> AppResult<()> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     let conn = db.conn();
     let (developer, reviewer) = store::task_agents(conn, &input.task_id)?;
@@ -406,7 +402,9 @@ pub(crate) fn set_task_agents(
                     return Ok(None);
                 }
                 if state.adapters.get(value).is_none() {
-                    return Err(format!("{label}适配器未注册：{value}"));
+                    return Err(AppError::validation(format!(
+                        "{label}适配器未注册：{value}"
+                    )));
                 }
                 Ok(Some(value.to_string()))
             }
@@ -421,13 +419,11 @@ pub(crate) fn set_task_agents(
         developer.as_deref(),
         reviewer.as_deref(),
     )
+    .map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn set_task_model(
-    state: State<AppState>,
-    input: SetTaskModelInput,
-) -> Result<(), String> {
+pub(crate) fn set_task_model(state: State<AppState>, input: SetTaskModelInput) -> AppResult<()> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::set_task_model(db.conn(), &input.task_id, input.model.as_deref())
+    store::set_task_model(db.conn(), &input.task_id, input.model.as_deref()).map_err(AppError::from)
 }
