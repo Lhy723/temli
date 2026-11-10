@@ -2,6 +2,18 @@
 
 本文件记录 temli 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.0] - 2026-11-10
+
+### Added
+
+- **前端 E2E**：Playwright + Vite + mock IPC，覆盖看板、计划验收意见、设置开发者模式、Vault；CI 自动运行。
+- **契约防漂移**：`npm run check:contracts` 校验 Rust 命令定义、`generate_handler!` 注册与前端 `invoke` 名称一致，CI 强制执行。
+- `docs/refactor-plan.md` 补充契约/E2E 结果与 tauri-specta 评估。
+
+### Changed
+
+- 清理 M6 遗留的 notes 模式死代码：删除 6 个失效 API 与 Workspace 的笔记分支（852 → 304 行，改为纯 docs 模式）。
+
 ## [0.8.0] - 2026-11-10
 
 ### Changed（可维护性，无行为变化）
