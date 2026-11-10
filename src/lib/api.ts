@@ -106,6 +106,16 @@ export type TaskDetail = {
   events: EventRow[];
 };
 
+/** 任务详情里的证据附件；内容通过 readTaskAttachment 按需读取。 */
+export type Attachment = {
+  id: string;
+  task_id: string;
+  file_name: string;
+  mime: string;
+  size: number;
+  created_at: string;
+};
+
 export type CreateTaskInput = {
   project_id: string;
   title: string;
@@ -199,6 +209,8 @@ export type Stage = {
   status: StageStatus;
   tasks: PlanTask[];
   passed_at: string | null;
+  summary: string | null;
+  summary_at: string | null;
 };
 
 export type PlanStatus = "draft" | "active" | "done";
@@ -492,6 +504,31 @@ export function listEvents(taskId: string): Promise<EventRow[]> {
   return invoke<EventRow[]>("list_events", { taskId });
 }
 
+export function addTaskAttachment(
+  taskId: string,
+  fileName: string,
+  dataBase64: string,
+): Promise<Attachment> {
+  return invoke<Attachment>("add_task_attachment", {
+    taskId,
+    fileName,
+    dataBase64,
+  });
+}
+
+export function listTaskAttachments(taskId: string): Promise<Attachment[]> {
+  return invoke<Attachment[]>("list_task_attachments", { taskId });
+}
+
+/** 读取附件内容，返回 base64（不含 data URL 前缀）。 */
+export function readTaskAttachment(attachmentId: string): Promise<string> {
+  return invoke<string>("read_task_attachment", { attachmentId });
+}
+
+export function deleteTaskAttachment(attachmentId: string): Promise<void> {
+  return invoke<void>("delete_task_attachment", { attachmentId });
+}
+
 export function addDependency(input: DependencyInput): Promise<void> {
   return invoke<void>("add_dependency", { input });
 }
@@ -644,11 +681,13 @@ export function startPlan(projectId: string, planId: string): Promise<void> {
 }
 
 export function acceptStage(
-  projectId: string,
-  planId: string,
   stageId: string,
+  note?: string,
 ): Promise<void> {
-  return invoke<void>("accept_stage", { projectId, planId, stageId });
+  return invoke<void>(
+    "accept_stage",
+    note === undefined ? { stageId } : { stageId, note },
+  );
 }
 
 export function linkContext(input: LinkContextInput): Promise<void> {
