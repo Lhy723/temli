@@ -574,7 +574,6 @@ export default function App() {
                   {current && (
                     <Workspace
                       projectId={current.id}
-                      mode="docs"
                       focusDocId={focusDocId ?? undefined}
                       onFocusConsumed={() => setFocusDocId(null)}
                     />
