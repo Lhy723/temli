@@ -1,14 +1,16 @@
 {
   "name": "temli",
   "private": true,
-  "version": "0.8.0",
+  "version": "0.9.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "test:e2e": "playwright test",
+    "tauri": "tauri",
+    "check:contracts": "node scripts/check-contracts.mjs"
   },
   "dependencies": {
     "@heroui/react": "^3.2.7",
@@ -22,6 +24,7 @@
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.0",
     "@tailwindcss/vite": "^4.3.5",
     "@tauri-apps/cli": "^2",
     "@types/react": "^19.1.8",
