@@ -2,6 +2,15 @@
 
 本文件记录 temli 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.0] - 2026-11-10
+
+### Changed（可维护性，无行为变化）
+
+- 后端 `store.rs`（5,099 行）拆分为 7 个领域模块（tasks/scheduling/runs/plans/settings/attachments/test_support），`crate::store::*` 公开路径不变。
+- `lib.rs` 的 72 个 Tauri 命令拆到 8 个 `commands/*` 领域模块；`AppState` 仅提升可见性，命令名与参数不变。
+- `TasksPanel.tsx`（4,015 行）拆为主文件 760 行 + 15 个子组件/hooks；`Vaults.tsx`（2,542 行）拆为主文件 559 行 + 14 个子组件/hooks。
+- 新增 `docs/refactor-plan.md` 记录拆分边界、验收与后续（契约生成、类型化错误、前端 E2E）。
+
 ## [0.7.0] - 2026-11-10
 
 ### Added
