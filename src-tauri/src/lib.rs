@@ -2,6 +2,7 @@ mod agent;
 mod commands;
 mod db;
 mod dev_api;
+mod error;
 mod evidence;
 mod github;
 mod gitops;
@@ -20,6 +21,8 @@ mod workspace;
 use agent::AdapterRegistry;
 use commands::settings::resolve_default_agent;
 use db::Db;
+
+pub(crate) use error::{AppError, AppResult};
 use rusqlite::params;
 use scheduler::Scheduler;
 use std::collections::HashSet;

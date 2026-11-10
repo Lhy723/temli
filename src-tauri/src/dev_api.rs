@@ -4,7 +4,7 @@
 //! （除 `/health`）要求 `Authorization: Bearer <token>`。每个请求都包在
 //! `catch_unwind` 里，处理线程 panic 不会带崩应用。
 
-use crate::{AppState, logging, store};
+use crate::{AppError, AppResult, AppState, logging, store};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::io::Cursor;
@@ -178,7 +178,7 @@ pub fn autostart(app: &AppHandle) {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn get_dev_status(state: State<AppState>) -> Result<DevStatus, String> {
+pub fn get_dev_status(state: State<AppState>) -> AppResult<DevStatus> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     let stored_port = store::dev_port(db.conn());
     let token = store::get_setting(db.conn(), store::SETTING_DEV_API_TOKEN)?.unwrap_or_default();
@@ -192,8 +192,8 @@ pub fn set_dev_mode(
     state: State<AppState>,
     enabled: bool,
     port: u32,
-) -> Result<DevStatus, String> {
-    let port = validate_port(port)?;
+) -> AppResult<DevStatus> {
+    let port = validate_port(port).map_err(AppError::validation)?;
     let token = {
         let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
         store::ensure_dev_api_token(db.conn())?

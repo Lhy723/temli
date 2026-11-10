@@ -1,6 +1,5 @@
 //! 规划、计划与阶段相关命令。
 
-use crate::AppState;
 use crate::agent::{AgentAdapter, AgentEvent, Decision, EventSink, RunSpec, RunStatus};
 use crate::commands::db_err;
 use crate::db::Project;
@@ -9,6 +8,7 @@ use crate::logging;
 use crate::planner;
 use crate::prompts;
 use crate::store::{self, Criterion, TaskDetail};
+use crate::{AppError, AppResult, AppState};
 use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -204,16 +204,16 @@ pub(crate) fn run_plan(
 pub(crate) fn plan_project(
     state: State<AppState>,
     input: PlanProjectInput,
-) -> Result<planner::PlanDraft, String> {
+) -> AppResult<planner::PlanDraft> {
     let idea = input.idea.trim();
     if idea.is_empty() {
-        return Err("请提供要规划的想法".to_string());
+        return Err(AppError::validation("请提供要规划的想法"));
     }
 
     let project = {
         let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
         db.get_project(&input.project_id)?
-            .ok_or_else(|| "项目不存在".to_string())?
+            .ok_or_else(|| AppError::not_found("项目不存在"))?
     };
 
     let default_agent = state
@@ -230,15 +230,17 @@ pub(crate) fn plan_project(
     let adapter = state
         .adapters
         .get(requested)
-        .ok_or_else(|| format!("适配器未注册：{requested}"))?;
+        .ok_or_else(|| AppError::validation(format!("适配器未注册：{requested}")))?;
 
     let repo = Path::new(&project.repo_path);
     let commands = evidence::discover_commands(repo);
     if commands.is_empty() {
-        return Err("未发现可执行的测试/构建命令，请先配置测试或构建脚本".to_string());
+        return Err(AppError::validation(
+            "未发现可执行的测试/构建命令，请先配置测试或构建脚本",
+        ));
     }
 
-    run_plan(adapter.as_ref(), &project, idea, &commands)
+    run_plan(adapter.as_ref(), &project, idea, &commands).map_err(AppError::from)
 }
 
 /// 校验草案并把每个任务写入数据库。
@@ -338,11 +340,11 @@ fn rollback_plan_tasks(conn: &rusqlite::Connection, tasks: &[store::TaskRow]) {
 pub(crate) fn create_tasks_from_plan(
     state: State<AppState>,
     input: CreateTasksFromPlanInput,
-) -> Result<Vec<TaskDetail>, String> {
+) -> AppResult<Vec<TaskDetail>> {
     let project = {
         let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
         db.get_project(&input.project_id)?
-            .ok_or_else(|| "项目不存在".to_string())?
+            .ok_or_else(|| AppError::not_found("项目不存在"))?
     };
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     create_plan_tasks(
@@ -351,6 +353,7 @@ pub(crate) fn create_tasks_from_plan(
         Path::new(&project.repo_path),
         input.draft,
     )
+    .map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -360,7 +363,7 @@ pub(crate) fn create_plan(
     title: String,
     goal: String,
     stages: Vec<store::NewPlanStage>,
-) -> Result<store::Plan, String> {
+) -> AppResult<store::Plan> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     store::create_plan(
         db.conn(),
@@ -371,26 +374,27 @@ pub(crate) fn create_plan(
             stages,
         },
     )
+    .map_err(AppError::from)
 }
 
 #[tauri::command]
 pub(crate) fn list_plans(
     state: State<AppState>,
     project_id: String,
-) -> Result<Vec<store::Plan>, String> {
+) -> AppResult<Vec<store::Plan>> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::list_plans(db.conn(), &project_id)
+    store::list_plans(db.conn(), &project_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn get_plan(state: State<AppState>, plan_id: String) -> Result<store::Plan, String> {
+pub(crate) fn get_plan(state: State<AppState>, plan_id: String) -> AppResult<store::Plan> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::get_plan(db.conn(), &plan_id)
+    store::get_plan(db.conn(), &plan_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-pub(crate) fn start_plan(state: State<AppState>, plan_id: String) -> Result<store::Plan, String> {
-    state.scheduler.start_plan(&plan_id)
+pub(crate) fn start_plan(state: State<AppState>, plan_id: String) -> AppResult<store::Plan> {
+    state.scheduler.start_plan(&plan_id).map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -398,7 +402,7 @@ pub(crate) fn accept_stage(
     state: State<AppState>,
     stage_id: String,
     note: Option<String>,
-) -> Result<store::Plan, String> {
+) -> AppResult<store::Plan> {
     let plan = {
         let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
         store::accept_stage_with_note(db.conn(), &stage_id, note.as_deref())?
@@ -434,5 +438,5 @@ pub(crate) fn accept_stage(
         }
     }
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
-    store::get_plan(db.conn(), &plan.id)
+    store::get_plan(db.conn(), &plan.id).map_err(AppError::from)
 }

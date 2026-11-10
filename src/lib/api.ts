@@ -903,5 +903,10 @@ export function formatDate(value: string | null | undefined): string {
 export function errorText(error: unknown): string {
   if (typeof error === "string") return error;
   if (error instanceof Error) return error.message;
+  // 后端类型化错误序列化为 { code, message }；提示文案保持原样，不拼接 code。
+  if (typeof error === "object" && error !== null && "message" in error) {
+    const message = error.message;
+    if (typeof message === "string") return message;
+  }
   return String(error);
 }

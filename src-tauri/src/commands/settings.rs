@@ -1,9 +1,9 @@
 //! 应用设置、默认适配器与适配器列表相关命令。
 
-use crate::AppState;
 use crate::agent::{AdapterRegistry, AgentManifest};
 use crate::logging;
 use crate::store;
+use crate::{AppError, AppResult, AppState};
 use serde::Serialize;
 use tauri::State;
 
@@ -17,7 +17,7 @@ pub(crate) struct AppSettings {
 }
 
 #[tauri::command]
-pub(crate) fn get_app_settings(state: State<AppState>) -> Result<AppSettings, String> {
+pub(crate) fn get_app_settings(state: State<AppState>) -> AppResult<AppSettings> {
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     Ok(AppSettings {
         default_agent: store::get_setting(db.conn(), store::SETTING_DEFAULT_AGENT)?,
@@ -59,10 +59,7 @@ pub(crate) fn apply_default_agent(
 const FALLBACK_DEFAULT_AGENT: &str = "omp";
 
 #[tauri::command]
-pub(crate) fn set_default_agent(
-    state: State<AppState>,
-    agent: Option<String>,
-) -> Result<(), String> {
+pub(crate) fn set_default_agent(state: State<AppState>, agent: Option<String>) -> AppResult<()> {
     {
         let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
         apply_default_agent(db.conn(), &state.adapters, agent.as_deref())?;
@@ -116,8 +113,8 @@ pub(crate) fn validate_retention_days(days: u32) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub(crate) fn set_worktree_retention_days(state: State<AppState>, days: u32) -> Result<(), String> {
-    validate_retention_days(days)?;
+pub(crate) fn set_worktree_retention_days(state: State<AppState>, days: u32) -> AppResult<()> {
+    validate_retention_days(days).map_err(AppError::validation)?;
     let db = state.db.lock().map_err(|_| "数据库锁被占用".to_string())?;
     store::set_setting(
         db.conn(),
